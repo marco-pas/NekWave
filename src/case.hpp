@@ -24,9 +24,12 @@ using InitialConditionFn = std::function<void(double x, double y, double z,
                                               double& Hx, double& Hy, double& Hz)>;
 
 /**
- * @brief Forward declaration of Case.
+ * @brief Forward declaration of Case and GpuSolver.
  */
 class Case;
+#ifdef NEKWAVE_ENABLE_CUDA
+class GpuSolver;
+#endif
 
 /**
  * @brief User-defined postprocessing callback signature.
@@ -102,6 +105,9 @@ private:
     std::unique_ptr<Mesh> mesh_;
     std::unique_ptr<Physics> physics_;
     std::unique_ptr<TimeStepperRK45> timeStepper_;
+#ifdef NEKWAVE_ENABLE_CUDA
+    std::unique_ptr<GpuSolver> gpuSolver_;
+#endif
     ProbeManager probes_;
     StateVector state_;
 

@@ -62,6 +62,7 @@ if(ENABLE_CUDA)
 
     add_library(nekwave_cuda STATIC
         src/cuda/mxm_cuda.cu
+        src/cuda/gpu_solver.cu
     )
     target_include_directories(nekwave_cuda PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>

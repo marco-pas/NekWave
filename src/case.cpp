@@ -6,6 +6,10 @@
 
 #include "case.hpp"
 
+#ifdef NEKWAVE_ENABLE_CUDA
+#include "cuda/gpu_solver.hpp"
+#endif
+
 #include <iostream>
 #include <iomanip>
 #include <cmath>
@@ -231,6 +235,13 @@ void Case::simulate() {
     const int numSteps = config_.numSteps;
     const int freq = std::max(1, config_.outputFreq);
 
+#ifdef NEKWAVE_ENABLE_CUDA
+    std::cout << "[SIMULATE] Initializing full GPU data residency (GpuSolver)..." << std::endl;
+    gpuSolver_.reset(new GpuSolver());
+    gpuSolver_->initialize(*mesh_, config_.c0);
+    gpuSolver_->uploadState(state_.data(), state_.size());
+#endif
+
     std::cout << "\n[SIMULATE] Advancing time integration (LSRK45)..." << std::endl;
     std::cout << std::setw(8) << "Step" 
               << std::setw(14) << "Time" 
@@ -240,9 +251,17 @@ void Case::simulate() {
     std::cout << "------------------------------------------------------------------" << std::endl;
 
     for (int step = 1; step <= numSteps; ++step) {
+#ifdef NEKWAVE_ENABLE_CUDA
+        gpuSolver_->step(dt_, currentTime_);
+        currentTime_ += dt_;
+        currentStep_ = step;
+
+        gpuSolver_->downloadState(state_.data(), state_.size());
+#else
         timeStepper_->step(*mesh_, *physics_, state_, dt_, currentTime_);
         currentTime_ += dt_;
         currentStep_ = step;
+#endif
 
         probes_.record(step, currentTime_, state_, npts);
 
@@ -263,6 +282,10 @@ void Case::simulate() {
                       << std::setw(16) << std::scientific << std::setprecision(6) << energy << std::endl;
         }
     }
+
+#ifdef NEKWAVE_ENABLE_CUDA
+    gpuSolver_->downloadState(state_.data(), state_.size());
+#endif
 
     bIsSimulated_ = true;
 }
