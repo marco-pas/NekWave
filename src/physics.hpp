@@ -22,6 +22,10 @@ public:
     // @@ declaring the basic matrix-matrix multiplication routine for tensor contractions
     static void mxm(const double* A, int n1, const double* B, int n2, double* C, int n3);
 
+    // @@ configuring CUDA acceleration for matrix multiplication
+    static void setUseCudaMxm(bool enable);
+    static bool getUseCudaMxm();
+
     // @@ declaring the local element differentiation function local_grad3
     // Use tensor-product contractions:
     //      u_r = (I (x) I (x) D) u,  u_s = (I (x) D (x) I) u,  u_t = (D (x) I (x) I) u

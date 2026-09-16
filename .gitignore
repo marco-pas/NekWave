@@ -1,9 +1,11 @@
 # Build directories and binaries
-build/
+build*/
 app/
 nekwave
 nekwave_prof
 nekwave-test
+nekwave_cuda_test
+*.a
 *.prof
 
 # Compiled object and dependency files

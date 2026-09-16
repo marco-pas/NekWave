@@ -1,17 +1,42 @@
 #include "physics.hpp"
 
+#ifdef NEKWAVE_ENABLE_CUDA
+#include "cuda/mxm_cuda.hpp"
+static bool s_useCudaMxm = true;
+#else
+static bool s_useCudaMxm = false;
+#endif
+
 // @@ the Physics constructor
 Physics::Physics() : m_c0(1.0) {}
 
 // @@ the Physics destructor
 Physics::~Physics() = default;
 
+void Physics::setUseCudaMxm(bool enable) {
+#ifdef NEKWAVE_ENABLE_CUDA
+    s_useCudaMxm = enable;
+#else
+    (void)enable;
+    s_useCudaMxm = false;
+#endif
+}
+
+bool Physics::getUseCudaMxm() {
+    return s_useCudaMxm;
+}
 
 // --------------------- (!) ---------------------
 
 // @@ matrix-matrix multiplication C = A * B in column-major layout
 // Fast tensor contraction operator matching NekCEM's mxm
 void Physics::mxm(const double* A, int n1, const double* B, int n2, double* C, int n3) {
+#ifdef NEKWAVE_ENABLE_CUDA
+    if (s_useCudaMxm) {
+        nw_cuda_mxm(A, n1, B, n2, C, n3);
+        return;
+    }
+#endif
     // @@ looping over the columns of C
     for (int j = 0; j < n3; ++j) {
         // @@ looping over the rows of C

@@ -285,6 +285,47 @@ void MaxwellPhysicsStabilityTest() {
     std::cout << "  PASSED" << std::endl;
 }
 
+#ifdef NEKWAVE_ENABLE_CUDA
+/*
+ * Test 4: CUDA Matrix Multiplication Consistency Test
+ *
+ * Verifies that Physics::mxm with CUDA acceleration yields identical numerical
+ * results compared to the reference CPU implementation for DG-SEM tensor contractions.
+ */
+void CudaMxmConsistencyTest() {
+    std::cout << "[RUN] CudaMxmConsistencyTest..." << std::endl;
+
+    const int N = 6;
+    // Contraction 1: ur = (I (x) I (x) D) u -> (6x6) * (6x36)
+    int n1 = N, n2 = N, n3 = N * N;
+    std::vector<double> A(n1 * n2), B(n2 * n3), C_cpu(n1 * n3, 0.0), C_gpu(n1 * n3, 0.0);
+
+    for (int j = 0; j < n2; ++j) {
+        for (int i = 0; i < n1; ++i) {
+            A[i + j * n1] = std::sin(0.3 * (i + 1) + 0.7 * (j + 1));
+        }
+    }
+    for (int j = 0; j < n3; ++j) {
+        for (int i = 0; i < n2; ++i) {
+            B[i + j * n2] = std::cos(0.5 * (i + 1) - 0.2 * (j + 1));
+        }
+    }
+
+    Physics::setUseCudaMxm(false);
+    Physics::mxm(A.data(), n1, B.data(), n2, C_cpu.data(), n3);
+
+    Physics::setUseCudaMxm(true);
+    Physics::mxm(A.data(), n1, B.data(), n2, C_gpu.data(), n3);
+
+    for (size_t k = 0; k < C_cpu.size(); ++k) {
+        EXPECT_NEAR(C_cpu[k], C_gpu[k], 1e-12);
+    }
+
+    g_testsPassed++;
+    std::cout << "  PASSED" << std::endl;
+}
+#endif
+
 /*
  * Main entry point for the NekWave test harness.
  *
@@ -296,6 +337,7 @@ void MaxwellPhysicsStabilityTest() {
  *   ./nekwave-test MeshQuadratureTest        (runs only MeshQuadratureTest)
  *   ./nekwave-test ProbeScalingTest         (runs only ProbeScalingTest)
  *   ./nekwave-test MaxwellPhysicsStabilityTest (runs only MaxwellPhysicsStabilityTest)
+ *   ./nekwave-test CudaMxmConsistencyTest    (runs only CudaMxmConsistencyTest)
  */
 int main(int argc, char* argv[]) {
     std::string filter = (argc > 1) ? argv[1] : "";
@@ -316,6 +358,11 @@ int main(int argc, char* argv[]) {
     if (filter.empty() || filter == "MaxwellPhysicsStabilityTest") {
         MaxwellPhysicsStabilityTest();
     }
+#ifdef NEKWAVE_ENABLE_CUDA
+    if (filter.empty() || filter == "CudaMxmConsistencyTest") {
+        CudaMxmConsistencyTest();
+    }
+#endif
 
     std::cout << "----------------------------------------------------------" << std::endl;
     std::cout << "Test Summary: " << g_testsPassed << " passed, " 
