@@ -1,0 +1,31 @@
+# Build directories and binaries
+build/
+app/
+nekwave
+nekwave_prof
+nekwave-test
+*.prof
+
+# Compiled object and dependency files
+*.o
+*.d
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+Testing/
+
+# Simulation outputs
+output/
+examples/*/output/
+examples/**/output/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# System artifacts
+.DS_Store

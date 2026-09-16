@@ -1,0 +1,23 @@
+# Example: 3D PEC Cavity Gaussian Pulse
+elements_x = 10
+elements_y = 10
+elements_z = 10
+order = 6
+
+L_x = 2.0
+L_y = 2.0
+L_z = 2.0
+
+cfl = auto
+dt = auto
+num_steps = 3000
+output_freq = 50
+pulse_sigma = 20.0
+C0 = 0.0 # Central flux (energy-conserving)
+output_dir = output
+
+# Observation probes defined in relative coordinates in (-0.5, 0.5)
+probe_rel = 0.16 0.15 -0.1333
+probe_rel = -0.24 0.20 0.1667
+probe_rel = 0.08 -0.25 -0.20
+

@@ -1,0 +1,22 @@
+# Example: 3D PEC Cavity Analytical TM_110 Standing Wave Eigenmode
+elements_x = 4
+elements_y = 4
+elements_z = 4
+order = 4
+
+L_x = 2.0
+L_y = 2.0
+L_z = 2.0
+
+cfl = auto
+dt = auto
+num_steps = 100
+output_freq = 25
+C0 = 0.0 # Energy-conserving central flux
+output_dir = output
+
+# Analytical mode parameters
+mode_m = 1
+mode_n = 1
+amplitude = 1.0
+

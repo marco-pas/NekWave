@@ -206,7 +206,82 @@ $$\mathbf{u} \leftarrow \mathbf{u} + b_s \, \mathbf{k}$$
 
 ---
 
-## 6. NekCEM Subroutine Reference Map
+## 6. Affine Transformations in Hexahedral DG-SEM
+
+### 6.1 Where Affine Transformations Are Used
+Affine transformations belong in the **`Mesh` geometry initialization** (`Mesh::initialize`, `Mesh::setAffineBox`, or `gengeom` in NekCEM).
+
+### 6.2 Mathematical Definition
+When an element $\Omega^e$ is an affine brick or parallelepiped, the mapping from the reference cube $[-1, 1]^3$ to physical space $\mathbf{x} = (x, y, z)$ is linear:
+
+$$\mathbf{x}(\boldsymbol{\xi}) = \mathbf{x}_0 + \mathcal{J}_{\text{aff}} \boldsymbol{\xi}, \quad \text{where } \boldsymbol{\xi} = (r, s, t)^T$$
+
+For an axis-aligned bounding box $[x_{\min}, x_{\max}] \times [y_{\min}, y_{\max}] \times [z_{\min}, z_{\max}]$:
+
+$$\begin{aligned}
+x(r) &= \frac{x_{\min} + x_{\max}}{2} + \frac{\Delta x}{2} r \\
+y(s) &= \frac{y_{\min} + y_{\max}}{2} + \frac{\Delta y}{2} s \\
+z(t) &= \frac{z_{\min} + z_{\max}}{2} + \frac{\Delta z}{2} t
+\end{aligned}$$
+
+### 6.3 Metric Invariants for Affine Elements
+The Jacobian matrix $\mathcal{J}_{\text{aff}}$ and its determinant $J$ are **constant throughout the entire element**:
+
+$$\mathcal{J}_{\text{aff}} = \begin{bmatrix} \frac{\Delta x}{2} & 0 & 0 \\ 0 & \frac{\Delta y}{2} & 0 \\ 0 & 0 & \frac{\Delta z}{2} \end{bmatrix}, \quad J = \det(\mathcal{J}_{\text{aff}}) = \frac{\Delta x \, \Delta y \, \Delta z}{8}$$
+
+The metric derivatives $\mathcal{J}^{-T}$ are similarly constant across all GLL points:
+
+$$\begin{bmatrix} r_x & s_x & t_x \\ r_y & s_y & t_y \\ r_z & s_z & t_z \end{bmatrix} = \begin{bmatrix} \frac{2}{\Delta x} & 0 & 0 \\ 0 & \frac{2}{\Delta y} & 0 \\ 0 & 0 & \frac{2}{\Delta z} \end{bmatrix}$$
+
+**Performance Consequence**: For affine elements, memory bandwidth can be drastically reduced because metric terms do not need to be stored per-point; a single set of 9 values and one Jacobian suffices for all $N_p$ nodes in that element.
+
+---
+
+## 7. Piola Transformations in Computational Electromagnetics
+
+### 7.1 Where the Piola Transformation Belongs
+The Piola transformation belongs in the **`Physics` spatial operator**:
+1. **In Volume Integration (`compute_weighted_curl`)**: Mapping curls between reference and physical coordinates.
+2. **In Surface Flux Evaluation (`computeFlux`)**: Preserving normal flux continuity across element interfaces via Nanson's formula.
+
+### 7.2 Differential Forms and Piola Mappings
+In CEM, electromagnetic fields are differential forms with specific geometric conservation properties:
+* **Electric/Magnetic field intensities ($\mathbf{E}, \mathbf{H}$)** are **1-forms** ($H(\text{curl})$). They must preserve tangential continuity across interfaces ($\hat{n} \times [[\mathbf{E}]] = 0$).
+* **Flux densities ($\mathbf{D}, \mathbf{B}$)** and **curls ($\nabla \times \mathbf{E}, \nabla \times \mathbf{H}$)** are **2-forms** ($H(\text{div})$). They must preserve normal continuity across interfaces ($\hat{n} \cdot [[\mathbf{B}]] = 0$).
+
+#### 1. Covariant Piola Transformation (for 1-forms $\mathbf{E}, \mathbf{H}$):
+$$\hat{\mathbf{u}}(\boldsymbol{\xi}) = \mathcal{J}^T \mathbf{u}(\mathbf{x}) \iff \mathbf{u}(\mathbf{x}) = \mathcal{J}^{-T} \hat{\mathbf{u}}(\boldsymbol{\xi})$$
+This guarantees circulation invariance:
+
+$$\int_C \mathbf{u} \cdot d\mathbf{x} = \int_{C_{\text{ref}}} \hat{\mathbf{u}} \cdot d\boldsymbol{\xi}$$
+
+#### 2. Contravariant Piola Transformation (for 2-forms $\mathbf{B}, \mathbf{D}$, and curls):
+$$\tilde{\mathbf{w}}(\boldsymbol{\xi}) = J \, \mathcal{J}^{-1} \mathbf{w}(\mathbf{x}) \iff \mathbf{w}(\mathbf{x}) = \frac{1}{J} \mathcal{J} \, \tilde{\mathbf{w}}(\boldsymbol{\xi})$$
+This guarantees surface flux invariance:
+
+$$\int_S \mathbf{w} \cdot d\mathbf{S} = \int_{S_{\text{ref}}} \tilde{\mathbf{w}} \cdot d\hat{\mathbf{S}}$$
+
+and automatically commutes with the divergence operator: $\nabla_{\mathbf{x}} \cdot \mathbf{w} = \frac{1}{J} \nabla_{\boldsymbol{\xi}} \cdot \tilde{\mathbf{w}}$.
+
+### 7.3 Commutation with the Curl Operator
+When a 1-form field is transformed covariantly ($\hat{\mathbf{u}} = \mathcal{J}^T \mathbf{u}$), its curl transforms contravariantly:
+
+$$\nabla_{\mathbf{x}} \times \mathbf{u} = \frac{1}{J} \, \mathcal{J} \left( \nabla_{\boldsymbol{\xi}} \times \hat{\mathbf{u}} \right)$$
+
+In NekCEM, rather than transforming the entire field to reference space and back, the code computes derivatives of the Cartesian components $(u_x, u_y, u_z)$ directly via the metric cofactor relations ($J r_x, J s_x, \dots$), which satisfies the discrete **Piola identity**:
+
+$$\nabla_{\boldsymbol{\xi}} \cdot \left( J \, \mathcal{J}^{-1} \right) = \mathbf{0}$$
+
+### 7.4 Surface Fluxes: Nanson's Formula
+At element faces, a physical area element $d\mathbf{S} = \hat{n} \, dA$ is mapped from reference face normal $d\hat{\mathbf{S}} = \hat{n}_{\text{ref}} \, dA_{\text{ref}}$ via **Nanson's formula**:
+
+$$\hat{n} \, dA = J \, \mathcal{J}^{-T} \hat{n}_{\text{ref}} \, dA_{\text{ref}}$$
+
+In `cem_maxwell_flux3d`, this relation ensures that tangential traces and jump terms $\hat{n} \times [[\mathbf{E}]]$ and $\hat{n} \times [[\mathbf{H}]]$ computed in physical coordinates correctly couple with the face metric areas $A_j$ (`aream`) during surface flux lifting (`cem_maxwell_add_flux_to_res`).
+
+---
+
+## 8. NekCEM Subroutine Reference Map
 
 | Subroutine | Source File | Mathematical / Computational Function |
 |---|---|---|
@@ -227,4 +302,3 @@ $$\mathbf{u} \leftarrow \mathbf{u} + b_s \, \mathbf{k}$$
 | `cem_maxwell_invqmass` | `cem_maxwell.F` | Inverts diagonal mass matrix (divides by $\varepsilon J W$ and $\mu J W$) |
 | `rk_maxwell_ab` / `rk4_upd` | `cem_common.F` / `cem_maxwell.F` | Applies low-storage Runge-Kutta accumulator updates |
 | `q_filter` | `filter.F` | Applies modal filtering to suppress polynomial aliasing instabilities |
-
