@@ -20,10 +20,12 @@ CTestTestfile.cmake
 compile_commands.json
 Testing/
 
-# Simulation outputs
+# Simulation outputs and results across all folders
 output/
-examples/*/output/
-examples/**/output/
+**/output/
+results/
+**/results/*
+!**/results/.gitkeep
 
 # Python cache
 __pycache__/

@@ -224,6 +224,10 @@ def load_case_params(case_file=None, input_dir=None):
 
 def load_csv_data(filepath):
     """Loads CSV file while properly skipping comments and headers."""
+    if not filepath or not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+        print(f"[NekWave Postprocess] Warning: {filepath} is empty or not found.")
+        return None
+
     print(f"[NekWave Postprocess] Loading: {filepath}")
     col_names = None
     header_line_idx = -1
@@ -237,9 +241,12 @@ def load_csv_data(filepath):
             break
 
     if not col_names:
-        raise ValueError(f"Could not find valid CSV header in {filepath}")
+        print(f"[NekWave Postprocess] Warning: Could not find valid CSV header in {filepath}")
+        return None
 
     data = np.genfromtxt(filepath, delimiter=',', comments='#', skip_header=header_line_idx + 1)
+    if data.size == 0:
+        return None
     if data.ndim == 1:
         data = data.reshape(1, -1)
     data_dict = {}
@@ -259,15 +266,19 @@ def generate_dashboard(args=None):
     field_final_file = find_file("field_final.csv", input_dir)
     probe_file = find_file("probe_history.csv", input_dir)
 
-    if not energy_file or not field_init_file or not field_final_file:
-        print("[Error] Required simulation CSV files (energy_history.csv, field_initial.csv, field_final.csv) not found.")
+    if not energy_file:
+        print("[Error] Required energy_history.csv not found.")
         if input_dir:
             print(f"  Looked inside: {input_dir}")
         return
 
     energy_data = load_csv_data(energy_file)
-    f_init = load_csv_data(field_init_file)
-    f_final = load_csv_data(field_final_file)
+    if not energy_data:
+        print(f"[Error] Failed to read energy data from {energy_file}")
+        return
+
+    f_init = load_csv_data(field_init_file) if field_init_file else None
+    f_final = load_csv_data(field_final_file) if field_final_file else None
 
     time_hist = energy_data['time']
     energy_hist = energy_data['energy']
@@ -282,14 +293,26 @@ def generate_dashboard(args=None):
     e0 = energy_hist[0]
     drift = (energy_hist - e0) / e0 if e0 != 0 else np.zeros_like(energy_hist)
 
-    # Setup single unified figure with GridSpec: 2 panels on top, 1 wide panel on bottom
-    fig = plt.figure(figsize=(11, 8), dpi=150)
-    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.15], hspace=0.38, wspace=0.25)
+    has_fields = (f_init is not None and f_final is not None and 
+                  'x' in f_init and 'x' in f_final and 'Ez' in f_init and 'Ez' in f_final)
+
+    if has_fields:
+        fig = plt.figure(figsize=(11, 8), dpi=150)
+        gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.15], hspace=0.38, wspace=0.25)
+        ax_energy = fig.add_subplot(gs[0, 0])
+        ax_cut = fig.add_subplot(gs[0, 1])
+        ax_fft = fig.add_subplot(gs[1, :])
+    else:
+        # Clean 2-panel layout focused on Energy Conservation and Cavity Resonant Modes
+        fig = plt.figure(figsize=(10, 7.5), dpi=150)
+        gs = fig.add_gridspec(2, 1, height_ratios=[1.0, 1.3], hspace=0.35)
+        ax_energy = fig.add_subplot(gs[0])
+        ax_cut = None
+        ax_fft = fig.add_subplot(gs[1])
 
     # -------------------------------------------------------------------------
-    # Panel 1 (Top-Left): Relative Energy Drift
+    # Panel 1: Relative Energy Drift
     # -------------------------------------------------------------------------
-    ax_energy = fig.add_subplot(gs[0, 0])
     ax_energy.axhline(0.0, color='black', linestyle='--', linewidth=0.8, alpha=0.5)
     ax_energy.plot(time_hist, drift, '-', color='#1f77b4', linewidth=1.5, label='$(U(t)-U_0)/U_0$')
     ax_energy.set_xlabel('Time $t$')
@@ -299,48 +322,53 @@ def generate_dashboard(args=None):
     ax_energy.ticklabel_format(style='sci', scilimits=(0, 0), axis='y')
     ax_energy.grid(True, linestyle=':', alpha=0.5)
 
-    # -------------------------------------------------------------------------
-    # Panel 2 (Top-Right): Centerline Spatial Field Cut Ez(x)
-    # -------------------------------------------------------------------------
-    ax_cut = fig.add_subplot(gs[0, 1])
-    dist_init = np.hypot(f_init['y'] - yc, f_init['z'] - zc)
-    tol_r = 0.08 * min(Ly, Lz)
-    mask_init = dist_init <= tol_r
-    if np.sum(mask_init) < 20:
-        idx_c = np.argsort(dist_init)[:max(50, int(0.02 * len(dist_init)))]
-        mask_init = np.zeros(len(dist_init), dtype=bool)
-        mask_init[idx_c] = True
-
-    dist_final = np.hypot(f_final['y'] - yc, f_final['z'] - zc)
-    mask_final = dist_final <= tol_r
-    if np.sum(mask_final) < 20:
-        idx_c = np.argsort(dist_final)[:max(50, int(0.02 * len(dist_final)))]
-        mask_final = np.zeros(len(dist_final), dtype=bool)
-        mask_final[idx_c] = True
-
-    x_cut_init = f_init['x'][mask_init]
-    Ez_cut_init = f_init['Ez'][mask_init]
-    order_init = np.argsort(x_cut_init)
-
-    x_cut_final = f_final['x'][mask_final]
-    Ez_cut_final = f_final['Ez'][mask_final]
-    order_final = np.argsort(x_cut_final)
-
-    t_final = time_hist[-1] if len(time_hist) > 0 else 0.0
-    ax_cut.plot(x_cut_init[order_init], Ez_cut_init[order_init], 'k--', linewidth=1.2, label='Initial ($t = 0$)')
-    ax_cut.plot(x_cut_final[order_final], Ez_cut_final[order_final], 'r-', linewidth=1.2, label=f'Final ($t = {t_final:.2f}$)')
-    dx_margin = 0.04 * Lx
-    ax_cut.set_xlim([xmin - dx_margin, xmax + dx_margin])
-    ax_cut.set_xlabel('Spatial coordinate $x$')
-    ax_cut.set_ylabel('Electric field $E_z$')
-    ax_cut.set_title('Centerline Field Cut ($y = y_c, z = z_c$)')
-    ax_cut.legend(loc='upper right', frameon=False)
-    ax_cut.grid(True, linestyle=':', alpha=0.5)
+    max_abs_drift = float(np.max(np.abs(drift))) if len(drift) > 0 else 0.0
+    final_drift = float(drift[-1]) if len(drift) > 0 else 0.0
+    drift_text = f"$U_0 = {e0:.6e}$\nMax $|\\Delta U/U_0| = {max_abs_drift:.2e}$\nFinal $\\Delta U/U_0 = {final_drift:+.2e}$"
+    ax_energy.text(0.02, 0.95, drift_text, transform=ax_energy.transAxes, verticalalignment='top',
+                   fontsize=9, bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.85, edgecolor='#cccccc'))
+    ax_energy.legend(loc='best', frameon=False)
 
     # -------------------------------------------------------------------------
-    # Panel 3 (Bottom): Wide 1D Multi-Probe Fourier Spectrum
+    # Panel 2: Centerline Spatial Field Cut Ez(x) (if field data present)
     # -------------------------------------------------------------------------
-    ax_fft = fig.add_subplot(gs[1, :])
+    if ax_cut is not None:
+        dist_init = np.hypot(f_init['y'] - yc, f_init['z'] - zc)
+        tol_r = 0.08 * min(Ly, Lz)
+        mask_init = dist_init <= tol_r
+        if np.sum(mask_init) < 20:
+            idx_c = np.argsort(dist_init)[:max(50, int(0.02 * len(dist_init)))]
+            mask_init = np.zeros(len(dist_init), dtype=bool)
+            mask_init[idx_c] = True
+
+        dist_final = np.hypot(f_final['y'] - yc, f_final['z'] - zc)
+        mask_final = dist_final <= tol_r
+        if np.sum(mask_final) < 20:
+            idx_c = np.argsort(dist_final)[:max(50, int(0.02 * len(dist_final)))]
+            mask_final = np.zeros(len(dist_final), dtype=bool)
+            mask_final[idx_c] = True
+
+        x_cut_init = f_init['x'][mask_init]
+        Ez_cut_init = f_init['Ez'][mask_init]
+        order_init = np.argsort(x_cut_init)
+
+        x_cut_final = f_final['x'][mask_final]
+        Ez_cut_final = f_final['Ez'][mask_final]
+        order_final = np.argsort(x_cut_final)
+
+        t_final = time_hist[-1] if len(time_hist) > 0 else 0.0
+        ax_cut.plot(x_cut_init[order_init], Ez_cut_init[order_init], 'k--', linewidth=1.2, label='Initial ($t = 0$)')
+        ax_cut.plot(x_cut_final[order_final], Ez_cut_final[order_final], 'r-', linewidth=1.2, label=f'Final ($t = {t_final:.2f}$)')
+        dx_margin = 0.04 * Lx
+        ax_cut.set_xlim([xmin - dx_margin, xmax + dx_margin])
+        ax_cut.legend(loc='best', frameon=False)
+        ax_cut.set_xlabel('Spatial coordinate $x$')
+        ax_cut.set_ylabel('Electric field $E_z$')
+        ax_cut.set_title('Centerline Field Cut ($y = y_c, z = z_c$)')
+        ax_cut.grid(True, linestyle=':', alpha=0.5)
+
+    # -------------------------------------------------------------------------
+    # Panel 3: Wide 1D Multi-Probe Fourier Spectrum
 
     if probe_file:
         probe_data = load_csv_data(probe_file)
@@ -446,7 +474,7 @@ def generate_dashboard(args=None):
             ax_fft.set_xlabel('Frequency $f$ [cycles / time]')
             ax_fft.set_ylabel('Normalized Amplitude $|\\hat{E}_z(f)|$')
             ax_fft.set_title('Cavity Resonant Mode Frequency Spectrum (1D Multi-Probe FFT)')
-            ax_fft.legend(loc='upper right', frameon=False, ncol=len(probe_indices))
+            ax_fft.legend(loc='best', frameon=False, ncol=len(probe_indices))
             ax_fft.grid(True, linestyle=':', alpha=0.5)
         else:
             ax_fft.text(0.5, 0.5, 'Insufficient probe time samples for FFT', ha='center', va='center')
@@ -459,11 +487,63 @@ def generate_dashboard(args=None):
     plt.close()
     print(f"[NekWave Postprocess] Master dashboard saved: {out_file}")
 
+    # -------------------------------------------------------------------------
+    # Terminal Summary Report: Energy Drift & Cavity Resonant Modes
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 76)
+    print("                    NekWave Simulation Analysis Report")
+    print("=" * 76)
+    print(f" Initial Energy U_0:      {e0:.8e}")
+    print(f" Final Energy U_f:        {energy_hist[-1]:.8e}")
+    print(f" Maximum Relative Drift:  {max_abs_drift:.4e}")
+    print(f" Final Relative Drift:    {final_drift:+.4e}")
+    print("-" * 76)
+    print(f"{'Step':>8} | {'Time':>10} | {'Total Energy':>18} | {'Relative Drift':>18}")
+    print("-" * 76)
+    step_hist = energy_data.get('step', np.arange(len(time_hist)))
+    num_pts = len(time_hist)
+    # Print up to 15 evenly spaced points plus initial and final
+    stride = max(1, num_pts // 12)
+    printed_indices = set(range(0, num_pts, stride))
+    printed_indices.add(num_pts - 1)
+    for idx in sorted(printed_indices):
+        s_val = int(step_hist[idx]) if idx < len(step_hist) else idx
+        print(f"{s_val:8d} | {time_hist[idx]:10.4f} | {energy_hist[idx]:18.8e} | {drift[idx]:+18.4e}")
+    print("-" * 76)
+
+    # Cavity Resonant Modes
+    if probe_file and 'distinct_modes' in locals() and len(theory_freqs) > 0:
+        print("\n Cavity Resonant Mode Spectrum (Detected FFT Peaks vs. Theory):")
+        print(f"{'Peak Freq (f)':>14} | {'Theory Freq':>12} | {'Cavity Mode (m,n,p)':>20} | {'Error (%)':>10}")
+        print("-" * 76)
+
+        # Detect local peaks in combined spectrum
+        peaks = []
+        for p_i in range(1, len(freqs) - 1):
+            if freq_mask[p_i] and freqs[p_i] > 0.05 and all_spec[p_i] > 0.05:
+                if all_spec[p_i] > all_spec[p_i - 1] and all_spec[p_i] > all_spec[p_i + 1]:
+                    peaks.append((freqs[p_i], all_spec[p_i]))
+        peaks.sort(key=lambda x: x[1], reverse=True)
+
+        for f_pk, amp in peaks[:8]:
+            dists = np.abs(theory_freqs - f_pk)
+            b_idx = np.argmin(dists)
+            f_th = theory_freqs[b_idx]
+            m_lbl = distinct_modes[b_idx][1]
+            err = 100.0 * abs(f_pk - f_th) / f_th if f_th > 0 else 0.0
+            print(f"{f_pk:14.5f} | {f_th:12.5f} | {m_lbl:>20} | {err:9.2f}%")
+        print("=" * 76 + "\n")
+
     # Copy to agent artifact directory if available
-    artifact_dir = "/Users/marcopas/.gemini/antigravity/brain/9bd5118a-edc6-42e1-b35d-b075cb9801db"
-    if os.path.isdir(artifact_dir):
-        dest = os.path.join(artifact_dir, filename)
-        shutil.copyfile(out_file, dest)
+    artifact_dirs = [
+        "/afs/pdc.kth.se/home/m/marcopas/.gemini/antigravity/brain/e9a93cc1-19fc-435d-be1d-a448fc998657",
+        os.environ.get("ANTIGRAVITY_ARTIFACT_DIR", "")
+    ]
+    for ad in artifact_dirs:
+        if ad and os.path.isdir(ad):
+            dest = os.path.join(ad, filename)
+            shutil.copyfile(out_file, dest)
+            print(f"[NekWave Postprocess] Synced to agent artifact: {dest}")
 
 if __name__ == "__main__":
     cli_args = parse_args()

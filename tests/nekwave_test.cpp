@@ -1,16 +1,18 @@
 // Verification and Unit Tests
 
 #include "mesh.hpp"
-#include "physics.hpp"
-#include "timestepperrk45.hpp"
+#include "dg_solver.hpp"
 #include "config.hpp"
 #include "probe.hpp"
+#include "case.hpp"
 
 #include <iostream>
+#include <fstream>
 #include <cassert>
 #include <cmath>
 #include <vector>
 #include <string>
+#include <sys/stat.h>
 
 // Global test execution counters
 static int g_testsPassed = 0;
@@ -207,17 +209,17 @@ void ProbeScalingTest() {
  *      U(t_{n+1}) <= U(t_n) + tol
  *    and that field values remain strictly finite (no NaN or Inf).
  */
-void MaxwellPhysicsStabilityTest() {
-    std::cout << "[RUN] MaxwellPhysicsStabilityTest..." << std::endl;
+void MaxwellStabilityTest() {
+    std::cout << "[RUN] MaxwellStabilityTest (GPU DgSolver)..." << std::endl;
 
     // Polynomial order N = 4 (P = 3) on a 2x2x2 mesh of elements
     const int N = 4;
     Mesh mesh(N, 1);
     mesh.createBoxMesh(2, 2, 2, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5);
 
-    // Configure Maxwell physics with upwind numerical flux (C0 = 1.0, strictly dissipative)
-    Physics physics;
-    physics.setC0(1.0);
+    // Initialize GPU DgSolver with upwind numerical flux (C0 = 1.0, strictly dissipative)
+    DgSolver solver;
+    solver.initialize(mesh, 1.0);
 
     const int npts = mesh.getTotalPoints();
 
@@ -264,13 +266,16 @@ void MaxwellPhysicsStabilityTest() {
     double initialEnergy = computeEnergy(state);
     EXPECT_TRUE(initialEnergy > 0.0);
 
-    // Advance 5 time steps using the 5-stage Low-Storage Runge-Kutta integrator
-    TimeStepperRK45 stepper;
+    // Upload initial state to GPU
+    solver.uploadState(state.data(), state.size());
+
+    // Advance 5 time steps using the GPU DgSolver (5-stage LSRK45)
     const double dt = 0.005;
     double t = 0.0;
     for (int s = 0; s < 5; ++s) {
-        stepper.step(mesh, physics, state, dt, t);
+        solver.step(dt, t);
         t += dt;
+        solver.downloadState(state.data(), state.size());
         double currentEnergy = computeEnergy(state);
 
         // Discrete energy must be non-increasing for upwind flux formulation (dU/dt <= 0)
@@ -281,50 +286,204 @@ void MaxwellPhysicsStabilityTest() {
         EXPECT_TRUE(!std::isinf(currentEnergy));
     }
 
+    solver.finalize();
+
     g_testsPassed++;
     std::cout << "  PASSED" << std::endl;
 }
 
-#ifdef NEKWAVE_ENABLE_CUDA
 /*
- * Test 4: CUDA Matrix Multiplication Consistency Test
+ * Test 4: Case Input Loading and Zero Disk Artifacts Verification
  *
- * Verifies that Physics::mxm with CUDA acceleration yields identical numerical
- * results compared to the reference CPU implementation for DG-SEM tensor contractions.
+ * Verifies that loading a test input fixture from tests/input/ with output_dir = none
+ * runs correctly and produces zero output files on disk (no test pollution).
  */
-void CudaMxmConsistencyTest() {
-    std::cout << "[RUN] CudaMxmConsistencyTest..." << std::endl;
+void CaseInputLoadingTest() {
+    std::cout << "[RUN] CaseInputLoadingTest..." << std::endl;
 
-    const int N = 6;
-    // Contraction 1: ur = (I (x) I (x) D) u -> (6x6) * (6x36)
-    int n1 = N, n2 = N, n3 = N * N;
-    std::vector<double> A(n1 * n2), B(n2 * n3), C_cpu(n1 * n3, 0.0), C_gpu(n1 * n3, 0.0);
+#ifdef NEKWAVE_SOURCE_DIR
+    std::string parFile = std::string(NEKWAVE_SOURCE_DIR) + "/tests/input/cavity_gaussian.par";
+#else
+    std::string parFile = "tests/input/cavity_gaussian.par";
+#endif
 
-    for (int j = 0; j < n2; ++j) {
-        for (int i = 0; i < n1; ++i) {
-            A[i + j * n1] = std::sin(0.3 * (i + 1) + 0.7 * (j + 1));
-        }
-    }
-    for (int j = 0; j < n3; ++j) {
-        for (int i = 0; i < n2; ++i) {
-            B[i + j * n2] = std::cos(0.5 * (i + 1) - 0.2 * (j + 1));
-        }
-    }
+    // Verify input file exists
+    std::ifstream f(parFile.c_str());
+    EXPECT_TRUE(f.good());
+    f.close();
 
-    Physics::setUseCudaMxm(false);
-    Physics::mxm(A.data(), n1, B.data(), n2, C_cpu.data(), n3);
+    Case testCase;
+    testCase.loadConfig(parFile);
 
-    Physics::setUseCudaMxm(true);
-    Physics::mxm(A.data(), n1, B.data(), n2, C_gpu.data(), n3);
+    // Override to a fast 2-step run for unit testing
+    testCase.config().numSteps = 2;
+    testCase.config().outputFreq = 1;
 
-    for (size_t k = 0; k < C_cpu.size(); ++k) {
-        EXPECT_NEAR(C_cpu[k], C_gpu[k], 1e-12);
-    }
+    EXPECT_TRUE(testCase.config().outputDir == "none");
+    EXPECT_TRUE(!testCase.config().exportFields);
+
+    // Run the full 3-phase lifecycle
+    testCase.run();
+
+    // Verify that output_dir was "none" and no files/directories were created
+    struct stat st;
+    int res = stat("none", &st);
+    EXPECT_TRUE(res != 0); // Directory 'none' must NOT exist
+
+#ifdef NEKWAVE_BUILD_DIR
+    std::string buildNone = std::string(NEKWAVE_BUILD_DIR) + "/none";
+    res = stat(buildNone.c_str(), &st);
+    EXPECT_TRUE(res != 0); // Directory '${BUILD}/none' must NOT exist
+#endif
 
     g_testsPassed++;
     std::cout << "  PASSED" << std::endl;
 }
+
+/*
+ * Test 5: Numerical Dispersion Benchmark Test
+ *
+ * Verifies that loading the numerical dispersion test fixture from
+ * tests/input/numerical_dispersion.par initializes the DG-SEM Maxwell
+ * solver, injects the wavepacket initial condition, advances in time
+ * on GPU, and produces zero output files on disk.
+ */
+void NumericalDispersionTest() {
+    std::cout << "[RUN] NumericalDispersionTest..." << std::endl;
+
+#ifdef NEKWAVE_SOURCE_DIR
+    std::string parFile = std::string(NEKWAVE_SOURCE_DIR) + "/tests/input/numerical_dispersion.par";
+#else
+    std::string parFile = "tests/input/numerical_dispersion.par";
 #endif
+
+    std::ifstream f(parFile.c_str());
+    EXPECT_TRUE(f.good());
+    f.close();
+
+    Case dispersionCase;
+    dispersionCase.loadConfig(parFile);
+
+    EXPECT_TRUE(dispersionCase.config().outputDir == "none");
+    EXPECT_TRUE(!dispersionCase.config().exportFields);
+
+    const auto& cfg = dispersionCase.config();
+    const double Lx = cfg.Lx;
+    const double Ly = cfg.Ly;
+    const double xmin = cfg.xmin;
+    const double carrierK = cfg.getDouble("carrier_k", 4.0 * M_PI);
+    const double sigma = cfg.getDouble("packet_sigma", 0.30);
+    const double x0 = cfg.getDouble("packet_x0", xmin + 0.25 * Lx);
+
+    // Initial condition hook: modulated Gaussian wavepacket
+    dispersionCase.setInitialCondition([=](double x, double y, double /*z*/,
+                                          double& Ex, double& Ey, double& Ez,
+                                          double& Hx, double& Hy, double& Hz) {
+        Ex = 0.0; Ey = 0.0; Hx = 0.0; Hz = 0.0;
+        double yt = y - cfg.ymin;
+        double transY = std::sin(M_PI * yt / Ly);
+        double dxEnv = x - x0;
+        double envelope = std::exp(-(dxEnv * dxEnv) / (2.0 * sigma * sigma));
+        double carrier = std::cos(carrierK * dxEnv);
+        Ez = envelope * carrier * transY;
+        Hy = -Ez;
+    });
+
+    dispersionCase.run();
+
+    // Verify energy is strictly positive and finite
+    double totalEnergy = dispersionCase.computeTotalEnergy();
+    EXPECT_TRUE(totalEnergy > 0.0);
+    EXPECT_TRUE(!std::isnan(totalEnergy));
+    EXPECT_TRUE(!std::isinf(totalEnergy));
+
+    // Verify no output directories or files were created
+    struct stat st;
+    int res = stat("none", &st);
+    EXPECT_TRUE(res != 0);
+
+#ifdef NEKWAVE_BUILD_DIR
+    std::string buildNone = std::string(NEKWAVE_BUILD_DIR) + "/none";
+    res = stat(buildNone.c_str(), &st);
+    EXPECT_TRUE(res != 0);
+#endif
+
+    g_testsPassed++;
+    std::cout << "  PASSED" << std::endl;
+}
+
+/*
+ * Test 6: Periodic Boundary Condition Mesh Connectivity
+ *
+ * Verifies that structured Cartesian box meshes with periodic boundary conditions:
+ * 1. Tag boundary faces as "PERIODIC" rather than "PEC".
+ * 2. Assign valid exterior neighbor element IDs across the periodic wrap.
+ * 3. Correctly connect opposite face collocation nodes such that transverse
+ *    coordinates match exactly and longitudinal coordinates differ by domain length L.
+ * 4. Maintain non-periodic directions (e.g. Z) as PEC mirror conditions.
+ */
+void PeriodicBCTest() {
+    std::cout << "[RUN] PeriodicBCTest..." << std::endl;
+
+    const int N = 4;
+    Mesh mesh(N, 1);
+
+    // 2x2x2 mesh with periodic in X and Y, PEC in Z
+    const double xmin = -2.0, xmax = 2.0;
+    const double ymin = -1.0, ymax = 1.0;
+    const double zmin = -0.5, zmax = 0.5;
+    mesh.createBoxMesh(2, 2, 2, xmin, xmax, ymin, ymax, zmin, zmax, true, true, false);
+
+    const auto& faceData = mesh.getFaceData();
+    const auto& x = mesh.getCoordX();
+    const auto& y = mesh.getCoordY();
+    const auto& z = mesh.getCoordZ();
+
+    int periodicFacesCount = 0;
+    int pecFacesCount = 0;
+
+    for (size_t f = 0; f < faceData.size(); ++f) {
+        const auto& fd = faceData[f];
+        if (fd.bcType == "PERIODIC") {
+            periodicFacesCount++;
+            for (const auto& pt : fd.points) {
+                EXPECT_TRUE(pt.volIdxPlus >= 0);
+                int vM = pt.volIdxMinus;
+                int vP = pt.volIdxPlus;
+
+                // For X-periodic faces (face 1 and 3): Y and Z coordinates must match exactly
+                if (fd.faceId == 1 || fd.faceId == 3) {
+                    EXPECT_NEAR(y[vM], y[vP], 1e-12);
+                    EXPECT_NEAR(z[vM], z[vP], 1e-12);
+                    EXPECT_NEAR(std::abs(x[vM] - x[vP]), (xmax - xmin), 1e-12);
+                }
+                // For Y-periodic faces (face 0 and 2): X and Z coordinates must match exactly
+                if (fd.faceId == 0 || fd.faceId == 2) {
+                    EXPECT_NEAR(x[vM], x[vP], 1e-12);
+                    EXPECT_NEAR(z[vM], z[vP], 1e-12);
+                    EXPECT_NEAR(std::abs(y[vM] - y[vP]), (ymax - ymin), 1e-12);
+                }
+            }
+        } else if (fd.bcType == "PEC") {
+            pecFacesCount++;
+            // Must be Z boundary faces (face 4 or 5)
+            EXPECT_TRUE(fd.faceId == 4 || fd.faceId == 5);
+            for (const auto& pt : fd.points) {
+                EXPECT_TRUE(pt.volIdxPlus == -1);
+            }
+        }
+    }
+
+    // With 2x2x2 elements (8 elements, 48 faces total):
+    // Internal faces: 12 internal interfaces * 2 = 24 "E" faces
+    // Periodic faces: 4 in Xmin + 4 in Xmax + 4 in Ymin + 4 in Ymax = 16 "PERIODIC" faces
+    // PEC faces: 4 in Zmin + 4 in Zmax = 8 "PEC" faces
+    EXPECT_TRUE(periodicFacesCount == 16);
+    EXPECT_TRUE(pecFacesCount == 8);
+
+    g_testsPassed++;
+    std::cout << "  PASSED" << std::endl;
+}
 
 /*
  * Main entry point for the NekWave test harness.
@@ -336,8 +495,10 @@ void CudaMxmConsistencyTest() {
  *   ./nekwave-test                           (runs all tests)
  *   ./nekwave-test MeshQuadratureTest        (runs only MeshQuadratureTest)
  *   ./nekwave-test ProbeScalingTest         (runs only ProbeScalingTest)
- *   ./nekwave-test MaxwellPhysicsStabilityTest (runs only MaxwellPhysicsStabilityTest)
- *   ./nekwave-test CudaMxmConsistencyTest    (runs only CudaMxmConsistencyTest)
+ *   ./nekwave-test MaxwellStabilityTest     (runs only MaxwellStabilityTest)
+ *   ./nekwave-test CaseInputLoadingTest     (runs only CaseInputLoadingTest)
+ *   ./nekwave-test NumericalDispersionTest  (runs only NumericalDispersionTest)
+ *   ./nekwave-test PeriodicBCTest           (runs only PeriodicBCTest)
  */
 int main(int argc, char* argv[]) {
     std::string filter = (argc > 1) ? argv[1] : "";
@@ -355,14 +516,19 @@ int main(int argc, char* argv[]) {
     if (filter.empty() || filter == "ProbeScalingTest") {
         ProbeScalingTest();
     }
-    if (filter.empty() || filter == "MaxwellPhysicsStabilityTest") {
-        MaxwellPhysicsStabilityTest();
+    if (filter.empty() || filter == "MaxwellStabilityTest" || filter == "MaxwellPhysicsStabilityTest") {
+        MaxwellStabilityTest();
     }
-#ifdef NEKWAVE_ENABLE_CUDA
-    if (filter.empty() || filter == "CudaMxmConsistencyTest") {
-        CudaMxmConsistencyTest();
+    if (filter.empty() || filter == "CaseInputLoadingTest") {
+        CaseInputLoadingTest();
     }
-#endif
+    if (filter.empty() || filter == "NumericalDispersionTest") {
+        NumericalDispersionTest();
+    }
+    if (filter.empty() || filter == "PeriodicBCTest") {
+        PeriodicBCTest();
+    }
+
 
     std::cout << "----------------------------------------------------------" << std::endl;
     std::cout << "Test Summary: " << g_testsPassed << " passed, " 

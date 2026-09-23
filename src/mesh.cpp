@@ -418,7 +418,8 @@ bool Mesh::loadFromRea(const std::string& filename) {
 bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                          double xmin, double xmax,
                          double ymin, double ymax,
-                         double zmin, double zmax) {
+                         double zmin, double zmax,
+                         bool periodicX, bool periodicY, bool periodicZ) {
     if (nelx < 1 || nely < 1 || nelz < 1) return false;
 
     m_numElements = nelx * nely * nelz;
@@ -465,6 +466,10 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f0.bcType = "E";
                     f0.neighborElementId = elemIdx(ex, ey - 1, ez);
                     f0.neighborFaceId = 2;
+                } else if (periodicY) {
+                    f0.bcType = "PERIODIC";
+                    f0.neighborElementId = elemIdx(ex, nely - 1, ez);
+                    f0.neighborFaceId = 2;
                 } else {
                     f0.bcType = "PEC";
                     f0.neighborElementId = -1; f0.neighborFaceId = -1;
@@ -477,6 +482,10 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                 if (ex < nelx - 1) {
                     f1.bcType = "E";
                     f1.neighborElementId = elemIdx(ex + 1, ey, ez);
+                    f1.neighborFaceId = 3;
+                } else if (periodicX) {
+                    f1.bcType = "PERIODIC";
+                    f1.neighborElementId = elemIdx(0, ey, ez);
                     f1.neighborFaceId = 3;
                 } else {
                     f1.bcType = "PEC";
@@ -491,6 +500,10 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f2.bcType = "E";
                     f2.neighborElementId = elemIdx(ex, ey + 1, ez);
                     f2.neighborFaceId = 0;
+                } else if (periodicY) {
+                    f2.bcType = "PERIODIC";
+                    f2.neighborElementId = elemIdx(ex, 0, ez);
+                    f2.neighborFaceId = 0;
                 } else {
                     f2.bcType = "PEC";
                     f2.neighborElementId = -1; f2.neighborFaceId = -1;
@@ -503,6 +516,10 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                 if (ex > 0) {
                     f3.bcType = "E";
                     f3.neighborElementId = elemIdx(ex - 1, ey, ez);
+                    f3.neighborFaceId = 1;
+                } else if (periodicX) {
+                    f3.bcType = "PERIODIC";
+                    f3.neighborElementId = elemIdx(nelx - 1, ey, ez);
                     f3.neighborFaceId = 1;
                 } else {
                     f3.bcType = "PEC";
@@ -517,6 +534,10 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f4.bcType = "E";
                     f4.neighborElementId = elemIdx(ex, ey, ez - 1);
                     f4.neighborFaceId = 5;
+                } else if (periodicZ) {
+                    f4.bcType = "PERIODIC";
+                    f4.neighborElementId = elemIdx(ex, ey, nelz - 1);
+                    f4.neighborFaceId = 5;
                 } else {
                     f4.bcType = "PEC";
                     f4.neighborElementId = -1; f4.neighborFaceId = -1;
@@ -529,6 +550,10 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                 if (ez < nelz - 1) {
                     f5.bcType = "E";
                     f5.neighborElementId = elemIdx(ex, ey, ez + 1);
+                    f5.neighborFaceId = 4;
+                } else if (periodicZ) {
+                    f5.bcType = "PERIODIC";
+                    f5.neighborElementId = elemIdx(ex, ey, 0);
                     f5.neighborFaceId = 4;
                 } else {
                     f5.bcType = "PEC";
@@ -741,6 +766,11 @@ void Mesh::setupFaceData() {
                 // Determine exterior neighbor node index
                 if (face.bcType == "PEC" || face.neighborElementId < 0) {
                     pt.volIdxPlus = -1;
+                } else if (face.bcType == "PERIODIC") {
+                    // Periodic boundary: aligned opposite Cartesian faces map directly by (pA, qA)
+                    int eB = face.neighborElementId;
+                    int fB = face.neighborFaceId;
+                    pt.volIdxPlus = getFaceNodeVolIndex(eB, fB, pA, qA);
                 } else {
                     int eB = face.neighborElementId;
                     int fB = face.neighborFaceId;

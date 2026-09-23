@@ -61,7 +61,8 @@ public:
     bool createBoxMesh(int nelx, int nely, int nelz,
                        double xmin = -1.0, double xmax = 1.0,
                        double ymin = -1.0, double ymax = 1.0,
-                       double zmin = -1.0, double zmax = 1.0);
+                       double zmin = -1.0, double zmax = 1.0,
+                       bool periodicX = false, bool periodicY = false, bool periodicZ = false);
 
     // @@ config an element with an affine bounding box transformation
     // Computes constant Jacobian J and metric factors J^{-T}
@@ -132,6 +133,9 @@ public:
     const std::vector<double>& getCoordX() const { return m_coord_x; }
     const std::vector<double>& getCoordY() const { return m_coord_y; }
     const std::vector<double>& getCoordZ() const { return m_coord_z; }
+
+    // @@ element corners in physical space
+    const std::vector<std::array<std::array<double, 3>, 8>>& getElementCorners() const { return m_elementCorners; }
 
 private:
     // @@ store polynomial degree parameters

@@ -13,11 +13,13 @@ NekWave/
 ├── src/                    # C++ source code and headers (.cpp, .hpp)
 │   ├── case.hpp / .cpp     # Modular 3-phase simulation lifecycle (preprocess, simulate, postprocess)
 │   ├── config.hpp          # Extensible key-value configuration parser and dynamic probes
+│   ├── dg_solver.hpp / .cpp # High-level GPU solver coordinator & LSRK45 stepper
+│   ├── device/             # Low-level CUDA device kernels and launchers
+│   │   ├── dg_kernels.cu   # Raw GPU kernels (volume curl, face flux, mass matrix, LSRK45 update)
+│   │   └── dg_kernels.hpp  # C++ launcher dispatch declarations
 │   ├── main.cpp            # Application CLI entry point
 │   ├── mesh.hpp / .cpp     # Spectral element mesh, GLL nodes, metric terms
-│   ├── physics.hpp / .cpp  # Maxwell DG spatial operator, flux, and curl
-│   ├── probe.hpp / .cpp    # Observation probes and time-series recording
-│   └── timestepperrk45.hpp / .cpp # 5-stage low-storage Runge-Kutta 4th order
+│   └── probe.hpp / .cpp    # Observation probes and time-series recording
 ├── examples/               # Modular Neko-style case suite
 │   ├── CMakeLists.txt      # Build and CTest registration for examples
 │   ├── cavity_gaussian/    # 3D PEC cavity Gaussian pulse benchmark (.par, .cpp, README)
@@ -39,33 +41,35 @@ NekWave/
 Following Neko's architecture (`neko/src/case.f90`), all simulations are organized into three explicit stages:
 
 1. **Preprocessing (`preprocess()`)**:
-   - Parses the configuration file and generic parameter dictionary.
-   - Loads or generates the hexahedral mesh (Cartesian box or `.rea` format).
-   - Computes GLL metric factors, Jacobians, and stable time-step bounds.
-   - Evaluates initial condition hooks (`InitialConditionFn`).
+   - Parses the case `.par` parameter file and spectral element mesh.
+   - Generates high-order Gauss-Lobatto-Legendre (GLL) quadrature nodes and computes metric Jacobian transformations.
+   - Evaluates initial electromagnetic conditions ($E$, $H$) on host RAM.
    - Registers observation probes and exports initial field distributions (`field_initial.csv`).
 
 2. **Simulation (`simulate()`)**:
-   - Advances explicit 5-stage Low-Storage Runge-Kutta 4th-order (LSRK45) time integration.
-   - Evaluates inter-element numerical fluxes and element-local volume curls.
+   - Allocates GPU memory and uploads mesh metrics and initial fields into GPU VRAM.
+   - Advances explicit 5-stage Low-Storage Runge-Kutta 4th-order (LSRK45) time integration entirely on GPU.
+   - Evaluates inter-element numerical fluxes and element-local volume curls in device kernels.
    - Streams time-series observations to observation probes and energy logs (`energy_history.csv`).
 
 3. **Postprocessing (`postprocess()`)**:
    - Finalizes probe logs and exports final field states (`field_final.csv`).
-   - Executes custom postprocessing hooks (`PostprocessingFn`), such as computing analytical $L^2$ error norms against closed-form solutions or performing spectral decompositions.
+   - Releases GPU allocations via `dgSolver_->finalize()`.
+   - Executes custom postprocessing hooks (`PostprocessingFn`).
 
 ## Getting Started
 
 ### Prerequisites
 
-* CMake 3.16 or higher
-* Modern C++ compiler supporting C++11 or later (`clang++` or `g++`)
+* CMake 3.18 or higher
+* Modern C++ compiler supporting C++11 or later (`g++` or `clang++`)
+* NVIDIA GPU and CUDA Toolkit (`nvcc`) (Mandatory)
 * Python 3 with `numpy`, `matplotlib`, and `scipy`
-* Optional: `gperftools` for CPU profiling
+* Optional: `gperftools` for profiling
 
 ### Building with CMake
 
-Configure and build with CMake:
+Configure and build with CMake (CUDA is required):
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release

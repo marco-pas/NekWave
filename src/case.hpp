@@ -2,8 +2,7 @@
 #define NW_SRC_CASE_HPP
 
 #include "mesh.hpp"
-#include "physics.hpp"
-#include "timestepperrk45.hpp"
+#include "dg_solver.hpp"
 #include "config.hpp"
 #include "probe.hpp"
 
@@ -23,13 +22,7 @@ using InitialConditionFn = std::function<void(double x, double y, double z,
                                               double& Ex, double& Ey, double& Ez,
                                               double& Hx, double& Hy, double& Hz)>;
 
-/**
- * @brief Forward declaration of Case and GpuSolver.
- */
 class Case;
-#ifdef NEKWAVE_ENABLE_CUDA
-class GpuSolver;
-#endif
 
 /**
  * @brief User-defined postprocessing callback signature.
@@ -46,7 +39,7 @@ using PostprocessingFn = std::function<void(Case& c)>;
  *
  *   1. preprocess(): Mesh loading, quadrature metrics, state allocation,
  *                    initial conditions, and observation probe registration.
- *   2. simulate():   LSRK45 time-stepping, continuous energy tracking,
+ *   2. simulate():   LSRK45 GPU time-stepping, continuous energy tracking,
  *                    and probe time-series recording.
  *   3. postprocess(): Final field export, file closure, and user postprocessing.
  */
@@ -87,8 +80,10 @@ public:
     const Mesh& mesh() const { return *mesh_; }
     Mesh& mesh() { return *mesh_; }
 
-    const Physics& physics() const { return *physics_; }
-    Physics& physics() { return *physics_; }
+    const DgSolver& solver() const { return *dgSolver_; }
+    DgSolver& solver() { return *dgSolver_; }
+    const DgSolver& dgSolver() const { return *dgSolver_; }
+    DgSolver& dgSolver() { return *dgSolver_; }
 
     const StateVector& state() const { return state_; }
     StateVector& state() { return state_; }
@@ -103,11 +98,7 @@ private:
     Config config_;
 
     std::unique_ptr<Mesh> mesh_;
-    std::unique_ptr<Physics> physics_;
-    std::unique_ptr<TimeStepperRK45> timeStepper_;
-#ifdef NEKWAVE_ENABLE_CUDA
-    std::unique_ptr<GpuSolver> gpuSolver_;
-#endif
+    std::unique_ptr<DgSolver> dgSolver_;
     ProbeManager probes_;
     StateVector state_;
 
@@ -129,4 +120,3 @@ private:
 };
 
 #endif // NW_SRC_CASE_HPP
-

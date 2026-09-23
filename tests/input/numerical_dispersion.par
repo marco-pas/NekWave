@@ -1,0 +1,40 @@
+# ==============================================================================
+# NekWave Example: 1-Element Bloch-Floquet & Periodic Boundary Benchmark
+# ==============================================================================
+# Single reference element with fully periodic boundary conditions
+elements_x = 1
+elements_y = 1
+elements_z = 1
+order = 10
+
+L_x = 1.0
+L_y = 1.0
+L_z = 1.0
+
+xmin = -0.5
+xmax =  0.5
+ymin = -0.5
+ymax =  0.5
+zmin = -0.5
+zmax =  0.5
+
+# Boundary conditions: Periodic across all directions
+periodic_x = true
+periodic_y = true
+periodic_z = true
+
+# Time-stepping
+cfl = auto
+dt = auto
+num_steps = 500
+output_freq = 1
+C0 = 0.0 # Central flux (energy-conserving) 0.0, upwind flux 1.0
+output_dir = none
+export_fields = false
+
+# Bloch-Floquet periodic wave excitation
+wave_type = bloch
+carrier_k = 6.283185307179586 # Fundamental periodic mode k0 = 2*pi / Lx
+num_modes = 4                 # Superposition of harmonic modes m = 1..4
+angle_deg = 0.0               # Direction of propagation
+num_probes = 8                # Probes placed directly at GLL collocation nodes

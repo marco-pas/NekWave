@@ -6,15 +6,15 @@
 
 #include "case.hpp"
 
-#ifdef NEKWAVE_ENABLE_CUDA
-#include "cuda/gpu_solver.hpp"
-#endif
-
 #include <iostream>
 #include <iomanip>
 #include <cmath>
 #include <cassert>
 #include <sys/stat.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 Case::Case()
     : dt_(0.0)
@@ -26,8 +26,7 @@ Case::Case()
     , bIsPostprocessed_(false)
 {
     mesh_ = std::unique_ptr<Mesh>(new Mesh());
-    physics_ = std::unique_ptr<Physics>(new Physics());
-    timeStepper_ = std::unique_ptr<TimeStepperRK45>(new TimeStepperRK45());
+    dgSolver_ = std::unique_ptr<DgSolver>(new DgSolver());
 }
 
 Case::Case(const std::string& configFile)
@@ -78,8 +77,22 @@ void Case::preprocess() {
 void Case::preprocess(const Config& cfg) {
     config_ = cfg;
 
+    bool bSaveOutput = (!config_.outputDir.empty() && 
+                        config_.outputDir != "none" && 
+                        config_.outputDir != "None" && 
+                        config_.outputDir != "NONE");
+
+#ifdef NEKWAVE_BUILD_DIR
+    // If outputDir is relative, always direct it inside the CMake build folder
+    if (bSaveOutput && config_.outputDir[0] != '/') {
+        config_.outputDir = std::string(NEKWAVE_BUILD_DIR) + "/" + config_.outputDir;
+    }
+#endif
+
     const std::string& outDir = config_.outputDir;
-    mkdir(outDir.c_str(), 0755);
+    if (bSaveOutput) {
+        mkdir(outDir.c_str(), 0755);
+    }
 
     mesh_->setN(config_.order);
 
@@ -92,10 +105,18 @@ void Case::preprocess(const Config& cfg) {
         std::cout << "             Domain: [" << config_.xmin << ", " << config_.xmax << "] x ["
                   << config_.ymin << ", " << config_.ymax << "] x ["
                   << config_.zmin << ", " << config_.zmax << "]" << std::endl;
+        if (config_.periodicX || config_.periodicY || config_.periodicZ) {
+            std::cout << "             Boundary Conditions: Periodic in ["
+                      << (config_.periodicX ? "X " : "")
+                      << (config_.periodicY ? "Y " : "")
+                      << (config_.periodicZ ? "Z " : "")
+                      << "]" << std::endl;
+        }
         mesh_->createBoxMesh(config_.nelx, config_.nely, config_.nelz,
                              config_.xmin, config_.xmax,
                              config_.ymin, config_.ymax,
-                             config_.zmin, config_.zmax);
+                             config_.zmin, config_.zmax,
+                             config_.periodicX, config_.periodicY, config_.periodicZ);
     } else if (!config_.meshFile.empty() && config_.meshFile != "box") {
         std::cout << "[PREPROCESS] Loading mesh file: " << config_.meshFile 
                   << " (Order N = " << config_.order << ")" << std::endl;
@@ -156,6 +177,127 @@ void Case::preprocess(const Config& cfg) {
             Hy[k] = hy;
             Hz[k] = hz;
         }
+    }
+    int actualNumModes = config_.getInt("num_modes", 1);
+    std::vector<double> actualModeK;
+    if (config_.has("wave_type") && (config_.getString("wave_type") == "bloch" || config_.getString("wave_type") == "periodic")) {
+        std::cout << "[PREPROCESS] Evaluating periodic Bloch electromagnetic plane wave in (Ez, Hx, Hy)..." << std::endl;
+        double* Ez = &state_[2 * npts];
+        double* Hx = &state_[3 * npts];
+        double* Hy = &state_[4 * npts];
+        const double Lx = config_.Lx;
+        const double Ly = config_.Ly;
+        const double xmin = config_.xmin;
+        const double ymin = config_.ymin;
+        const double carrierK = config_.getDouble("carrier_k", 2.0 * M_PI / Lx);
+        const double angleDeg = config_.getDouble("angle_deg", 0.0);
+        const double angleRad = angleDeg * M_PI / 180.0;
+
+        // Reciprocal lattice vector (mx, my) to guarantee exact periodic continuity across periodic boundaries
+        double kx = 0.0, ky = 0.0;
+        if (std::abs(angleDeg - 0.0) < 1e-4) {
+            kx = 2.0 * M_PI / Lx; ky = 0.0;
+        } else if (std::abs(angleDeg - 45.0) < 1e-4) {
+            kx = 2.0 * M_PI / Lx; ky = 2.0 * M_PI / Ly;
+        } else if (std::abs(angleDeg - 90.0) < 1e-4) {
+            kx = 0.0; ky = 2.0 * M_PI / Ly;
+        } else if (std::abs(angleDeg - 26.6) < 1.0 || std::abs(angleDeg - 30.0) < 5.0) {
+            kx = 4.0 * M_PI / Lx; ky = 2.0 * M_PI / Ly;
+        } else if (std::abs(angleDeg - 18.4) < 1.0 || std::abs(angleDeg - 15.0) < 5.0) {
+            kx = 6.0 * M_PI / Lx; ky = 2.0 * M_PI / Ly;
+        } else {
+            int mx = std::max(1, (int)std::round(std::cos(angleRad) * 4.0));
+            int my = (int)std::round(std::sin(angleRad) * 4.0);
+            kx = 2.0 * M_PI * mx / Lx;
+            ky = 2.0 * M_PI * my / Ly;
+        }
+        const double kMag = std::sqrt(kx * kx + ky * ky);
+        const double cosA = kx / kMag;
+        const double sinA = ky / kMag;
+        int pDegree = mesh_->getN() - 1;
+        int totalDofX = config_.nelx * pDegree;
+        int maxModes = std::max(1, totalDofX / 2);
+        int requestedModes = config_.getInt("num_modes", 1);
+        int numModes = std::min(requestedModes, maxModes);
+        if (requestedModes > maxModes) {
+            std::cout << "[PREPROCESS] Notice: num_modes clamped from " << requestedModes 
+                      << " to " << numModes << " (grid Nyquist limit = " 
+                      << maxModes << " modes for " << config_.nelx << " elements of order N=" 
+                      << mesh_->getN() << ")." << std::endl;
+        }
+        actualNumModes = numModes;
+
+        double kStart = config_.getDouble("k_start", 0.0);
+        double kEnd   = config_.getDouble("k_end", 0.0);
+        if (kStart > 0.0 && kEnd > 0.0) {
+            std::cout << "[PREPROCESS] Generating " << numModes 
+                      << " linspace modes from k = " << kStart 
+                      << " to " << kEnd << " rad/m" << std::endl;
+            for (int m = 0; m < numModes; ++m) {
+                double km = (numModes > 1) ? kStart + m * (kEnd - kStart) / (numModes - 1) : kStart;
+                actualModeK.push_back(km);
+            }
+        } else {
+            for (int m = 1; m <= numModes; ++m) {
+                actualModeK.push_back(m * kMag);
+            }
+        }
+
+        for (int k = 0; k < npts; ++k) {
+            double xt = x[k] - xmin;
+            double yt = y[k] - ymin;
+            double sumE = 0.0;
+            if (numModes > 1) {
+                for (size_t m = 0; m < actualModeK.size(); ++m) {
+                    double phase = actualModeK[m] * (cosA * xt + sinA * yt);
+                    sumE += std::cos(phase);
+                }
+                sumE /= std::sqrt((double)numModes);
+            } else {
+                double phase = (config_.has("carrier_k") && std::abs(angleDeg) < 1e-4)
+                                ? carrierK * xt
+                                : (kx * xt + ky * yt);
+                sumE = std::cos(phase);
+            }
+            Ez[k] = sumE;
+            Hx[k] =  sinA * sumE;
+            Hy[k] = -cosA * sumE;
+        }
+    } else if (config_.has("wave_type") && config_.getString("wave_type") == "multimode") {
+        std::cout << "[PREPROCESS] Evaluating multi-harmonic sinusoidal standing wave packet in Ez..." << std::endl;
+        double* Ez = &state_[2 * npts];
+        const double Lx = config_.Lx;
+        const double Ly = config_.Ly;
+        const double xmin = config_.xmin;
+        const double ymin = config_.ymin;
+        for (int k = 0; k < npts; ++k) {
+            double xt = x[k] - xmin;
+            double yt = y[k] - ymin;
+            double transY = std::sin(M_PI * yt / Ly);
+            double sumE = 0.0;
+            for (int m = 1; m <= 8; ++m) {
+                double km = m * M_PI / Lx;
+                sumE += (1.0 / m) * std::sin(km * xt);
+            }
+            Ez[k] = sumE * transY;
+        }
+    } else if (config_.has("wave_type") && config_.getString("wave_type") == "packet") {
+        std::cout << "[PREPROCESS] Evaluating modulated Gaussian wavepacket in Ez..." << std::endl;
+        const double carrierK = config_.getDouble("carrier_k", 4.0 * M_PI);
+        const double sigma    = config_.getDouble("packet_sigma", 0.30);
+        const double x0       = config_.getDouble("packet_x0", config_.xmin + 0.25 * config_.Lx);
+        const double xmin     = config_.xmin;
+        const double ymin     = config_.ymin;
+        const double Ly       = config_.Ly;
+        double* Ez = &state_[2 * npts];
+        for (int k = 0; k < npts; ++k) {
+            double yt = y[k] - ymin;
+            double transY = std::sin(M_PI * yt / Ly);
+            double dxEnv = x[k] - x0;
+            double envelope = std::exp(-(dxEnv * dxEnv) / (2.0 * sigma * sigma));
+            double carrier  = std::sin(carrierK * (x[k] - xmin));
+            Ez[k] = envelope * carrier * transY;
+        }
     } else {
         std::cout << "[PREPROCESS] Evaluating default Gaussian pulse in Ez..." << std::endl;
         const double sigma = config_.pulseSigma;
@@ -165,9 +307,6 @@ void Case::preprocess(const Config& cfg) {
             Ez[k] = std::exp(-sigma * r2);
         }
     }
-
-    // Configure numerical flux parameter C0
-    physics_->setC0(config_.c0);
 
     // Assemble probe coordinates
     std::vector<std::array<double, 3>> allProbes = config_.probes;
@@ -183,21 +322,52 @@ void Case::preprocess(const Config& cfg) {
         allProbes.push_back({{xc + r[0] * config_.Lx, yc + r[1] * config_.Ly, zc + r[2] * config_.Lz}});
     }
 
-    probes_.init(*mesh_, allProbes, outDir);
+    // If no explicit probes configured, check for num_probes parameter
+    if (allProbes.empty() && config_.has("num_probes")) {
+        int numProbes = config_.getInt("num_probes", 0);
+        if (numProbes > 0) {
+            if (config_.nelx == 1 && config_.nely == 1 && config_.nelz == 1) {
+                std::cout << "[PREPROCESS] Generating " << numProbes 
+                          << " observation probes placed at GLL collocation nodes..." << std::endl;
+                const auto& gllZ = mesh_->getGllZ();
+                int N = mesh_->getN();
+                int actualProbes = std::min(numProbes, N);
+                for (int p = 0; p < actualProbes; ++p) {
+                    double xp = config_.xmin + 0.5 * (1.0 + gllZ[p]) * config_.Lx;
+                    allProbes.push_back({{xp, yc, zc}});
+                }
+            } else {
+                std::cout << "[PREPROCESS] Generating " << numProbes 
+                          << " collinear observation probes along centerline x-axis..." << std::endl;
+                const double xStart = config_.xmin + 0.05 * config_.Lx;
+                const double xEnd   = config_.xmax - 0.05 * config_.Lx;
+                const double dxP    = (numProbes > 1) ? (xEnd - xStart) / (numProbes - 1) : 0.0;
+                for (int p = 0; p < numProbes; ++p) {
+                    allProbes.push_back({{xStart + p * dxP, yc, zc}});
+                }
+            }
+        }
+    }
 
-    // Export initial fields (t = 0)
-    saveFields(outDir + "/field_initial.csv", 0.0);
+    probes_.init(*mesh_, allProbes, outDir, actualNumModes, config_.Lx, config_.nelx, actualModeK);
+
+    // Export initial fields (t = 0) if enabled
+    if (bSaveOutput && config_.exportFields) {
+        saveFields(outDir + "/field_initial.csv", 0.0);
+    }
 
     // Record t = 0 on probes
     probes_.record(0, 0.0, state_, npts);
 
-    // Initialize continuous energy log
-    energyFile_.open(outDir + "/energy_history.csv");
-    if (energyFile_.is_open()) {
-        energyFile_ << "step,time,maxE,maxH,energy\n";
-        energyFile_ << std::scientific << std::setprecision(8);
-        energyFile_ << 0 << "," << 0.0 << "," << getMaxE() << "," << getMaxH() << "," << computeTotalEnergy() << "\n";
-        energyFile_.flush();
+    // Initialize continuous energy log if output is enabled
+    if (bSaveOutput) {
+        energyFile_.open(outDir + "/energy_history.csv");
+        if (energyFile_.is_open()) {
+            energyFile_ << "step,time,maxE,maxH,energy\n";
+            energyFile_ << std::scientific << std::setprecision(8);
+            energyFile_ << 0 << "," << 0.0 << "," << getMaxE() << "," << getMaxH() << "," << computeTotalEnergy() << "\n";
+            energyFile_.flush();
+        }
     }
 
     std::cout << "\n----------------------------------------------------------" << std::endl;
@@ -235,14 +405,12 @@ void Case::simulate() {
     const int numSteps = config_.numSteps;
     const int freq = std::max(1, config_.outputFreq);
 
-#ifdef NEKWAVE_ENABLE_CUDA
-    std::cout << "[SIMULATE] Initializing full GPU data residency (GpuSolver)..." << std::endl;
-    gpuSolver_.reset(new GpuSolver());
-    gpuSolver_->initialize(*mesh_, config_.c0);
-    gpuSolver_->uploadState(state_.data(), state_.size());
-#endif
+    std::cout << "[SIMULATE] Initializing full GPU data residency (DgSolver)..." << std::endl;
+    dgSolver_.reset(new DgSolver());
+    dgSolver_->initialize(*mesh_, config_.c0);
+    dgSolver_->uploadState(state_.data(), state_.size());
 
-    std::cout << "\n[SIMULATE] Advancing time integration (LSRK45)..." << std::endl;
+    std::cout << "\n[SIMULATE] Advancing time integration on GPU (LSRK45)..." << std::endl;
     std::cout << std::setw(8) << "Step" 
               << std::setw(14) << "Time" 
               << std::setw(14) << "max|E|" 
@@ -251,17 +419,11 @@ void Case::simulate() {
     std::cout << "------------------------------------------------------------------" << std::endl;
 
     for (int step = 1; step <= numSteps; ++step) {
-#ifdef NEKWAVE_ENABLE_CUDA
-        gpuSolver_->step(dt_, currentTime_);
+        dgSolver_->step(dt_, currentTime_);
         currentTime_ += dt_;
         currentStep_ = step;
 
-        gpuSolver_->downloadState(state_.data(), state_.size());
-#else
-        timeStepper_->step(*mesh_, *physics_, state_, dt_, currentTime_);
-        currentTime_ += dt_;
-        currentStep_ = step;
-#endif
+        dgSolver_->downloadState(state_.data(), state_.size());
 
         probes_.record(step, currentTime_, state_, npts);
 
@@ -283,9 +445,7 @@ void Case::simulate() {
         }
     }
 
-#ifdef NEKWAVE_ENABLE_CUDA
-    gpuSolver_->downloadState(state_.data(), state_.size());
-#endif
+    dgSolver_->downloadState(state_.data(), state_.size());
 
     bIsSimulated_ = true;
 }
@@ -297,6 +457,7 @@ void Case::postprocess() {
     assert(bIsSimulated_ && "Must call simulate() before postprocess()");
 
     const std::string& outDir = config_.outputDir;
+    bool bSaveOutput = (!outDir.empty() && outDir != "none" && outDir != "None" && outDir != "NONE");
 
     // Finalize probe observations
     probes_.finalize();
@@ -307,8 +468,10 @@ void Case::postprocess() {
         std::cout << "[POSTPROCESS] Exported energy history to " << outDir << "/energy_history.csv" << std::endl;
     }
 
-    // Export final field distributions
-    saveFields(outDir + "/field_final.csv", currentTime_);
+    // Export final field distributions if enabled
+    if (bSaveOutput && config_.exportFields) {
+        saveFields(outDir + "/field_final.csv", currentTime_);
+    }
 
     std::cout << "------------------------------------------------------------------" << std::endl;
     std::cout << "Simulation completed successfully at t = " << std::scientific << std::setprecision(6) << currentTime_ << std::endl;
@@ -317,6 +480,10 @@ void Case::postprocess() {
     if (postprocessingHook_) {
         std::cout << "[POSTPROCESS] Executing custom user postprocessing hook..." << std::endl;
         postprocessingHook_(*this);
+    }
+
+    if (dgSolver_) {
+        dgSolver_->finalize();
     }
 
     bIsPostprocessed_ = true;

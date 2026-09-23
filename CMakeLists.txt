@@ -31,57 +31,68 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
     )
 endif()
 
-# Ensure output directory exists in project root
-file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/output")
+# Ensure output directory exists in the CMake build directory
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/output")
 
 # ------------------------------------------------------------------------------
 # Options
 # ------------------------------------------------------------------------------
 option(ENABLE_PROFILING "Build CPU profiler executable using gperftools" OFF)
 option(BUILD_TESTING "Build unit tests and register with CTest" ON)
-option(ENABLE_CUDA "Build CUDA-accelerated matrix multiplication kernel" OFF)
 
 # ------------------------------------------------------------------------------
-# CUDA Support (Optional Side-Compilation or Integration)
+# CUDA Support (Mandatory GPU Backend)
 # ------------------------------------------------------------------------------
-if(ENABLE_CUDA)
-    # Check if CMAKE_CUDA_COMPILER is already set; if not, search common paths
-    if(NOT CMAKE_CUDA_COMPILER)
-        find_program(NVCC_EXECUTABLE NAMES nvcc
-            PATHS /usr/local/cuda-11.7/bin /usr/local/cuda/bin
-        )
-        if(NVCC_EXECUTABLE)
-            set(CMAKE_CUDA_COMPILER "${NVCC_EXECUTABLE}")
-        endif()
+if(NOT CMAKE_CUDA_COMPILER OR NOT EXISTS "${CMAKE_CUDA_COMPILER}")
+    find_program(NVCC_EXECUTABLE NAMES nvcc
+        PATHS /usr/local/cuda-11.7/bin /usr/local/cuda/bin
+        NO_DEFAULT_PATH
+    )
+    if(NOT NVCC_EXECUTABLE)
+        find_program(NVCC_EXECUTABLE NAMES nvcc)
     endif()
-
-    enable_language(CUDA)
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 80)
+    if(NVCC_EXECUTABLE)
+        set(CMAKE_CUDA_COMPILER "${NVCC_EXECUTABLE}" CACHE FILEPATH "CUDA compiler" FORCE)
     endif()
-
-    add_library(nekwave_cuda STATIC
-        src/cuda/mxm_cuda.cu
-        src/cuda/gpu_solver.cu
-    )
-    target_include_directories(nekwave_cuda PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
-    )
-    set_target_properties(nekwave_cuda PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        POSITION_INDEPENDENT_CODE ON
-    )
 endif()
+
+if(NOT CMAKE_CUDA_COMPILER)
+    message(FATAL_ERROR "NekWave requires an NVIDIA GPU and the CUDA Toolkit (nvcc). Please ensure CUDA is installed and available.")
+endif()
+
+enable_language(CUDA)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 80)
+endif()
+get_filename_component(CUDA_BIN_DIR "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+get_filename_component(CUDA_TOOLKIT_ROOT "${CUDA_BIN_DIR}" DIRECTORY)
+set(CUDA_INCLUDE_DIR "${CUDA_TOOLKIT_ROOT}/include")
+
+add_library(nekwave_device STATIC
+    src/device/dg_kernels.cu
+)
+target_include_directories(nekwave_device PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<BUILD_INTERFACE:${CUDA_INCLUDE_DIR}>
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+)
+set_target_properties(nekwave_device PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    POSITION_INDEPENDENT_CODE ON
+)
 
 # ------------------------------------------------------------------------------
 # Core Solver Library (nekwave_core)
 # ------------------------------------------------------------------------------
-add_library(nekwave_core STATIC
+set(NEKWAVE_CORE_SRCS
     src/mesh.cpp
-    src/physics.cpp
-    src/timestepperrk45.cpp
+    src/dg_solver.cpp
     src/probe.cpp
     src/case.cpp
+)
+
+add_library(nekwave_core STATIC
+    ${NEKWAVE_CORE_SRCS}
 )
 
 target_include_directories(nekwave_core PUBLIC
@@ -89,10 +100,13 @@ target_include_directories(nekwave_core PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-if(ENABLE_CUDA)
-    target_link_libraries(nekwave_core PUBLIC nekwave_cuda)
-    target_compile_definitions(nekwave_core PUBLIC NEKWAVE_ENABLE_CUDA)
-endif()
+target_compile_definitions(nekwave_core PUBLIC
+    NEKWAVE_BUILD_DIR="${CMAKE_BINARY_DIR}"
+    NEKWAVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    NEKWAVE_ENABLE_CUDA
+)
+
+target_link_libraries(nekwave_core PUBLIC nekwave_device)
 
 # ------------------------------------------------------------------------------
 # Main Application Executable (nekwave)
@@ -121,30 +135,21 @@ if(BUILD_TESTING)
     # CTest test names per docs/conventions.md: CamelCase ending with Tests
     add_test(NAME MeshQuadratureTests COMMAND nekwave-test MeshQuadratureTest)
     add_test(NAME ProbeScalingTests COMMAND nekwave-test ProbeScalingTest)
-    add_test(NAME MaxwellStabilityTests COMMAND nekwave-test MaxwellPhysicsStabilityTest)
+    add_test(NAME MaxwellStabilityTests COMMAND nekwave-test MaxwellStabilityTest)
+    add_test(NAME CaseInputLoadingTests COMMAND nekwave-test CaseInputLoadingTest)
+    add_test(NAME NumericalDispersionUnitTests COMMAND nekwave-test NumericalDispersionTest)
     add_test(NAME NekWaveUnitTests COMMAND nekwave-test)
 
     set_tests_properties(
         MeshQuadratureTests
         ProbeScalingTests
         MaxwellStabilityTests
+        CaseInputLoadingTests
+        NumericalDispersionUnitTests
         NekWaveUnitTests
         PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     )
-
-    if(ENABLE_CUDA)
-        add_executable(nekwave_cuda_test src/cuda/test_mxm_cuda.cu)
-        target_link_libraries(nekwave_cuda_test PRIVATE nekwave_cuda)
-        set_target_properties(nekwave_cuda_test PROPERTIES
-            OUTPUT_NAME "nekwave_cuda_test"
-            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-        )
-        add_test(NAME CudaMatrixMultiplicationTests COMMAND nekwave_cuda_test)
-        set_tests_properties(CudaMatrixMultiplicationTests PROPERTIES
-            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        )
-    endif()
 endif()
 
 # ------------------------------------------------------------------------------

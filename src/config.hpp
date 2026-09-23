@@ -38,6 +38,12 @@ struct Config {
     bool hasExplicitBoundsY = false;
     bool hasExplicitBoundsZ = false;
     std::string outputDir = "output";     // Output directory for CSVs and plots
+    bool exportFields = false;            // Whether to export 3D volume nodal fields (field_initial.csv, field_final.csv)
+
+    // Periodic boundary conditions (default: false -> PEC mirror)
+    bool periodicX = false;
+    bool periodicY = false;
+    bool periodicZ = false;
 
     // Observation probe coordinates
     std::vector<std::array<double, 3>> probe_rel; // Relative coordinates in [-0.5, 0.5]^3
@@ -211,6 +217,28 @@ struct Config {
             else if (lkey == "zmin") { zmin = std::stod(val); hasExplicitBoundsZ = true; }
             else if (lkey == "zmax") { zmax = std::stod(val); hasExplicitBoundsZ = true; }
             else if (lkey == "output_dir") outputDir = val;
+            else if (lkey == "export_fields" || lkey == "save_fields") {
+                std::string lv = toLower(val);
+                exportFields = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
+            }
+            else if (lkey == "periodic_x") {
+                std::string lv = toLower(val);
+                periodicX = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
+            }
+            else if (lkey == "periodic_y") {
+                std::string lv = toLower(val);
+                periodicY = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
+            }
+            else if (lkey == "periodic_z") {
+                std::string lv = toLower(val);
+                periodicZ = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
+            }
+            else if (lkey == "periodic" || lkey == "bc" || lkey == "bc_type") {
+                std::string lv = toLower(val);
+                if (lv == "periodic" || lv == "true" || lv == "1" || lv == "yes" || lv == "all") {
+                    periodicX = periodicY = periodicZ = true;
+                }
+            }
             // Indexed relative probe specifications
             else if (lkey == "probe1_rx" || lkey == "probe1_rel_x") ensureProbeRel(0, 0, std::stod(val));
             else if (lkey == "probe1_ry" || lkey == "probe1_rel_y") ensureProbeRel(0, 1, std::stod(val));

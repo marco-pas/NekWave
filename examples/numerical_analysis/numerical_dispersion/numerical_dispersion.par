@@ -1,0 +1,46 @@
+# ==============================================================================
+# NekWave Example: Two-Probe Periodic Numerical Dispersion Benchmark
+# Domain: Lx = 16*pi (~50.26548) with 64 Elements & Periodic Boundary Conditions
+# Discrete Modes: Linspace 5 modes from k = 0.25 to 3.75 (Delta k = 0.875)
+# Exact cycle counts across Lx: n = [2, 9, 16, 23, 30] (strictly periodic)
+# ==============================================================================
+elements_x = 64
+elements_y = 1
+elements_z = 1
+order = 10
+
+L_x = 50.26548245743669
+L_y = 1.0
+L_z = 1.0
+
+xmin = 0.0
+xmax = 50.26548245743669
+ymin = 0.0
+ymax = 1.0
+zmin = 0.0
+zmax = 1.0
+
+# Boundary conditions: Periodic across all directions
+periodic_x = true
+periodic_y = true
+periodic_z = true
+
+# Time-stepping
+cfl = auto
+dt = auto
+num_steps = 10000
+output_freq = 1
+C0 = 1.0
+output_dir = output
+export_fields = false
+
+# Two point probes positioned with exact separation d = 1.0
+probe = 24.5 0.5 0.5
+probe = 25.5 0.5 0.5
+
+# Multi-harmonic Bloch excitation (Linspace 5 modes: 0.25 to 3.75)
+wave_type = bloch
+k_start = 0.25
+k_end = 3.75
+num_modes = 4
+angle_deg = 0.0

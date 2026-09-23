@@ -1,0 +1,26 @@
+# ==============================================================================
+# NekWave Test Input: 3D PEC Cavity Analytical TM_110 Standing Wave Eigenmode
+# This file is a read-only test fixture for regression and unit testing.
+# Output is explicitly disabled (output_dir = none) to ensure tests produce no disk artifacts.
+# ==============================================================================
+elements_x = 5
+elements_y = 5
+elements_z = 5
+order = 5
+
+L_x = 2.0
+L_y = 2.0
+L_z = 2.0
+
+cfl = auto
+dt = auto
+num_steps = 100
+output_freq = 50
+C0 = 0.0 # Energy-conserving central flux
+output_dir = none
+export_fields = false
+
+# Analytical mode parameters
+mode_m = 1
+mode_n = 1
+amplitude = 1.0
