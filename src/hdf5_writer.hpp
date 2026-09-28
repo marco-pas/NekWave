@@ -78,7 +78,9 @@ public:
         const std::string& xmfPath,
         const std::string& h5BaseName,
         int npts,
-        const std::vector<std::pair<int, double>>& stepTimes
+        const std::vector<std::pair<int, double>>& stepTimes,
+        int totalCells = 0,
+        bool useHexCells = false
     );
 
 private:

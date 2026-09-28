@@ -22,6 +22,8 @@ struct Hdf5Writer::Impl {
     int npts = 0;
     int numElements = 0;
     int orderN = 0;
+    int totalCells = 0;
+    bool useHexCells = false;
     bool enableXdmf = true;
     bool exportContinuous = false;
     bool bInitialized = false;
@@ -59,7 +61,7 @@ struct Hdf5Writer::Impl {
             fileId = -1;
         }
         if (enableXdmf && !xmfPath.empty()) {
-            writeXdmfDescriptor(xmfPath, fileStem + ".h5", npts, recordedSteps);
+            writeXdmfDescriptor(xmfPath, fileStem + ".h5", exportContinuous ? numCgPoints : npts, recordedSteps, totalCells, useHexCells);
         }
 #else
         if (binFile.is_open()) {
@@ -459,6 +461,8 @@ bool Hdf5Writer::initialize(const std::string& h5Path, const Mesh& mesh, bool en
     bool useHexCells = (p >= 1 && impl_->numElements > 0);
     int cellsPerElem = p * p * p;
     int totalCells = useHexCells ? (impl_->numElements * cellsPerElem) : impl_->npts;
+    impl_->useHexCells = useHexCells;
+    impl_->totalCells = totalCells;
     int nPtsPerElem = impl_->orderN * impl_->orderN * impl_->orderN;
 
     if (impl_->exportContinuous) {
@@ -615,6 +619,15 @@ bool Hdf5Writer::initialize(const std::string& h5Path, const Mesh& mesh, bool en
     H5Dwrite(jacDset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, mesh.getJac().data());
     H5Dclose(jacDset);
     H5Sclose(jacSpace);
+
+    if (impl_->useHexCells && impl_->totalCells > 0) {
+        hsize_t connDims[2] = {static_cast<hsize_t>(impl_->totalCells), 8};
+        hid_t connSpace = H5Screate_simple(2, connDims, NULL);
+        hid_t connDset = H5Dcreate2(meshGroup, "connectivity", H5T_STD_I32LE, connSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        H5Dwrite(connDset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, impl_->cellConnectivity.data());
+        H5Dclose(connDset);
+        H5Sclose(connSpace);
+    }
 
     H5Gclose(meshGroup);
 
@@ -776,7 +789,9 @@ bool Hdf5Writer::writeXdmfDescriptor(
     const std::string& xmfPath,
     const std::string& h5BaseName,
     int npts,
-    const std::vector<std::pair<int, double>>& stepTimes)
+    const std::vector<std::pair<int, double>>& stepTimes,
+    int totalCells,
+    bool useHexCells)
 {
     std::ofstream xmf(xmfPath);
     if (!xmf.is_open()) return false;
@@ -793,7 +808,15 @@ bool Hdf5Writer::writeXdmfDescriptor(
 
         xmf << "      <Grid Name=\"step_" << step << "\" GridType=\"Uniform\">\n";
         xmf << "        <Time Value=\"" << std::scientific << std::setprecision(8) << time << "\"/>\n";
-        xmf << "        <Topology TopologyType=\"Polyvertex\" NumberOfElements=\"" << npts << "\"/>\n";
+        if (useHexCells && totalCells > 0) {
+            xmf << "        <Topology TopologyType=\"Hexahedron\" NumberOfElements=\"" << totalCells << "\">\n";
+            xmf << "          <DataItem Dimensions=\"" << totalCells << " 8\" NumberType=\"Int\" Precision=\"4\" Format=\"HDF\">\n";
+            xmf << "            " << h5BaseName << ":/mesh/connectivity\n";
+            xmf << "          </DataItem>\n";
+            xmf << "        </Topology>\n";
+        } else {
+            xmf << "        <Topology TopologyType=\"Polyvertex\" NumberOfElements=\"" << npts << "\"/>\n";
+        }
         xmf << "        <Geometry GeometryType=\"XYZ\">\n";
         xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
         xmf << "            " << h5BaseName << ":/mesh/coordinates\n";
