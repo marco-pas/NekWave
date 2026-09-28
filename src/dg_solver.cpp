@@ -86,7 +86,7 @@ public:
 
         std::vector<int> h_volIdxMinus(totalFacePoints_);
         std::vector<int> h_volIdxPlus(totalFacePoints_);
-        std::vector<int> h_isPEC(totalFacePoints_);
+        std::vector<int> h_bcType(totalFacePoints_);
         std::vector<double> h_nx(totalFacePoints_);
         std::vector<double> h_ny(totalFacePoints_);
         std::vector<double> h_nz(totalFacePoints_);
@@ -94,11 +94,20 @@ public:
 
         size_t ptIdx = 0;
         for (const auto& fd : faceData) {
-            int pecFlag = (fd.bcType == "PEC") ? 1 : 0;
+            int bcCode = 0;
+            if (fd.bcType == "PEC" || fd.bcType == "W" || fd.bcType == "V" || fd.bcType == "v") {
+                bcCode = 1;
+            } else if (fd.bcType == "PMC" || fd.bcType == "SYM" || fd.bcType == "S" || fd.bcType == "s") {
+                bcCode = 2;
+            }
             for (const auto& pt : fd.points) {
                 h_volIdxMinus[ptIdx] = pt.volIdxMinus;
                 h_volIdxPlus[ptIdx]  = pt.volIdxPlus;
-                h_isPEC[ptIdx]       = pecFlag || (pt.volIdxPlus < 0);
+                int ptBc = bcCode;
+                if (pt.volIdxPlus < 0 && ptBc == 0) {
+                    ptBc = 1; // Default boundary to PEC if no neighbor
+                }
+                h_bcType[ptIdx]      = ptBc;
                 h_nx[ptIdx]          = pt.nx;
                 h_ny[ptIdx]          = pt.ny;
                 h_nz[ptIdx]          = pt.nz;
@@ -112,6 +121,9 @@ public:
         // ----------------------------------------------------------------------
         // 1. Allocate State, Auxiliary, and Residual GPU Buffers
         // ----------------------------------------------------------------------
+        // Memory layout here, totalEntries_ = 6
+        // This is SoA: Ex1, Ex2, ..., Ey1, Ey2, ..., Hx1, Hx2, ...
+        // Good for the GPU, as global bndwidth is optimized
         NW_GPU_CHECK(cudaMalloc(&d_state_, totalEntries_ * sizeof(double)));
         NW_GPU_CHECK(cudaMalloc(&d_k_, totalEntries_ * sizeof(double)));
         NW_GPU_CHECK(cudaMalloc(&d_rhs_, totalEntries_ * sizeof(double)));
@@ -129,6 +141,8 @@ public:
         // ----------------------------------------------------------------------
         // 3. Allocate & Copy Volume Coordinate Metrics and Element Jacobians
         // ----------------------------------------------------------------------
+        // This is AoS: Ex1, Ey1, ..., Hx1, Hy1, ...
+        // AoS used from the host side for the mesh
         NW_GPU_CHECK(cudaMalloc(&d_jac_, npts_ * sizeof(double)));
         NW_GPU_CHECK(cudaMemcpyAsync(d_jac_, mesh.getJac().data(), npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
 
@@ -162,8 +176,8 @@ public:
         NW_GPU_CHECK(cudaMalloc(&d_volIdxPlus_, totalFacePoints_ * sizeof(int)));
         NW_GPU_CHECK(cudaMemcpyAsync(d_volIdxPlus_, h_volIdxPlus.data(), totalFacePoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
 
-        NW_GPU_CHECK(cudaMalloc(&d_isPEC_, totalFacePoints_ * sizeof(int)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_isPEC_, h_isPEC.data(), totalFacePoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_bcType_, totalFacePoints_ * sizeof(int)));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_bcType_, h_bcType.data(), totalFacePoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
 
         NW_GPU_CHECK(cudaMalloc(&d_nx_, totalFacePoints_ * sizeof(double)));
         NW_GPU_CHECK(cudaMemcpyAsync(d_nx_, h_nx.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
@@ -284,7 +298,7 @@ public:
             //   n x E^+ = -n x E^- => [[E]] = -2 E^-,  [[H]] = 0
             // ------------------------------------------------------------------
             nekwave::device::launch_compute_flux(
-                d_state_, d_fEN_, d_fHN_, d_volIdxPlus_, d_isPEC_,
+                d_state_, d_fEN_, d_fHN_, d_volIdxPlus_, d_bcType_,
                 d_nx_, d_ny_, d_nz_, d_flux_, c0_, totalFacePoints_, npts_, stream_
             );
 
@@ -350,7 +364,7 @@ public:
 
         cudaFree(d_volIdxMinus_); d_volIdxMinus_ = nullptr;
         cudaFree(d_volIdxPlus_); d_volIdxPlus_ = nullptr;
-        cudaFree(d_isPEC_); d_isPEC_ = nullptr;
+        cudaFree(d_bcType_); d_bcType_ = nullptr;
         cudaFree(d_nx_); d_nx_ = nullptr;
         cudaFree(d_ny_); d_ny_ = nullptr;
         cudaFree(d_nz_); d_nz_ = nullptr;
@@ -398,7 +412,7 @@ private:
 
     int* d_volIdxMinus_ = nullptr;
     int* d_volIdxPlus_ = nullptr;
-    int* d_isPEC_ = nullptr;
+    int* d_bcType_ = nullptr;
     double* d_nx_ = nullptr;
     double* d_ny_ = nullptr;
     double* d_nz_ = nullptr;

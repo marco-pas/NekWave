@@ -22,6 +22,8 @@ using InitialConditionFn = std::function<void(double x, double y, double z,
                                               double& Ex, double& Ey, double& Ez,
                                               double& Hx, double& Hy, double& Hz)>;
 
+#include "hdf5_writer.hpp"
+
 class Case;
 
 /**
@@ -93,12 +95,30 @@ public:
     double currentTime() const { return currentTime_; }
     int currentStep() const { return currentStep_; }
     int numSteps() const { return config_.numSteps; }
+    int maxSteps() const { return config_.maxSteps; }
+    double finalTime() const { return config_.finalTime; }
+    int outputFreq() const { return config_.outputFreq; }
+    int saveFreq() const { return config_.saveFreq; }
+    bool exportContinuousVtk() const { return config_.exportContinuousVtk; }
+
+    /**
+     * @brief Computes exact DG spectral spatial derivatives (divergence and curl) on GLL nodes.
+     *
+     * Evaluates div(E), div(H) and curl(E), curl(H) using element differentiation matrix D
+     * and metric transformation factors without inter-element finite differencing.
+     */
+    void computeFieldDerivatives(const double* state,
+                                 std::vector<double>& divE,
+                                 std::vector<double>& divH,
+                                 std::vector<double>& curlE,
+                                 std::vector<double>& curlH) const;
 
 private:
     Config config_;
 
     std::unique_ptr<Mesh> mesh_;
     std::unique_ptr<DgSolver> dgSolver_;
+    std::unique_ptr<Hdf5Writer> hdf5Writer_;
     ProbeManager probes_;
     StateVector state_;
 

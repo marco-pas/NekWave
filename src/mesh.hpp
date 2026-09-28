@@ -56,6 +56,12 @@ public:
     // Adapted 1-to-1 from NekCEM format; to be replaced by Neko-style reader in the future
     bool loadFromRea(const std::string& filename);
 
+    // @@ load mesh directly from a NekCEM binary .re2 file
+    bool loadFromRe2(const std::string& filename, int nel = 0);
+
+    // @@ rescale mesh bounding box to specified physical coordinates [xmin, xmax] x [ymin, ymax] x [zmin, zmax]
+    void rescale(double xmin, double xmax, double ymin, double ymax, double zmin, double zmax);
+
     // @@ create a structured Cartesian box mesh with arbitrary elements in each direction
     // Automatic multi-element Cartesian hex mesh generation
     bool createBoxMesh(int nelx, int nely, int nelz,

@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.16)
 project(NekWave
     VERSION 0.1.0
     DESCRIPTION "High-fidelity time-domain Maxwell solver using DG-SEM"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 # ------------------------------------------------------------------------------
@@ -82,6 +82,18 @@ set_target_properties(nekwave_device PROPERTIES
 )
 
 # ------------------------------------------------------------------------------
+# HDF5 Support (Optional High-Performance Output)
+# ------------------------------------------------------------------------------
+find_package(HDF5 COMPONENTS C QUIET)
+if(HDF5_FOUND)
+    message(STATUS "[NekWave] Found HDF5: ${HDF5_LIBRARIES} (include: ${HDF5_INCLUDE_DIRS})")
+    set(NEKWAVE_HDF5_LIBS ${HDF5_LIBRARIES})
+else()
+    message(STATUS "[NekWave] Native HDF5 C library not found; binary/XDMF pipeline will be used.")
+    set(NEKWAVE_HDF5_LIBS "")
+endif()
+
+# ------------------------------------------------------------------------------
 # Core Solver Library (nekwave_core)
 # ------------------------------------------------------------------------------
 set(NEKWAVE_CORE_SRCS
@@ -89,6 +101,7 @@ set(NEKWAVE_CORE_SRCS
     src/dg_solver.cpp
     src/probe.cpp
     src/case.cpp
+    src/hdf5_writer.cpp
 )
 
 add_library(nekwave_core STATIC
@@ -100,13 +113,18 @@ target_include_directories(nekwave_core PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
+if(HDF5_FOUND)
+    target_include_directories(nekwave_core PUBLIC ${HDF5_INCLUDE_DIRS})
+    target_compile_definitions(nekwave_core PUBLIC NEKWAVE_HAVE_HDF5=1)
+endif()
+
 target_compile_definitions(nekwave_core PUBLIC
     NEKWAVE_BUILD_DIR="${CMAKE_BINARY_DIR}"
     NEKWAVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     NEKWAVE_ENABLE_CUDA
 )
 
-target_link_libraries(nekwave_core PUBLIC nekwave_device)
+target_link_libraries(nekwave_core PUBLIC nekwave_device ${NEKWAVE_HDF5_LIBS})
 
 # ------------------------------------------------------------------------------
 # Main Application Executable (nekwave)

@@ -23,8 +23,13 @@ struct Config {
     int order = 3;                        // Polynomial order N (collocation points per direction)
     double cfl = -1.0;                    // CFL number (negative: auto-calculated)
     double dt = -1.0;                     // Time step size (negative: auto-calculated)
-    int numSteps = 100;                   // Total simulation steps
-    int outputFreq = 10;                  // Diagnostic and logging frequency
+    int numSteps = 100;                   // Total simulation steps (or max_steps)
+    int maxSteps = 100;                   // Maximum simulation steps (-1 if unlimited / finalTime governed)
+    bool hasExplicitMaxSteps = false;     // True if max_steps or num_steps was explicitly set
+    double finalTime = -1.0;              // Simulation termination time (< 0 if unlimited / step governed)
+    int outputFreq = 10;                  // Diagnostic and logging frequency (stdout + energy history)
+    int saveFreq = -1;                    // Field snapshot export frequency (-1: defaults to outputFreq)
+    std::string exportFormat = "hdf5";    // Snapshot export format ("hdf5" or "csv" or "vtk")
     double pulseSigma = 20.0;             // Gaussian pulse spatial width
     double c0 = 1.0;                      // Flux penalty: 0.0 (central), 1.0 (upwind)
     int nelx = 0;                         // Cartesian box element count in X
@@ -39,6 +44,7 @@ struct Config {
     bool hasExplicitBoundsZ = false;
     std::string outputDir = "output";     // Output directory for CSVs and plots
     bool exportFields = false;            // Whether to export 3D volume nodal fields (field_initial.csv, field_final.csv)
+    bool exportContinuousVtk = false;    // Whether to average DG interface nodes into a continuous CG mesh for ParaView
 
     // Periodic boundary conditions (default: false -> PEC mirror)
     bool periodicX = false;
@@ -196,8 +202,23 @@ struct Config {
                 if (toLower(val) == "auto") dt = -1.0;
                 else dt = std::stod(val);
             }
-            else if (lkey == "num_steps" || lkey == "steps") numSteps = std::stoi(val);
-            else if (lkey == "output_freq" || lkey == "freq") outputFreq = std::stoi(val);
+            else if (lkey == "max_steps" || lkey == "num_steps" || lkey == "steps") {
+                maxSteps = std::stoi(val);
+                numSteps = maxSteps;
+                hasExplicitMaxSteps = true;
+            }
+            else if (lkey == "final_time" || lkey == "t_final" || lkey == "tfinal" || lkey == "time_final") {
+                finalTime = std::stod(val);
+            }
+            else if (lkey == "output_frequency" || lkey == "output_freq" || lkey == "freq") {
+                outputFreq = std::stoi(val);
+            }
+            else if (lkey == "save_frequency" || lkey == "save_freq" || lkey == "export_freq") {
+                saveFreq = std::stoi(val);
+            }
+            else if (lkey == "export_format" || lkey == "save_format") {
+                exportFormat = toLower(val);
+            }
             else if (lkey == "pulse_sigma" || lkey == "sigma") pulseSigma = std::stod(val);
             else if (lkey == "c0") c0 = std::stod(val);
             else if (lkey == "flux_type") {
@@ -220,6 +241,10 @@ struct Config {
             else if (lkey == "export_fields" || lkey == "save_fields") {
                 std::string lv = toLower(val);
                 exportFields = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
+            }
+            else if (lkey == "export_continuous_vtk" || lkey == "continuous_vtk" || lkey == "export_continuous") {
+                std::string lv = toLower(val);
+                exportContinuousVtk = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
             }
             else if (lkey == "periodic_x") {
                 std::string lv = toLower(val);
@@ -249,6 +274,18 @@ struct Config {
             else if (lkey == "probe3_rx" || lkey == "probe3_rel_x") ensureProbeRel(2, 0, std::stod(val));
             else if (lkey == "probe3_ry" || lkey == "probe3_rel_y") ensureProbeRel(2, 1, std::stod(val));
             else if (lkey == "probe3_rz" || lkey == "probe3_rel_z") ensureProbeRel(2, 2, std::stod(val));
+        }
+
+        // If final_time was explicitly specified without an explicit max_steps,
+        // let final_time drive simulation termination
+        if (finalTime > 0.0 && !hasExplicitMaxSteps) {
+            maxSteps = -1;
+            numSteps = -1;
+        }
+
+        // Default saveFreq to outputFreq if not set
+        if (saveFreq <= 0) {
+            saveFreq = outputFreq;
         }
 
         // Synchronize bounding coordinates and physical box dimensions

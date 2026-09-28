@@ -1,0 +1,24 @@
+# NekWave Example: NekCEM Canonical 3D Box PEC Benchmark Case
+# Directly loads the 27-element mesh from contrib/NekCEM/tests/3dboxpec/3dboxpec.rea
+
+mesh = contrib/NekCEM/tests/3dboxpec/3dboxpec.rea
+order = 7
+wave_type = 3dboxpec
+
+cfl = auto
+dt = auto
+
+# Termination criteria (whichever is reached first)
+final_time = 50.0
+max_steps = 4000
+
+# Diagnostic and snapshot frequencies (independent)
+output_frequency = 50     # Console logging and energy history
+save_frequency = 100      # Full 3D field snapshot saving (HDF5/XDMF)
+
+c0 = 0.0                  # Energy-conserving central flux (zero dissipation)
+output_dir = output_3dboxpec
+
+export_fields = true
+export_format = hdf5
+export_continuous_vtk = true

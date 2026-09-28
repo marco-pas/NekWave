@@ -8,6 +8,8 @@
 #include <sstream>
 #include <iostream>
 #include <algorithm>
+#include <map>
+#include <tuple>
 
 // @@ Helper to evaluate the Legendre polynomial of degree n at x
 // Use Bonnet's 3-term recurrence relation (https://en.wikipedia.org/wiki/Legendre_polynomials)
@@ -304,6 +306,12 @@ void Mesh::computeMetricsFromCorners() {
 bool Mesh::loadFromRea(const std::string& filename) {
     std::ifstream file(filename);
     if (!file.is_open()) {
+        // Fallback: check ../<filename> if executed from build/ subdirectory
+        std::ifstream fileFallback("../" + filename);
+        if (fileFallback.is_open()) {
+            fileFallback.close();
+            return loadFromRea("../" + filename);
+        }
         std::cerr << "Error: Could not open .rea file: " << filename << std::endl;
         return false;
     }
@@ -331,7 +339,19 @@ bool Mesh::loadFromRea(const std::string& filename) {
         ss >> nel >> ndim;
     }
 
-    if (nel <= 0) {
+    if (nel < 0) {
+        std::cout << "[MESH] Negative NEL = " << nel << " indicates binary .re2 mesh. Redirecting to loadFromRe2..." << std::endl;
+        std::string re2name = filename;
+        size_t dotPos = re2name.rfind('.');
+        if (dotPos != std::string::npos) {
+            re2name = re2name.substr(0, dotPos) + ".re2";
+        } else {
+            re2name += ".re2";
+        }
+        return loadFromRe2(re2name, std::abs(nel));
+    }
+
+    if (nel == 0) {
         std::cerr << "Error: Invalid number of elements (NEL = " << nel << ") in " << filename << std::endl;
         return false;
     }
@@ -411,6 +431,240 @@ bool Mesh::loadFromRea(const std::string& filename) {
     setupFaceData();
 
     return true;
+}
+
+// @@ load mesh directly from a NekCEM binary .re2 file
+bool Mesh::loadFromRe2(const std::string& filename, int nel) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::ifstream fileFallback("../" + filename, std::ios::binary);
+        if (fileFallback.is_open()) {
+            fileFallback.close();
+            return loadFromRe2("../" + filename, nel);
+        }
+        std::cerr << "Error: Could not open .re2 file: " << filename << std::endl;
+        return false;
+    }
+
+    // Read 80-byte header
+    char header[81] = {0};
+    file.read(header, 80);
+    if (!file) {
+        std::cerr << "Error: Failed to read header from " << filename << std::endl;
+        return false;
+    }
+
+    // Read 4-byte endianness test tag (6.54321)
+    float tag = 0.0f;
+    file.read(reinterpret_cast<char*>(&tag), sizeof(float));
+    if (!file) {
+        std::cerr << "Error: Failed to read tag from " << filename << std::endl;
+        return false;
+    }
+
+    // If nel wasn't provided, parse from header: "#v002 <nel> <ndim> <nelv> ..."
+    if (nel <= 0) {
+        std::string hdrStr(header, 80);
+        size_t p = hdrStr.find_first_not_of(" \t", 5);
+        if (p != std::string::npos) {
+            std::stringstream ss(hdrStr.substr(p));
+            ss >> nel;
+        }
+    }
+
+    if (nel <= 0) {
+        std::cerr << "Error: Invalid number of elements (NEL = " << nel << ") in " << filename << std::endl;
+        return false;
+    }
+
+    m_numElements = nel;
+    m_totalPoints = m_numElements * m_numPointsPerElement;
+    m_elementCorners.resize(m_numElements);
+
+    // Read elements: group (double) + 8 x (double) + 8 y (double) + 8 z (double)
+    for (int e = 0; e < nel; ++e) {
+        double group = 0.0;
+        double x[8], y[8], z[8];
+        file.read(reinterpret_cast<char*>(&group), sizeof(double));
+        file.read(reinterpret_cast<char*>(x), 8 * sizeof(double));
+        file.read(reinterpret_cast<char*>(y), 8 * sizeof(double));
+        file.read(reinterpret_cast<char*>(z), 8 * sizeof(double));
+
+        for (int a = 0; a < 8; ++a) {
+            m_elementCorners[e][a] = {x[a], y[a], z[a]};
+        }
+    }
+
+    // Read curved faces count
+    double ncurvD = 0.0;
+    file.read(reinterpret_cast<char*>(&ncurvD), sizeof(double));
+
+    // Read boundary conditions count
+    double nbcD = 0.0;
+    file.read(reinterpret_cast<char*>(&nbcD), sizeof(double));
+    int nbc = static_cast<int>(nbcD);
+
+    // Map: (elemId, faceId) -> FaceInfo
+    std::map<std::pair<int, int>, FaceInfo> bcMap;
+    for (int i = 0; i < nbc; ++i) {
+        double elemD = 0.0, faceD = 0.0, nbrElemD = 0.0, nbrFaceD = 0.0;
+        double p1 = 0.0, p2 = 0.0, p3 = 0.0;
+        char tagStr[9] = {0};
+
+        file.read(reinterpret_cast<char*>(&elemD), sizeof(double));
+        file.read(reinterpret_cast<char*>(&faceD), sizeof(double));
+        file.read(reinterpret_cast<char*>(&nbrElemD), sizeof(double));
+        file.read(reinterpret_cast<char*>(&nbrFaceD), sizeof(double));
+        file.read(reinterpret_cast<char*>(&p1), sizeof(double));
+        file.read(reinterpret_cast<char*>(&p2), sizeof(double));
+        file.read(reinterpret_cast<char*>(&p3), sizeof(double));
+        file.read(tagStr, 8);
+
+        int e = static_cast<int>(elemD) - 1;
+        int f = static_cast<int>(faceD) - 1;
+        int nbrE = (nbrElemD > 0.0) ? (static_cast<int>(nbrElemD) - 1) : -1;
+        int nbrF = (nbrFaceD > 0.0) ? (static_cast<int>(nbrFaceD) - 1) : -1;
+
+        std::string rawTag(tagStr);
+        std::string bcType = "PEC";
+        if (rawTag.find('P') != std::string::npos) {
+            bcType = "PERIODIC";
+        } else if (rawTag.find('E') != std::string::npos) {
+            bcType = "E";
+        } else if (rawTag.find('W') != std::string::npos || rawTag.find("PEC") != std::string::npos) {
+            bcType = "PEC";
+        } else if (nbrE >= 0) {
+            bcType = "PERIODIC";
+        }
+
+        FaceInfo info;
+        info.elementId = e;
+        info.faceId = f;
+        info.bcType = bcType;
+        info.neighborElementId = nbrE;
+        info.neighborFaceId = nbrF;
+        bcMap[{e, f}] = info;
+    }
+
+    // Hex face corner definitions matching NekWave / NekCEM:
+    // Face 0 (s=-1): 0, 1, 5, 4
+    // Face 1 (r=+1): 1, 2, 6, 5
+    // Face 2 (s=+1): 2, 3, 7, 6
+    // Face 3 (r=-1): 3, 0, 4, 7
+    // Face 4 (t=-1): 0, 3, 2, 1
+    // Face 5 (t=+1): 4, 5, 6, 7
+    const int faceCorners[6][4] = {
+        {0, 1, 5, 4},
+        {1, 2, 6, 5},
+        {2, 3, 7, 6},
+        {3, 0, 4, 7},
+        {0, 3, 2, 1},
+        {4, 5, 6, 7}
+    };
+
+    // Index face centroids for interior conforming faces
+    std::map<std::tuple<long long, long long, long long>, std::pair<int, int>> interiorCenters;
+    auto makeKey = [](double cx, double cy, double cz) {
+        long long ix = static_cast<long long>(std::round(cx * 100000.0));
+        long long iy = static_cast<long long>(std::round(cy * 100000.0));
+        long long iz = static_cast<long long>(std::round(cz * 100000.0));
+        return std::make_tuple(ix, iy, iz);
+    };
+
+    m_faces.clear();
+    m_faces.resize(nel * 6);
+
+    for (int e = 0; e < nel; ++e) {
+        for (int f = 0; f < 6; ++f) {
+            int idx = e * 6 + f;
+            auto it = bcMap.find({e, f});
+            if (it != bcMap.end()) {
+                m_faces[idx] = it->second;
+            } else {
+                // Interior face: match neighbor via centroid
+                double cx = 0.0, cy = 0.0, cz = 0.0;
+                for (int v = 0; v < 4; ++v) {
+                    int cIdx = faceCorners[f][v];
+                    cx += m_elementCorners[e][cIdx][0] * 0.25;
+                    cy += m_elementCorners[e][cIdx][1] * 0.25;
+                    cz += m_elementCorners[e][cIdx][2] * 0.25;
+                }
+                auto key = makeKey(cx, cy, cz);
+                auto cIt = interiorCenters.find(key);
+                if (cIt != interiorCenters.end()) {
+                    int otherE = cIt->second.first;
+                    int otherF = cIt->second.second;
+                    int otherIdx = otherE * 6 + otherF;
+
+                    FaceInfo infoThis;
+                    infoThis.elementId = e;
+                    infoThis.faceId = f;
+                    infoThis.bcType = "E";
+                    infoThis.neighborElementId = otherE;
+                    infoThis.neighborFaceId = otherF;
+                    m_faces[idx] = infoThis;
+
+                    FaceInfo infoOther;
+                    infoOther.elementId = otherE;
+                    infoOther.faceId = otherF;
+                    infoOther.bcType = "E";
+                    infoOther.neighborElementId = e;
+                    infoOther.neighborFaceId = f;
+                    m_faces[otherIdx] = infoOther;
+                } else {
+                    interiorCenters[key] = {e, f};
+                }
+            }
+        }
+    }
+
+    setupGLL();
+    computeMetricsFromCorners();
+    setupFaceData();
+    return true;
+}
+
+// @@ rescale mesh bounding box to specified physical coordinates [xmin, xmax] x [ymin, ymax] x [zmin, zmax]
+void Mesh::rescale(double xmin, double xmax, double ymin, double ymax, double zmin, double zmax) {
+    if (m_numElements <= 0 || m_elementCorners.empty()) return;
+
+    double curXmin = 1e30, curXmax = -1e30;
+    double curYmin = 1e30, curYmax = -1e30;
+    double curZmin = 1e30, curZmax = -1e30;
+
+    for (int e = 0; e < m_numElements; ++e) {
+        for (int a = 0; a < 8; ++a) {
+            curXmin = std::min(curXmin, m_elementCorners[e][a][0]);
+            curXmax = std::max(curXmax, m_elementCorners[e][a][0]);
+            curYmin = std::min(curYmin, m_elementCorners[e][a][1]);
+            curYmax = std::max(curYmax, m_elementCorners[e][a][1]);
+            curZmin = std::min(curZmin, m_elementCorners[e][a][2]);
+            curZmax = std::max(curZmax, m_elementCorners[e][a][2]);
+        }
+    }
+
+    double dxCur = curXmax - curXmin;
+    double dyCur = curYmax - curYmin;
+    double dzCur = curZmax - curZmin;
+
+    if (dxCur < 1e-14) dxCur = 1.0;
+    if (dyCur < 1e-14) dyCur = 1.0;
+    if (dzCur < 1e-14) dzCur = 1.0;
+
+    for (int e = 0; e < m_numElements; ++e) {
+        for (int a = 0; a < 8; ++a) {
+            double rx = (m_elementCorners[e][a][0] - curXmin) / dxCur;
+            double ry = (m_elementCorners[e][a][1] - curYmin) / dyCur;
+            double rz = (m_elementCorners[e][a][2] - curZmin) / dzCur;
+
+            m_elementCorners[e][a][0] = xmin + rx * (xmax - xmin);
+            m_elementCorners[e][a][1] = ymin + ry * (ymax - ymin);
+            m_elementCorners[e][a][2] = zmin + rz * (zmax - zmin);
+        }
+    }
+
+    computeMetricsFromCorners();
+    setupFaceData();
 }
 
 // @@ generate structured Cartesian box mesh with nelx * nely * nelz hexahedral elements

@@ -39,6 +39,24 @@ set_target_properties(analytical_export PROPERTIES
 )
 
 # ------------------------------------------------------------------------------
+# Example 5: NekCEM 3D Box PEC Benchmark
+# ------------------------------------------------------------------------------
+add_executable(3dboxpec 3dboxpec/3dboxpec.cpp)
+target_link_libraries(3dboxpec PRIVATE nekwave_core)
+set_target_properties(3dboxpec PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ctests/3dboxpec"
+)
+
+# ------------------------------------------------------------------------------
+# Example 6: NekCEM 3D Box Periodic Benchmark
+# ------------------------------------------------------------------------------
+add_executable(3dboxper 3dboxper/3dboxper.cpp)
+target_link_libraries(3dboxper PRIVATE nekwave_core)
+set_target_properties(3dboxper PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ctests/3dboxper"
+)
+
+# ------------------------------------------------------------------------------
 # CTest Registrations for Examples
 # ------------------------------------------------------------------------------
 if(BUILD_TESTING)
@@ -64,4 +82,20 @@ if(BUILD_TESTING)
     set_tests_properties(NumericalDispersionTests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
     )
+    if(EXISTS "${CMAKE_SOURCE_DIR}/contrib/NekCEM/tests/3dboxpec/3dboxpec.rea")
+        add_test(NAME BoxPecTests
+            COMMAND 3dboxpec "${CMAKE_SOURCE_DIR}/tests/input/3dboxpec.par"
+        )
+        set_tests_properties(BoxPecTests PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        )
+    endif()
+    if(EXISTS "${CMAKE_SOURCE_DIR}/contrib/NekCEM/tests/3dboxper/3dboxper.rea")
+        add_test(NAME BoxPerTests
+            COMMAND 3dboxper "${CMAKE_SOURCE_DIR}/tests/input/3dboxper.par"
+        )
+        set_tests_properties(BoxPerTests PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        )
+    endif()
 endif()

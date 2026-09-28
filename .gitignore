@@ -8,6 +8,10 @@ nekwave_cuda_test
 *.a
 *.prof
 
+# 
+contrib
+NekCEM
+
 # Compiled object and dependency files
 *.o
 *.d
@@ -23,6 +27,10 @@ Testing/
 # Simulation outputs and results across all folders
 output/
 **/output/
+tests_hdf5/
+**/tests_hdf5/
+tests_freq/
+**/tests_freq/
 results/
 **/results/*
 !**/results/.gitkeep

@@ -13,7 +13,10 @@ dt = auto
 num_steps = 100
 output_freq = 25
 C0 = 0.0 # Energy-conserving central flux
-output_dir = output
+output_dir = output_cavity_eigenmode
+export_fields = true
+export_format = hdf5
+export_continuous_vtk = true
 
 # Analytical mode parameters
 mode_m = 1

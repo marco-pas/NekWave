@@ -14,8 +14,10 @@ num_steps = 2000
 output_freq = 200
 pulse_sigma = 20.0
 C0 = 0.0 # Central flux (energy-conserving)
-output_dir = output
-export_fields = false # Set true to dump full 3D nodal field CSVs (large)
+output_dir = output_cavity_gaussian
+export_fields = true
+export_format = hdf5
+export_continuous_vtk = true
 
 # Observation probes defined in relative coordinates in (-0.5, 0.5)
 probe_rel = 0.16 0.15 -0.1333

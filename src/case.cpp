@@ -120,7 +120,12 @@ void Case::preprocess(const Config& cfg) {
     } else if (!config_.meshFile.empty() && config_.meshFile != "box") {
         std::cout << "[PREPROCESS] Loading mesh file: " << config_.meshFile 
                   << " (Order N = " << config_.order << ")" << std::endl;
-        bool bOk = mesh_->loadFromRea(config_.meshFile);
+        bool bOk = false;
+        if (config_.meshFile.find(".re2") != std::string::npos) {
+            bOk = mesh_->loadFromRe2(config_.meshFile);
+        } else {
+            bOk = mesh_->loadFromRea(config_.meshFile);
+        }
         if (!bOk) {
             std::cerr << "Warning: Could not load mesh. Falling back to default 3x3x3 mesh." << std::endl;
             mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
@@ -129,6 +134,19 @@ void Case::preprocess(const Config& cfg) {
         std::cout << "[PREPROCESS] Using default 3x3x3 Cartesian box mesh (27 elements, Order N = " 
                   << config_.order << ")" << std::endl;
         mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
+    }
+
+    if (config_.has("wave_type") && config_.getString("wave_type") == "3dboxper") {
+        const auto& cx = mesh_->getCoordX();
+        double minX = 1e30, maxX = -1e30;
+        for (size_t k = 0; k < cx.size(); ++k) {
+            minX = std::min(minX, cx[k]);
+            maxX = std::max(maxX, cx[k]);
+        }
+        if (std::abs(minX - (-1.0)) < 1e-3 && std::abs(maxX - 1.0) < 1e-3) {
+            std::cout << "[PREPROCESS] Rescaling mesh domain from [-1, 1]^3 to [0, 2*pi]^3 matching NekCEM usrdat2..." << std::endl;
+            mesh_->rescale(0.0, 2.0 * M_PI, 0.0, 2.0 * M_PI, 0.0, 2.0 * M_PI);
+        }
     }
 
     const int npts = mesh_->getTotalPoints();
@@ -157,6 +175,9 @@ void Case::preprocess(const Config& cfg) {
     const auto& y = mesh_->getCoordY();
     const auto& z = mesh_->getCoordZ();
 
+    int actualNumModes = config_.getInt("num_modes", 1);
+    std::vector<double> actualModeK;
+
     if (initialConditionHook_) {
         std::cout << "[PREPROCESS] Evaluating user initial condition hook..." << std::endl;
         double* Ex = &state_[0 * npts];
@@ -177,10 +198,33 @@ void Case::preprocess(const Config& cfg) {
             Hy[k] = hy;
             Hz[k] = hz;
         }
-    }
-    int actualNumModes = config_.getInt("num_modes", 1);
-    std::vector<double> actualModeK;
-    if (config_.has("wave_type") && (config_.getString("wave_type") == "bloch" || config_.getString("wave_type") == "periodic")) {
+    } else if (config_.has("wave_type") && config_.getString("wave_type") == "3dboxpec") {
+        std::cout << "[PREPROCESS] Evaluating NekCEM 3D Box PEC analytical cavity eigenmode in H..." << std::endl;
+        const double invSqrt6 = 1.0 / std::sqrt(6.0);
+        double* Hx = &state_[3 * npts];
+        double* Hy = &state_[4 * npts];
+        double* Hz = &state_[5 * npts];
+        for (int k = 0; k < npts; ++k) {
+            double sx = std::sin(M_PI * x[k]);
+            double cx = std::cos(M_PI * x[k]);
+            double sy = std::sin(M_PI * y[k]);
+            double cy = std::cos(M_PI * y[k]);
+            double sz = std::sin(M_PI * z[k]);
+            double cz = std::cos(M_PI * z[k]);
+
+            Hx[k] = -sx * cy * cz * invSqrt6;
+            Hy[k] = -cx * sy * cz * invSqrt6;
+            Hz[k] =  2.0 * cx * cy * sz * invSqrt6;
+        }
+    } else if (config_.has("wave_type") && config_.getString("wave_type") == "3dboxper") {
+        std::cout << "[PREPROCESS] Evaluating NekCEM 3D Box Periodic analytical eigenmode in E..." << std::endl;
+        double* Ey = &state_[1 * npts];
+        double* Ez = &state_[2 * npts];
+        for (int k = 0; k < npts; ++k) {
+            Ey[k] = std::cos(x[k]) * std::sin(y[k]) * std::sin(z[k]);
+            Ez[k] = std::cos(x[k]) * std::cos(y[k]) * std::cos(z[k]);
+        }
+    } else if (config_.has("wave_type") && (config_.getString("wave_type") == "bloch" || config_.getString("wave_type") == "periodic")) {
         std::cout << "[PREPROCESS] Evaluating periodic Bloch electromagnetic plane wave in (Ez, Hx, Hy)..." << std::endl;
         double* Ez = &state_[2 * npts];
         double* Hx = &state_[3 * npts];
@@ -351,9 +395,31 @@ void Case::preprocess(const Config& cfg) {
 
     probes_.init(*mesh_, allProbes, outDir, actualNumModes, config_.Lx, config_.nelx, actualModeK);
 
+    // Synchronize maxSteps and numSteps
+    int maxSteps = -1;
+    if (config_.maxSteps != 100) maxSteps = config_.maxSteps;
+    else if (config_.numSteps != 100) maxSteps = config_.numSteps;
+    else if (config_.hasExplicitMaxSteps) maxSteps = 100;
+    else if (config_.finalTime <= 0.0) maxSteps = 100;
+    config_.maxSteps = maxSteps;
+    config_.numSteps = maxSteps;
+
+    if (config_.saveFreq <= 0) {
+        config_.saveFreq = config_.outputFreq;
+    }
+
     // Export initial fields (t = 0) if enabled
     if (bSaveOutput && config_.exportFields) {
-        saveFields(outDir + "/field_initial.csv", 0.0);
+        if (config_.exportFormat == "hdf5" || config_.exportFormat == "vtk") {
+            hdf5Writer_.reset(new Hdf5Writer());
+            hdf5Writer_->initialize(outDir + "/fields.h5", *mesh_, true, config_.exportContinuousVtk);
+            std::vector<double> divE, divH, curlE, curlH;
+            computeFieldDerivatives(state_.data(), divE, divH, curlE, curlH);
+            Hdf5Writer::DerivedFields derived{divE.data(), divH.data(), curlE.data(), curlH.data()};
+            hdf5Writer_->writeStep(0, 0.0, state_.data(), npts, &derived);
+        } else {
+            saveFields(outDir + "/field_initial.csv", 0.0);
+        }
     }
 
     // Record t = 0 on probes
@@ -386,7 +452,14 @@ void Case::preprocess(const Config& cfg) {
     std::cout << "  Minimum Spacing:   dxmin = " << std::scientific << std::setprecision(2) << dxmin << std::endl;
     std::cout << "  CFL Number:        " << std::scientific << std::setprecision(2) << cfl_ << std::endl;
     std::cout << "  Time Step:         dt = " << std::scientific << std::setprecision(2) << dt_ << std::endl;
-    std::cout << "  Total Steps:       " << config_.numSteps << " (Final Time: " << std::scientific << std::setprecision(2) << config_.numSteps * dt_ << ")" << std::endl;
+    if (config_.maxSteps > 0) {
+        std::cout << "  Max Steps:         " << config_.maxSteps << std::endl;
+    }
+    if (config_.finalTime > 0.0) {
+        std::cout << "  Final Time:        " << std::scientific << std::setprecision(2) << config_.finalTime << std::endl;
+    }
+    std::cout << "  Output Frequency:  " << config_.outputFreq << " steps" << std::endl;
+    std::cout << "  Save Frequency:    " << config_.saveFreq << " steps" << std::endl;
     std::cout << "  Initial Energy:    " << std::scientific << std::setprecision(2) << computeTotalEnergy() << std::endl;
     std::cout << "  Initial max|E|:    " << std::scientific << std::setprecision(2) << getMaxE() 
               << " | max|H|: " << std::scientific << std::setprecision(2) << getMaxH() << std::endl;
@@ -402,8 +475,10 @@ void Case::simulate() {
     assert(bIsPreprocessed_ && "Must call preprocess() before simulate()");
 
     const int npts = mesh_->getTotalPoints();
-    const int numSteps = config_.numSteps;
-    const int freq = std::max(1, config_.outputFreq);
+    const int maxSteps = config_.maxSteps;
+    const double finalTime = config_.finalTime;
+    const int outFreq = std::max(1, config_.outputFreq);
+    const int saveFreq = std::max(1, config_.saveFreq);
 
     std::cout << "[SIMULATE] Initializing full GPU data residency (DgSolver)..." << std::endl;
     dgSolver_.reset(new DgSolver());
@@ -418,16 +493,43 @@ void Case::simulate() {
               << std::setw(16) << "Total Energy" << std::endl;
     std::cout << "------------------------------------------------------------------" << std::endl;
 
-    for (int step = 1; step <= numSteps; ++step) {
-        dgSolver_->step(dt_, currentTime_);
-        currentTime_ += dt_;
+    int step = 0;
+    while (true) {
+        // Termination condition: either step count reached or final time reached
+        if (maxSteps > 0 && step >= maxSteps) {
+            break;
+        }
+        if (finalTime > 0.0 && currentTime_ >= finalTime - 1e-13) {
+            break;
+        }
+
+        // Sub-step clamping to hit finalTime exactly if needed
+        double currentDt = dt_;
+        if (finalTime > 0.0 && currentTime_ + currentDt > finalTime) {
+            currentDt = finalTime - currentTime_;
+        }
+
+        step++;
+        dgSolver_->step(currentDt, currentTime_);
+        currentTime_ += currentDt;
         currentStep_ = step;
 
         dgSolver_->downloadState(state_.data(), state_.size());
 
         probes_.record(step, currentTime_, state_, npts);
 
-        if (step % freq == 0 || step == numSteps) {
+        bool isFinal = (maxSteps > 0 && step >= maxSteps) || (finalTime > 0.0 && currentTime_ >= finalTime - 1e-13);
+
+        // Save HDF5/VTK snapshots according to saveFreq or on final step
+        if (hdf5Writer_ && (step % saveFreq == 0 || isFinal)) {
+            std::vector<double> divE, divH, curlE, curlH;
+            computeFieldDerivatives(state_.data(), divE, divH, curlE, curlH);
+            Hdf5Writer::DerivedFields derived{divE.data(), divH.data(), curlE.data(), curlH.data()};
+            hdf5Writer_->writeStep(step, currentTime_, state_.data(), npts, &derived);
+        }
+
+        // Output diagnostics according to outFreq or on final step
+        if (step % outFreq == 0 || isFinal) {
             double maxE = getMaxE();
             double maxH = getMaxH();
             double energy = computeTotalEnergy();
@@ -468,8 +570,13 @@ void Case::postprocess() {
         std::cout << "[POSTPROCESS] Exported energy history to " << outDir << "/energy_history.csv" << std::endl;
     }
 
-    // Export final field distributions if enabled
-    if (bSaveOutput && config_.exportFields) {
+    // Finalize HDF5 time series writer if active
+    if (hdf5Writer_) {
+        hdf5Writer_->close();
+    }
+
+    // Export final field distributions if enabled and format is not HDF5/VTK
+    if (bSaveOutput && config_.exportFields && config_.exportFormat != "hdf5" && config_.exportFormat != "vtk") {
         saveFields(outDir + "/field_final.csv", currentTime_);
     }
 
@@ -594,3 +701,147 @@ void Case::saveFields(const std::string& filename, double time) const {
     std::cout << "Exported field data to " << filename << " (" << npts 
               << " points, t = " << std::scientific << std::setprecision(2) << time << ")" << std::endl;
 }
+
+void Case::computeFieldDerivatives(const double* state,
+                                   std::vector<double>& divE,
+                                   std::vector<double>& divH,
+                                   std::vector<double>& curlE,
+                                   std::vector<double>& curlH) const {
+    if (!mesh_) return;
+
+    int N = mesh_->getN();
+    int N3 = N * N * N;
+    int nelt = mesh_->getNumElements();
+    int npts = mesh_->getTotalPoints();
+
+    divE.assign(npts, 0.0);
+    divH.assign(npts, 0.0);
+    curlE.assign(3 * npts, 0.0);
+    curlH.assign(3 * npts, 0.0);
+
+    const auto& D = mesh_->getD();
+    const auto& rx = mesh_->getRx();
+    const auto& sx = mesh_->getSx();
+    const auto& tx = mesh_->getTx();
+    const auto& ry = mesh_->getRy();
+    const auto& sy = mesh_->getSy();
+    const auto& ty = mesh_->getTy();
+    const auto& rz = mesh_->getRz();
+    const auto& sz = mesh_->getSz();
+    const auto& tz = mesh_->getTz();
+
+    const double* Ex = &state[0 * npts];
+    const double* Ey = &state[1 * npts];
+    const double* Ez = &state[2 * npts];
+    const double* Hx = &state[3 * npts];
+    const double* Hy = &state[4 * npts];
+    const double* Hz = &state[5 * npts];
+
+    double* cEx = &curlE[0 * npts];
+    double* cEy = &curlE[1 * npts];
+    double* cEz = &curlE[2 * npts];
+    double* cHx = &curlH[0 * npts];
+    double* cHy = &curlH[1 * npts];
+    double* cHz = &curlH[2 * npts];
+
+    for (int e = 0; e < nelt; ++e) {
+        int elemOffset = e * N3;
+        for (int k = 0; k < N; ++k) {
+            for (int j = 0; j < N; ++j) {
+                for (int i = 0; i < N; ++i) {
+                    int m = i + N * (j + N * k);
+                    int p = elemOffset + m;
+
+                    // Reference derivatives for E
+                    double Ex_r = 0.0, Ex_s = 0.0, Ex_t = 0.0;
+                    double Ey_r = 0.0, Ey_s = 0.0, Ey_t = 0.0;
+                    double Ez_r = 0.0, Ez_s = 0.0, Ez_t = 0.0;
+
+                    // Reference derivatives for H
+                    double Hx_r = 0.0, Hx_s = 0.0, Hx_t = 0.0;
+                    double Hy_r = 0.0, Hy_s = 0.0, Hy_t = 0.0;
+                    double Hz_r = 0.0, Hz_s = 0.0, Hz_t = 0.0;
+
+                    for (int l = 0; l < N; ++l) {
+                        double d_il = D[i + l * N];
+                        double d_jl = D[j + l * N];
+                        double d_kl = D[k + l * N];
+
+                        int idx_r = elemOffset + l + N * (j + N * k);
+                        int idx_s = elemOffset + i + N * (l + N * k);
+                        int idx_t = elemOffset + i + N * (j + N * l);
+
+                        Ex_r += d_il * Ex[idx_r];
+                        Ey_r += d_il * Ey[idx_r];
+                        Ez_r += d_il * Ez[idx_r];
+
+                        Hx_r += d_il * Hx[idx_r];
+                        Hy_r += d_il * Hy[idx_r];
+                        Hz_r += d_il * Hz[idx_r];
+
+                        Ex_s += d_jl * Ex[idx_s];
+                        Ey_s += d_jl * Ey[idx_s];
+                        Ez_s += d_jl * Ez[idx_s];
+
+                        Hx_s += d_jl * Hx[idx_s];
+                        Hy_s += d_jl * Hy[idx_s];
+                        Hz_s += d_jl * Hz[idx_s];
+
+                        Ex_t += d_kl * Ex[idx_t];
+                        Ey_t += d_kl * Ey[idx_t];
+                        Ez_t += d_kl * Ez[idx_t];
+
+                        Hx_t += d_kl * Hx[idx_t];
+                        Hy_t += d_kl * Hy[idx_t];
+                        Hz_t += d_kl * Hz[idx_t];
+                    }
+
+                    double rx_k = rx[p], sx_k = sx[p], tx_k = tx[p];
+                    double ry_k = ry[p], sy_k = sy[p], ty_k = ty[p];
+                    double rz_k = rz[p], sz_k = sz[p], tz_k = tz[p];
+
+                    // Physical derivatives for E: dEx/dx, dEy/dy, dEz/dz, etc.
+                    double dEx_dx = Ex_r * rx_k + Ex_s * sx_k + Ex_t * tx_k;
+                    double dEx_dy = Ex_r * ry_k + Ex_s * sy_k + Ex_t * ty_k;
+                    double dEx_dz = Ex_r * rz_k + Ex_s * sz_k + Ex_t * tz_k;
+
+                    double dEy_dx = Ey_r * rx_k + Ey_s * sx_k + Ey_t * tx_k;
+                    double dEy_dy = Ey_r * ry_k + Ey_s * sy_k + Ey_t * ty_k;
+                    double dEy_dz = Ey_r * rz_k + Ey_s * sz_k + Ey_t * tz_k;
+
+                    double dEz_dx = Ez_r * rx_k + Ez_s * sx_k + Ez_t * tx_k;
+                    double dEz_dy = Ez_r * ry_k + Ez_s * sy_k + Ez_t * ty_k;
+                    double dEz_dz = Ez_r * rz_k + Ez_s * sz_k + Ez_t * tz_k;
+
+                    // Physical derivatives for H
+                    double dHx_dx = Hx_r * rx_k + Hx_s * sx_k + Hx_t * tx_k;
+                    double dHx_dy = Hx_r * ry_k + Hx_s * sy_k + Hx_t * ty_k;
+                    double dHx_dz = Hx_r * rz_k + Hx_s * sz_k + Hx_t * tz_k;
+
+                    double dHy_dx = Hy_r * rx_k + Hy_s * sx_k + Hy_t * tx_k;
+                    double dHy_dy = Hy_r * ry_k + Hy_s * sy_k + Hy_t * ty_k;
+                    double dHy_dz = Hy_r * rz_k + Hy_s * sz_k + Hy_t * tz_k;
+
+                    double dHz_dx = Hz_r * rx_k + Hz_s * sx_k + Hz_t * tx_k;
+                    double dHz_dy = Hz_r * ry_k + Hz_s * sy_k + Hz_t * ty_k;
+                    double dHz_dz = Hz_r * rz_k + Hz_s * sz_k + Hz_t * tz_k;
+
+                    // Divergence: div(E) = dEx/dx + dEy/dy + dEz/dz
+                    divE[p] = dEx_dx + dEy_dy + dEz_dz;
+                    divH[p] = dHx_dx + dHy_dy + dHz_dz;
+
+                    // Curl: curl(E) = (dEz/dy - dEy/dz, dEx/dz - dEz/dx, dEy/dx - dEx/dy)
+                    cEx[p] = dEz_dy - dEy_dz;
+                    cEy[p] = dEx_dz - dEz_dx;
+                    cEz[p] = dEy_dx - dEx_dy;
+
+                    // Curl: curl(H) = (dHz/dy - dHy/dz, dHx/dz - dHz/dx, dHy/dx - dHx/dy)
+                    cHx[p] = dHz_dy - dHy_dz;
+                    cHy[p] = dHx_dz - dHz_dx;
+                    cHz[p] = dHy_dx - dHx_dy;
+                }
+            }
+        }
+    }
+}
+
