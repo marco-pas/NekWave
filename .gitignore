@@ -8,9 +8,13 @@ nekwave_cuda_test
 *.a
 *.prof
 
-# 
+# other repos
 contrib
 NekCEM
+neko
+
+# modules
+config.sh
 
 # Compiled object and dependency files
 *.o

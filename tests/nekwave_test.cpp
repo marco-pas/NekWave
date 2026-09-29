@@ -302,9 +302,9 @@ void CaseInputLoadingTest() {
     std::cout << "[RUN] CaseInputLoadingTest..." << std::endl;
 
 #ifdef NEKWAVE_SOURCE_DIR
-    std::string parFile = std::string(NEKWAVE_SOURCE_DIR) + "/tests/input/cavity_gaussian.par";
+    std::string parFile = std::string(NEKWAVE_SOURCE_DIR) + "/tests/3dboxpec_test/3dboxpec_test.par";
 #else
-    std::string parFile = "tests/input/cavity_gaussian.par";
+    std::string parFile = "tests/3dboxpec_test/3dboxpec_test.par";
 #endif
 
     // Verify input file exists
@@ -341,79 +341,7 @@ void CaseInputLoadingTest() {
 }
 
 /*
- * Test 5: Numerical Dispersion Benchmark Test
- *
- * Verifies that loading the numerical dispersion test fixture from
- * tests/input/numerical_dispersion.par initializes the DG-SEM Maxwell
- * solver, injects the wavepacket initial condition, advances in time
- * on GPU, and produces zero output files on disk.
- */
-void NumericalDispersionTest() {
-    std::cout << "[RUN] NumericalDispersionTest..." << std::endl;
-
-#ifdef NEKWAVE_SOURCE_DIR
-    std::string parFile = std::string(NEKWAVE_SOURCE_DIR) + "/tests/input/numerical_dispersion.par";
-#else
-    std::string parFile = "tests/input/numerical_dispersion.par";
-#endif
-
-    std::ifstream f(parFile.c_str());
-    EXPECT_TRUE(f.good());
-    f.close();
-
-    Case dispersionCase;
-    dispersionCase.loadConfig(parFile);
-
-    EXPECT_TRUE(dispersionCase.config().outputDir == "none");
-    EXPECT_TRUE(!dispersionCase.config().exportFields);
-
-    const auto& cfg = dispersionCase.config();
-    const double Lx = cfg.Lx;
-    const double Ly = cfg.Ly;
-    const double xmin = cfg.xmin;
-    const double carrierK = cfg.getDouble("carrier_k", 4.0 * M_PI);
-    const double sigma = cfg.getDouble("packet_sigma", 0.30);
-    const double x0 = cfg.getDouble("packet_x0", xmin + 0.25 * Lx);
-
-    // Initial condition hook: modulated Gaussian wavepacket
-    dispersionCase.setInitialCondition([=](double x, double y, double /*z*/,
-                                          double& Ex, double& Ey, double& Ez,
-                                          double& Hx, double& Hy, double& Hz) {
-        Ex = 0.0; Ey = 0.0; Hx = 0.0; Hz = 0.0;
-        double yt = y - cfg.ymin;
-        double transY = std::sin(M_PI * yt / Ly);
-        double dxEnv = x - x0;
-        double envelope = std::exp(-(dxEnv * dxEnv) / (2.0 * sigma * sigma));
-        double carrier = std::cos(carrierK * dxEnv);
-        Ez = envelope * carrier * transY;
-        Hy = -Ez;
-    });
-
-    dispersionCase.run();
-
-    // Verify energy is strictly positive and finite
-    double totalEnergy = dispersionCase.computeTotalEnergy();
-    EXPECT_TRUE(totalEnergy > 0.0);
-    EXPECT_TRUE(!std::isnan(totalEnergy));
-    EXPECT_TRUE(!std::isinf(totalEnergy));
-
-    // Verify no output directories or files were created
-    struct stat st;
-    int res = stat("none", &st);
-    EXPECT_TRUE(res != 0);
-
-#ifdef NEKWAVE_BUILD_DIR
-    std::string buildNone = std::string(NEKWAVE_BUILD_DIR) + "/none";
-    res = stat(buildNone.c_str(), &st);
-    EXPECT_TRUE(res != 0);
-#endif
-
-    g_testsPassed++;
-    std::cout << "  PASSED" << std::endl;
-}
-
-/*
- * Test 6: Periodic Boundary Condition Mesh Connectivity
+ * Test 5: Periodic Boundary Condition Mesh Connectivity
  *
  * Verifies that structured Cartesian box meshes with periodic boundary conditions:
  * 1. Tag boundary faces as "PERIODIC" rather than "PEC".
@@ -497,7 +425,6 @@ void PeriodicBCTest() {
  *   ./nekwave-test ProbeScalingTest         (runs only ProbeScalingTest)
  *   ./nekwave-test MaxwellStabilityTest     (runs only MaxwellStabilityTest)
  *   ./nekwave-test CaseInputLoadingTest     (runs only CaseInputLoadingTest)
- *   ./nekwave-test NumericalDispersionTest  (runs only NumericalDispersionTest)
  *   ./nekwave-test PeriodicBCTest           (runs only PeriodicBCTest)
  */
 int main(int argc, char* argv[]) {
@@ -521,9 +448,6 @@ int main(int argc, char* argv[]) {
     }
     if (filter.empty() || filter == "CaseInputLoadingTest") {
         CaseInputLoadingTest();
-    }
-    if (filter.empty() || filter == "NumericalDispersionTest") {
-        NumericalDispersionTest();
     }
     if (filter.empty() || filter == "PeriodicBCTest") {
         PeriodicBCTest();

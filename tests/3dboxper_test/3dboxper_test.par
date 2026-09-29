@@ -1,0 +1,12 @@
+# NekWave CTest: NekCEM Canonical 3D Box Periodic Verification Test
+mesh = contrib/NekCEM/tests/3dboxper/3dboxper.rea
+order = 4
+wave_type = 3dboxper
+
+cfl = auto
+dt = auto
+max_steps = 50
+output_frequency = 0
+c0 = 0.0
+output_dir = none
+export_fields = false

@@ -39,57 +39,151 @@ file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/output")
 # ------------------------------------------------------------------------------
 option(ENABLE_PROFILING "Build CPU profiler executable using gperftools" OFF)
 option(BUILD_TESTING "Build unit tests and register with CTest" ON)
+option(ENABLE_HIP "Build NekWave with AMD ROCm / HIP GPU backend instead of NVIDIA CUDA" OFF)
 
 # ------------------------------------------------------------------------------
-# CUDA Support (Mandatory GPU Backend)
+# GPU Backend: AMD ROCm / HIP or NVIDIA CUDA
 # ------------------------------------------------------------------------------
-if(NOT CMAKE_CUDA_COMPILER OR NOT EXISTS "${CMAKE_CUDA_COMPILER}")
-    find_program(NVCC_EXECUTABLE NAMES nvcc
-        PATHS /usr/local/cuda-11.7/bin /usr/local/cuda/bin
-        NO_DEFAULT_PATH
+if(ENABLE_HIP)
+    message(STATUS "[NekWave] Configuring GPU backend: AMD ROCm / HIP")
+    if(NOT DEFINED ROCM_PATH)
+        if(DEFINED ENV{ROCM_PATH})
+            set(ROCM_PATH "$ENV{ROCM_PATH}")
+        elseif(EXISTS "/opt/rocm")
+            set(ROCM_PATH "/opt/rocm")
+        else()
+            set(ROCM_PATH "/opt/rocm")
+        endif()
+    endif()
+
+    list(APPEND CMAKE_PREFIX_PATH ${ROCM_PATH} ${ROCM_PATH}/hip ${ROCM_PATH}/llvm)
+    find_package(hip QUIET)
+
+    if(hip_FOUND)
+        message(STATUS "[NekWave] Found HIP: ${HIP_VERSION} (include: ${HIP_INCLUDE_DIRS})")
+        set(DEVICE_INCLUDE_DIRS ${HIP_INCLUDE_DIRS})
+    else()
+        find_program(HIPCC_EXECUTABLE NAMES hipcc PATHS ${ROCM_PATH}/bin /opt/rocm/bin)
+        set(DEVICE_INCLUDE_DIRS "${ROCM_PATH}/include")
+    endif()
+
+    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+        # Default to gfx90a (AMD Instinct MI210 / MI250 / MI250X, e.g. PDC Dardel)
+        set(CMAKE_HIP_ARCHITECTURES gfx90a)
+    endif()
+
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.21")
+        enable_language(HIP)
+        add_library(nekwave_device STATIC
+            src/device/dg_kernels.cu
+        )
+        set_source_files_properties(src/device/dg_kernels.cu PROPERTIES LANGUAGE HIP)
+        target_include_directories(nekwave_device PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+            $<BUILD_INTERFACE:${DEVICE_INCLUDE_DIRS}>
+        )
+        target_compile_definitions(nekwave_device PUBLIC USE_HIP=1 NEKWAVE_ENABLE_HIP=1)
+        if(TARGET hip::device)
+            target_link_libraries(nekwave_device PUBLIC hip::device)
+        elseif(TARGET hip::host)
+            target_link_libraries(nekwave_device PUBLIC hip::host)
+        endif()
+    else()
+        add_library(nekwave_device STATIC
+            src/device/dg_kernels.cu
+        )
+        set_target_properties(nekwave_device PROPERTIES
+            LINKER_LANGUAGE CXX
+            POSITION_INDEPENDENT_CODE ON
+        )
+        target_include_directories(nekwave_device PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+            $<BUILD_INTERFACE:${DEVICE_INCLUDE_DIRS}>
+        )
+        target_compile_definitions(nekwave_device PUBLIC USE_HIP=1 NEKWAVE_ENABLE_HIP=1)
+    endif()
+
+    set(CUDA_INCLUDE_DIR "")
+else()
+    # ------------------------------------------------------------------------------
+    # CUDA Support (Mandatory GPU Backend when not using HIP)
+    # ------------------------------------------------------------------------------
+    if(NOT CMAKE_CUDA_COMPILER OR NOT EXISTS "${CMAKE_CUDA_COMPILER}")
+        find_program(NVCC_EXECUTABLE NAMES nvcc
+            PATHS /usr/local/cuda-11.7/bin /usr/local/cuda/bin
+            NO_DEFAULT_PATH
+        )
+        if(NOT NVCC_EXECUTABLE)
+            find_program(NVCC_EXECUTABLE NAMES nvcc)
+        endif()
+        if(NVCC_EXECUTABLE)
+            set(CMAKE_CUDA_COMPILER "${NVCC_EXECUTABLE}" CACHE FILEPATH "CUDA compiler" FORCE)
+        endif()
+    endif()
+
+    if(NOT CMAKE_CUDA_COMPILER)
+        message(FATAL_ERROR "NekWave requires an NVIDIA GPU (CUDA) or AMD GPU (ROCm/HIP with -DENABLE_HIP=ON).")
+    endif()
+
+    enable_language(CUDA)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 80)
+    endif()
+    get_filename_component(CUDA_BIN_DIR "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+    get_filename_component(CUDA_TOOLKIT_ROOT "${CUDA_BIN_DIR}" DIRECTORY)
+    set(CUDA_INCLUDE_DIR "${CUDA_TOOLKIT_ROOT}/include")
+
+    add_library(nekwave_device STATIC
+        src/device/dg_kernels.cu
     )
-    if(NOT NVCC_EXECUTABLE)
-        find_program(NVCC_EXECUTABLE NAMES nvcc)
-    endif()
-    if(NVCC_EXECUTABLE)
-        set(CMAKE_CUDA_COMPILER "${NVCC_EXECUTABLE}" CACHE FILEPATH "CUDA compiler" FORCE)
-    endif()
+    target_include_directories(nekwave_device PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+        $<BUILD_INTERFACE:${CUDA_INCLUDE_DIR}>
+        ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    )
+    set_target_properties(nekwave_device PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        POSITION_INDEPENDENT_CODE ON
+    )
 endif()
-
-if(NOT CMAKE_CUDA_COMPILER)
-    message(FATAL_ERROR "NekWave requires an NVIDIA GPU and the CUDA Toolkit (nvcc). Please ensure CUDA is installed and available.")
-endif()
-
-enable_language(CUDA)
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 80)
-endif()
-get_filename_component(CUDA_BIN_DIR "${CMAKE_CUDA_COMPILER}" DIRECTORY)
-get_filename_component(CUDA_TOOLKIT_ROOT "${CUDA_BIN_DIR}" DIRECTORY)
-set(CUDA_INCLUDE_DIR "${CUDA_TOOLKIT_ROOT}/include")
-
-add_library(nekwave_device STATIC
-    src/device/dg_kernels.cu
-)
-target_include_directories(nekwave_device PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
-    $<BUILD_INTERFACE:${CUDA_INCLUDE_DIR}>
-    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
-)
-set_target_properties(nekwave_device PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    POSITION_INDEPENDENT_CODE ON
-)
 
 # ------------------------------------------------------------------------------
-# HDF5 Support (Optional High-Performance Output)
+# Auto-detect HPC / Spack Installations (e.g. PDC KTH Clusters)
+# ------------------------------------------------------------------------------
+if(NOT DEFINED CMAKE_PREFIX_PATH)
+    set(SPACK_HDF5_DIR "/local/spack/linux-centos8-zen2/gcc-12.2.0/hdf5-1.14.3-2z7sqsie3axwefcpkcroig6xekuofspt")
+    set(SPACK_MPI_DIR "/local/spack/linux-centos8-zen2/gcc-12.2.0/openmpi-4.1.6-kvterypc5syr66ltu3zlkqnd4l6acycx")
+    if(EXISTS "${SPACK_HDF5_DIR}" AND EXISTS "${SPACK_MPI_DIR}")
+        set(CMAKE_PREFIX_PATH ${SPACK_HDF5_DIR} ${SPACK_MPI_DIR})
+    endif()
+endif()
+
+# ------------------------------------------------------------------------------
+# MPI Support (Optional Multi-GPU / Multi-Node Parallelism)
+# ------------------------------------------------------------------------------
+option(ENABLE_MPI "Build NekWave with MPI multi-GPU support" ON)
+if(ENABLE_MPI)
+    find_package(MPI)
+    if(MPI_FOUND)
+        message(STATUS "[NekWave] Found MPI (C++): ${MPI_CXX_COMPILER}")
+        set(NEKWAVE_MPI_LIBS MPI::MPI_CXX)
+    else()
+        message(STATUS "[NekWave] MPI not found; building in single-GPU / serial mode.")
+        set(NEKWAVE_MPI_LIBS "")
+    endif()
+else()
+    set(NEKWAVE_MPI_LIBS "")
+endif()
+
+# ------------------------------------------------------------------------------
+# HDF5 Support (Native High-Performance Archive Output)
 # ------------------------------------------------------------------------------
 find_package(HDF5 COMPONENTS C QUIET)
 if(HDF5_FOUND)
     message(STATUS "[NekWave] Found HDF5: ${HDF5_LIBRARIES} (include: ${HDF5_INCLUDE_DIRS})")
     set(NEKWAVE_HDF5_LIBS ${HDF5_LIBRARIES})
 else()
-    message(STATUS "[NekWave] Native HDF5 C library not found; binary/XDMF pipeline will be used.")
+    message(STATUS "[NekWave] Native HDF5 C library not found; binary pipeline will be used.")
     set(NEKWAVE_HDF5_LIBS "")
 endif()
 
@@ -97,6 +191,7 @@ endif()
 # Core Solver Library (nekwave_core)
 # ------------------------------------------------------------------------------
 set(NEKWAVE_CORE_SRCS
+    src/comm.cpp
     src/mesh.cpp
     src/dg_solver.cpp
     src/probe.cpp
@@ -110,21 +205,51 @@ add_library(nekwave_core STATIC
 
 target_include_directories(nekwave_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<BUILD_INTERFACE:${CUDA_INCLUDE_DIR}>
     $<INSTALL_INTERFACE:include>
 )
 
 if(HDF5_FOUND)
     target_include_directories(nekwave_core PUBLIC ${HDF5_INCLUDE_DIRS})
     target_compile_definitions(nekwave_core PUBLIC NEKWAVE_HAVE_HDF5=1)
+    if(TARGET hdf5-shared)
+        get_target_property(HDF5_LIB_LOC hdf5-shared LOCATION)
+        if(HDF5_LIB_LOC)
+            get_filename_component(HDF5_LIB_DIR "${HDF5_LIB_LOC}" DIRECTORY)
+            set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${HDF5_LIB_DIR}")
+            set(CMAKE_BUILD_RPATH "${CMAKE_BUILD_RPATH};${HDF5_LIB_DIR}")
+        endif()
+    endif()
 endif()
 
-target_compile_definitions(nekwave_core PUBLIC
-    NEKWAVE_BUILD_DIR="${CMAKE_BINARY_DIR}"
-    NEKWAVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-    NEKWAVE_ENABLE_CUDA
-)
+if(MPI_FOUND AND ENABLE_MPI)
+    target_include_directories(nekwave_core PUBLIC ${MPI_CXX_INCLUDE_PATH})
+    target_compile_definitions(nekwave_core PUBLIC NEKWAVE_ENABLE_MPI=1)
+    target_link_libraries(nekwave_core PUBLIC ${NEKWAVE_MPI_LIBS})
+    get_filename_component(MPI_LIB_DIR "${MPI_CXX_LIBRARIES}" DIRECTORY)
+    if(MPI_LIB_DIR)
+        link_directories(${MPI_LIB_DIR})
+        set(CMAKE_INSTALL_RPATH "${MPI_LIB_DIR}")
+        set(CMAKE_BUILD_RPATH "${MPI_LIB_DIR}")
+    endif()
+endif()
 
-target_link_libraries(nekwave_core PUBLIC nekwave_device ${NEKWAVE_HDF5_LIBS})
+if(ENABLE_HIP)
+    target_compile_definitions(nekwave_core PUBLIC
+        NEKWAVE_BUILD_DIR="${CMAKE_BINARY_DIR}"
+        NEKWAVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        USE_HIP=1
+        NEKWAVE_ENABLE_HIP=1
+    )
+else()
+    target_compile_definitions(nekwave_core PUBLIC
+        NEKWAVE_BUILD_DIR="${CMAKE_BINARY_DIR}"
+        NEKWAVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        NEKWAVE_ENABLE_CUDA
+    )
+endif()
+
+target_link_libraries(nekwave_core PUBLIC nekwave_device ${NEKWAVE_HDF5_LIBS} ${CMAKE_DL_LIBS})
 
 # ------------------------------------------------------------------------------
 # Main Application Executable (nekwave)
@@ -142,32 +267,7 @@ set_target_properties(nekwave PROPERTIES
 include(CTest)
 
 if(BUILD_TESTING)
-    # Binary name per docs/conventions.md: <module>-test
-    add_executable(nekwave-test tests/nekwave_test.cpp)
-    target_link_libraries(nekwave-test PRIVATE nekwave_core)
-    set_target_properties(nekwave-test PROPERTIES
-        OUTPUT_NAME "nekwave-test"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-    )
-
-    # CTest test names per docs/conventions.md: CamelCase ending with Tests
-    add_test(NAME MeshQuadratureTests COMMAND nekwave-test MeshQuadratureTest)
-    add_test(NAME ProbeScalingTests COMMAND nekwave-test ProbeScalingTest)
-    add_test(NAME MaxwellStabilityTests COMMAND nekwave-test MaxwellStabilityTest)
-    add_test(NAME CaseInputLoadingTests COMMAND nekwave-test CaseInputLoadingTest)
-    add_test(NAME NumericalDispersionUnitTests COMMAND nekwave-test NumericalDispersionTest)
-    add_test(NAME NekWaveUnitTests COMMAND nekwave-test)
-
-    set_tests_properties(
-        MeshQuadratureTests
-        ProbeScalingTests
-        MaxwellStabilityTests
-        CaseInputLoadingTests
-        NumericalDispersionUnitTests
-        NekWaveUnitTests
-        PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    )
+    add_subdirectory(tests)
 endif()
 
 # ------------------------------------------------------------------------------
@@ -194,7 +294,7 @@ if(ENABLE_PROFILING)
         )
 
         add_custom_target(profile
-            COMMAND ${CMAKE_COMMAND} -E env CPUPROFILE=nekwave.prof $<TARGET_FILE:nekwave_prof> "${CMAKE_CURRENT_SOURCE_DIR}/examples/cavity_gaussian/cavity_gaussian.par"
+            COMMAND ${CMAKE_COMMAND} -E env CPUPROFILE=nekwave.prof $<TARGET_FILE:nekwave_prof> "${CMAKE_CURRENT_SOURCE_DIR}/examples/3dboxpec/3dboxpec.par"
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
             DEPENDS nekwave_prof
             COMMENT "Executing simulation with CPU profiling (output: nekwave.prof)..."
@@ -208,10 +308,10 @@ endif()
 # Custom Utility Targets: run and plot
 # ------------------------------------------------------------------------------
 add_custom_target(run
-    COMMAND $<TARGET_FILE:nekwave> "${CMAKE_CURRENT_SOURCE_DIR}/examples/cavity_gaussian/cavity_gaussian.par"
+    COMMAND $<TARGET_FILE:nekwave> "${CMAKE_CURRENT_SOURCE_DIR}/examples/3dboxpec/3dboxpec.par"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     DEPENDS nekwave
-    COMMENT "Running NekWave simulation with cavity_gaussian.par..."
+    COMMENT "Running NekWave simulation with 3dboxpec.par..."
 )
 
 # Detect Python interpreter for postprocessing
