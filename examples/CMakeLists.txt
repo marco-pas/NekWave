@@ -3,21 +3,21 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Example 1: Cavity Gaussian Pulse Benchmark
+# Example 1: NekCEM 3D Box PEC Benchmark Case
 # ------------------------------------------------------------------------------
-add_executable(cavity_gaussian cavity_gaussian/cavity_gaussian.cpp)
-target_link_libraries(cavity_gaussian PRIVATE nekwave_core)
-set_target_properties(cavity_gaussian PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ctests/cavity_gaussian"
+add_executable(3dboxpec 3dboxpec/3dboxpec.cpp)
+target_link_libraries(3dboxpec PRIVATE nekwave_core)
+set_target_properties(3dboxpec PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples/3dboxpec"
 )
 
 # ------------------------------------------------------------------------------
-# Example 2: Analytical Cavity TM_110 Eigenmode Benchmark
+# Example 2: NekCEM 3D Box Periodic Benchmark Case
 # ------------------------------------------------------------------------------
-add_executable(cavity_eigenmode cavity_eigenmode/cavity_eigenmode.cpp)
-target_link_libraries(cavity_eigenmode PRIVATE nekwave_core)
-set_target_properties(cavity_eigenmode PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ctests/cavity_eigenmode"
+add_executable(3dboxper 3dboxper/3dboxper.cpp)
+target_link_libraries(3dboxper PRIVATE nekwave_core)
+set_target_properties(3dboxper PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples/3dboxper"
 )
 
 # ------------------------------------------------------------------------------
@@ -26,7 +26,7 @@ set_target_properties(cavity_eigenmode PROPERTIES
 add_executable(numerical_dispersion numerical_analysis/numerical_dispersion/numerical_dispersion.cpp)
 target_link_libraries(numerical_dispersion PRIVATE nekwave_core)
 set_target_properties(numerical_dispersion PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ctests/numerical_dispersion"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples/numerical_dispersion"
 )
 
 # ------------------------------------------------------------------------------
@@ -35,67 +35,6 @@ set_target_properties(numerical_dispersion PROPERTIES
 add_executable(analytical_export numerical_analysis/analytical_export/analytical_export.cpp)
 target_link_libraries(analytical_export PRIVATE nekwave_core)
 set_target_properties(analytical_export PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ctests/numerical_analysis/analytical_export"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples/numerical_analysis/analytical_export"
 )
 
-# ------------------------------------------------------------------------------
-# Example 5: NekCEM 3D Box PEC Benchmark
-# ------------------------------------------------------------------------------
-add_executable(3dboxpec 3dboxpec/3dboxpec.cpp)
-target_link_libraries(3dboxpec PRIVATE nekwave_core)
-set_target_properties(3dboxpec PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ctests/3dboxpec"
-)
-
-# ------------------------------------------------------------------------------
-# Example 6: NekCEM 3D Box Periodic Benchmark
-# ------------------------------------------------------------------------------
-add_executable(3dboxper 3dboxper/3dboxper.cpp)
-target_link_libraries(3dboxper PRIVATE nekwave_core)
-set_target_properties(3dboxper PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ctests/3dboxper"
-)
-
-# ------------------------------------------------------------------------------
-# CTest Registrations for Examples
-# ------------------------------------------------------------------------------
-if(BUILD_TESTING)
-    # CTest test names per docs/conventions.md: CamelCase ending with Tests
-    # Uses read-only test fixtures from tests/input with outputs disabled
-    add_test(NAME CavityGaussianTests
-        COMMAND cavity_gaussian "${CMAKE_SOURCE_DIR}/tests/input/cavity_gaussian.par"
-    )
-    set_tests_properties(CavityGaussianTests PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    )
-
-    add_test(NAME CavityEigenmodeTests
-        COMMAND cavity_eigenmode "${CMAKE_SOURCE_DIR}/tests/input/cavity_eigenmode.par"
-    )
-    set_tests_properties(CavityEigenmodeTests PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    )
-
-    add_test(NAME NumericalDispersionTests
-        COMMAND numerical_dispersion "${CMAKE_SOURCE_DIR}/tests/input/numerical_dispersion.par"
-    )
-    set_tests_properties(NumericalDispersionTests PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    )
-    if(EXISTS "${CMAKE_SOURCE_DIR}/contrib/NekCEM/tests/3dboxpec/3dboxpec.rea")
-        add_test(NAME BoxPecTests
-            COMMAND 3dboxpec "${CMAKE_SOURCE_DIR}/tests/input/3dboxpec.par"
-        )
-        set_tests_properties(BoxPecTests PROPERTIES
-            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-        )
-    endif()
-    if(EXISTS "${CMAKE_SOURCE_DIR}/contrib/NekCEM/tests/3dboxper/3dboxper.rea")
-        add_test(NAME BoxPerTests
-            COMMAND 3dboxper "${CMAKE_SOURCE_DIR}/tests/input/3dboxper.par"
-        )
-        set_tests_properties(BoxPerTests PROPERTIES
-            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-        )
-    endif()
-endif()
