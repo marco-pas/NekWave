@@ -5,6 +5,11 @@
 // The case gets taken from the /examples folder
 
 #include "case.hpp"
+#include "comm.hpp"
+
+#ifndef USE_HIP
+#include <nvtx3/nvToolsExt.h>
+#endif
 
 #include <iostream>
 #include <iomanip>
@@ -75,6 +80,7 @@ void Case::preprocess() {
 }
 
 void Case::preprocess(const Config& cfg) {
+    Comm::init();
     config_ = cfg;
 
     bool bSaveOutput = (!config_.outputDir.empty() && 
@@ -96,6 +102,9 @@ void Case::preprocess(const Config& cfg) {
 
     mesh_->setN(config_.order);
 
+#ifndef USE_HIP
+    nvtxRangePushA("Case::loadMesh");
+#endif
     // Mesh setup: Built-in box generator or external .rea mesh file
     if (config_.nelx > 0 && config_.nely > 0 && config_.nelz > 0) {
         std::cout << "[PREPROCESS] Generating Cartesian box mesh: "
@@ -148,12 +157,29 @@ void Case::preprocess(const Config& cfg) {
             mesh_->rescale(0.0, 2.0 * M_PI, 0.0, 2.0 * M_PI, 0.0, 2.0 * M_PI);
         }
     }
+#ifndef USE_HIP
+    nvtxRangePop();
+#endif
 
+    // Partition mesh across MPI ranks if running in parallel
+    if (Comm::size() > 1) {
+#ifndef USE_HIP
+        nvtxRangePushA("Case::partitionMesh");
+#endif
+        mesh_->partition(Comm::rank(), Comm::size());
+#ifndef USE_HIP
+        nvtxRangePop();
+#endif
+    }
+
+    // Allocate the state vector with 6 variables (local points + halo ghost nodes)
     const int npts = mesh_->getTotalPoints();
-    state_.assign(6 * npts, 0.0);
+    const int totalAlloc = npts + mesh_->getNumHaloPoints();
+    state_.assign(6 * totalAlloc, 0.0); // Everything set to 0
 
-    // Calculate stable time-stepping metrics
-    const double dxmin = mesh_->computeMinNodeDistance();
+    // Calculate stable time-stepping metrics (synchronized across all ranks)
+    const double dxminLocal = mesh_->computeMinNodeDistance();
+    const double dxmin = Comm::allreduceMin(dxminLocal);
     const double waveSpeed = 1.0;
 
     if (config_.dt > 0.0) {
@@ -178,6 +204,10 @@ void Case::preprocess(const Config& cfg) {
     int actualNumModes = config_.getInt("num_modes", 1);
     std::vector<double> actualModeK;
 
+#ifndef USE_HIP
+    nvtxRangePushA("Case::initFields");
+#endif
+    // Field initialization!
     if (initialConditionHook_) {
         std::cout << "[PREPROCESS] Evaluating user initial condition hook..." << std::endl;
         double* Ex = &state_[0 * npts];
@@ -197,32 +227,6 @@ void Case::preprocess(const Config& cfg) {
             Hx[k] = hx;
             Hy[k] = hy;
             Hz[k] = hz;
-        }
-    } else if (config_.has("wave_type") && config_.getString("wave_type") == "3dboxpec") {
-        std::cout << "[PREPROCESS] Evaluating NekCEM 3D Box PEC analytical cavity eigenmode in H..." << std::endl;
-        const double invSqrt6 = 1.0 / std::sqrt(6.0);
-        double* Hx = &state_[3 * npts];
-        double* Hy = &state_[4 * npts];
-        double* Hz = &state_[5 * npts];
-        for (int k = 0; k < npts; ++k) {
-            double sx = std::sin(M_PI * x[k]);
-            double cx = std::cos(M_PI * x[k]);
-            double sy = std::sin(M_PI * y[k]);
-            double cy = std::cos(M_PI * y[k]);
-            double sz = std::sin(M_PI * z[k]);
-            double cz = std::cos(M_PI * z[k]);
-
-            Hx[k] = -sx * cy * cz * invSqrt6;
-            Hy[k] = -cx * sy * cz * invSqrt6;
-            Hz[k] =  2.0 * cx * cy * sz * invSqrt6;
-        }
-    } else if (config_.has("wave_type") && config_.getString("wave_type") == "3dboxper") {
-        std::cout << "[PREPROCESS] Evaluating NekCEM 3D Box Periodic analytical eigenmode in E..." << std::endl;
-        double* Ey = &state_[1 * npts];
-        double* Ez = &state_[2 * npts];
-        for (int k = 0; k < npts; ++k) {
-            Ey[k] = std::cos(x[k]) * std::sin(y[k]) * std::sin(z[k]);
-            Ez[k] = std::cos(x[k]) * std::cos(y[k]) * std::cos(z[k]);
         }
     } else if (config_.has("wave_type") && (config_.getString("wave_type") == "bloch" || config_.getString("wave_type") == "periodic")) {
         std::cout << "[PREPROCESS] Evaluating periodic Bloch electromagnetic plane wave in (Ez, Hx, Hy)..." << std::endl;
@@ -342,16 +346,24 @@ void Case::preprocess(const Config& cfg) {
             double carrier  = std::sin(carrierK * (x[k] - xmin));
             Ez[k] = envelope * carrier * transY;
         }
-    } else {
-        std::cout << "[PREPROCESS] Evaluating default Gaussian pulse in Ez..." << std::endl;
+    } else if (config_.has("wave_type") && config_.getString("wave_type") == "gaussian") {
+        std::cout << "[PREPROCESS] Evaluating Gaussian pulse in Ez..." << std::endl;
         const double sigma = config_.pulseSigma;
         double* Ez = &state_[2 * npts];
         for (int k = 0; k < npts; ++k) {
             double r2 = x[k] * x[k] + y[k] * y[k] + z[k] * z[k];
             Ez[k] = std::exp(-sigma * r2);
         }
+    } else {
+        std::cout << "[PREPROCESS] No initial condition hook provided; all electromagnetic fields initialized to 0.0." << std::endl;
     }
+#ifndef USE_HIP
+    nvtxRangePop();
+#endif
 
+#ifndef USE_HIP
+    nvtxRangePushA("Case::initProbes");
+#endif
     // Assemble probe coordinates
     std::vector<std::array<double, 3>> allProbes = config_.probes;
     for (const auto& p : customProbes_) {
@@ -394,6 +406,9 @@ void Case::preprocess(const Config& cfg) {
     }
 
     probes_.init(*mesh_, allProbes, outDir, actualNumModes, config_.Lx, config_.nelx, actualModeK);
+#ifndef USE_HIP
+    nvtxRangePop();
+#endif
 
     // Synchronize maxSteps and numSteps
     int maxSteps = -1;
@@ -410,60 +425,84 @@ void Case::preprocess(const Config& cfg) {
 
     // Export initial fields (t = 0) if enabled
     if (bSaveOutput && config_.exportFields) {
+#ifndef USE_HIP
+        nvtxRangePushA("Case::initialExport");
+#endif
         if (config_.exportFormat == "hdf5" || config_.exportFormat == "vtk") {
             hdf5Writer_.reset(new Hdf5Writer());
+            hdf5Writer_->setFieldSaveOptions(saveOptions_);
             hdf5Writer_->initialize(outDir + "/fields.h5", *mesh_, true, config_.exportContinuousVtk);
+            bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
+                                   saveOptions_.saveDivE || saveOptions_.saveDivH ||
+                                   saveOptions_.saveMagnitudeCurlE || saveOptions_.saveMagnitudeCurlH;
             std::vector<double> divE, divH, curlE, curlH;
-            computeFieldDerivatives(state_.data(), divE, divH, curlE, curlH);
-            Hdf5Writer::DerivedFields derived{divE.data(), divH.data(), curlE.data(), curlH.data()};
+            if (needDerivatives) {
+                computeFieldDerivatives(state_.data(), divE, divH, curlE, curlH);
+            }
+            Hdf5Writer::DerivedFields derived{
+                divE.empty() ? nullptr : divE.data(),
+                divH.empty() ? nullptr : divH.data(),
+                curlE.empty() ? nullptr : curlE.data(),
+                curlH.empty() ? nullptr : curlH.data()
+            };
             hdf5Writer_->writeStep(0, 0.0, state_.data(), npts, &derived);
         } else {
             saveFields(outDir + "/field_initial.csv", 0.0);
         }
+#ifndef USE_HIP
+        nvtxRangePop();
+#endif
     }
 
     // Record t = 0 on probes
     probes_.record(0, 0.0, state_, npts);
 
+    // Evaluate initial diagnostics across all ranks
+    double initEnergy = computeTotalEnergy();
+    double initMaxE = getMaxE();
+    double initMaxH = getMaxH();
+
     // Initialize continuous energy log if output is enabled
-    if (bSaveOutput) {
+    if (Comm::isRoot() && bSaveOutput) {
         energyFile_.open(outDir + "/energy_history.csv");
         if (energyFile_.is_open()) {
             energyFile_ << "step,time,maxE,maxH,energy\n";
             energyFile_ << std::scientific << std::setprecision(8);
-            energyFile_ << 0 << "," << 0.0 << "," << getMaxE() << "," << getMaxH() << "," << computeTotalEnergy() << "\n";
+            energyFile_ << 0 << "," << 0.0 << "," << initMaxE << "," << initMaxH << "," << initEnergy << "\n";
             energyFile_.flush();
         }
     }
 
-    std::cout << "\n----------------------------------------------------------" << std::endl;
-    std::cout << "               NekWave Solver Setup Summary               " << std::endl;
-    std::cout << "----------------------------------------------------------\n" << std::endl;
-    std::cout << "  Elements:          " << mesh_->getNumElements() << std::endl;
-    std::cout << "  Polynomial Order:  " << mesh_->getN() << " (Np = " << mesh_->getNumPointsPerElement() << " nodes/elem)" << std::endl;
-    std::cout << "  Total Collocation: " << npts << " points" << std::endl;
-    std::cout << "  Domain Dimensions: Lx = " << config_.Lx << ", Ly = " << config_.Ly << ", Lz = " << config_.Lz << std::endl;
-    std::cout << "  Bounding Box:      [" << config_.xmin << ", " << config_.xmax << "] x [" 
-              << config_.ymin << ", " << config_.ymax << "] x [" 
-              << config_.zmin << ", " << config_.zmax << "]" << std::endl;
-    std::cout << "  Faces Total:       " << mesh_->getFaceData().size() << std::endl;
-    std::cout << "  Flux Formulation:  " << ((config_.c0 == 0.0) ? "Central (C0 = 0.0, energy-conserving)" : "Upwind (C0 = 1.0, dissipative)") << std::endl;
-    std::cout << "  Probes Active:     " << allProbes.size() << " locations in " << outDir << "/" << std::endl;
-    std::cout << "  Minimum Spacing:   dxmin = " << std::scientific << std::setprecision(2) << dxmin << std::endl;
-    std::cout << "  CFL Number:        " << std::scientific << std::setprecision(2) << cfl_ << std::endl;
-    std::cout << "  Time Step:         dt = " << std::scientific << std::setprecision(2) << dt_ << std::endl;
-    if (config_.maxSteps > 0) {
-        std::cout << "  Max Steps:         " << config_.maxSteps << std::endl;
+    if (Comm::isRoot()) {
+        std::cout << "\n----------------------------------------------------------" << std::endl;
+        std::cout << "               NekWave Solver Setup Summary               " << std::endl;
+        std::cout << "----------------------------------------------------------\n" << std::endl;
+        std::cout << "  Elements:          " << mesh_->getNumElements() << std::endl;
+        std::cout << "  Polynomial Order:  " << mesh_->getN() << " (Np = " << mesh_->getNumPointsPerElement() << " nodes/elem)" << std::endl;
+        std::cout << "  Total Collocation: " << npts << " points" << std::endl;
+        std::cout << "  Domain Dimensions: Lx = " << config_.Lx << ", Ly = " << config_.Ly << ", Lz = " << config_.Lz << std::endl;
+        std::cout << "  Bounding Box:      [" << config_.xmin << ", " << config_.xmax << "] x [" 
+                  << config_.ymin << ", " << config_.ymax << "] x [" 
+                  << config_.zmin << ", " << config_.zmax << "]" << std::endl;
+        std::cout << "  Faces Total:       " << mesh_->getFaceData().size() << std::endl;
+        std::cout << "  Flux Formulation:  " << ((config_.c0 == 0.0) ? "Central (C0 = 0.0, energy-conserving)" : "Upwind (C0 = 1.0, dissipative)") << std::endl;
+        std::cout << "  Probes Active:     " << allProbes.size() << " locations in " << outDir << "/" << std::endl;
+        std::cout << "  Minimum Spacing:   dxmin = " << std::scientific << std::setprecision(2) << dxmin << std::endl;
+        std::cout << "  CFL Number:        " << std::scientific << std::setprecision(2) << cfl_ << std::endl;
+        std::cout << "  Time Step:         dt = " << std::scientific << std::setprecision(2) << dt_ << std::endl;
+        if (config_.maxSteps > 0) {
+            std::cout << "  Max Steps:         " << config_.maxSteps << std::endl;
+        }
+        if (config_.finalTime > 0.0) {
+            std::cout << "  Final Time:        " << std::scientific << std::setprecision(2) << config_.finalTime << std::endl;
+        }
+        std::cout << "  Output Frequency:  " << config_.outputFreq << " steps" << std::endl;
+        std::cout << "  Save Frequency:    " << config_.saveFreq << " steps" << std::endl;
+        std::cout << "  Initial Energy:    " << std::scientific << std::setprecision(2) << initEnergy << std::endl;
+        std::cout << "  Initial max|E|:    " << std::scientific << std::setprecision(2) << initMaxE 
+                  << " | max|H|: " << std::scientific << std::setprecision(2) << initMaxH << std::endl;
+        std::cout << "\n----------------------------------------------------------\n" << std::endl;
     }
-    if (config_.finalTime > 0.0) {
-        std::cout << "  Final Time:        " << std::scientific << std::setprecision(2) << config_.finalTime << std::endl;
-    }
-    std::cout << "  Output Frequency:  " << config_.outputFreq << " steps" << std::endl;
-    std::cout << "  Save Frequency:    " << config_.saveFreq << " steps" << std::endl;
-    std::cout << "  Initial Energy:    " << std::scientific << std::setprecision(2) << computeTotalEnergy() << std::endl;
-    std::cout << "  Initial max|E|:    " << std::scientific << std::setprecision(2) << getMaxE() 
-              << " | max|H|: " << std::scientific << std::setprecision(2) << getMaxH() << std::endl;
-    std::cout << "\n----------------------------------------------------------\n" << std::endl;
 
     bIsPreprocessed_ = true;
 }
@@ -480,18 +519,28 @@ void Case::simulate() {
     const int outFreq = std::max(1, config_.outputFreq);
     const int saveFreq = std::max(1, config_.saveFreq);
 
-    std::cout << "[SIMULATE] Initializing full GPU data residency (DgSolver)..." << std::endl;
+    if (Comm::isRoot()) {
+        std::cout << "[SIMULATE] Initializing full GPU data residency (DgSolver)..." << std::endl;
+    }
+#ifndef USE_HIP
+    nvtxRangePushA("Case::initSolverState");
+#endif
     dgSolver_.reset(new DgSolver());
     dgSolver_->initialize(*mesh_, config_.c0);
     dgSolver_->uploadState(state_.data(), state_.size());
+#ifndef USE_HIP
+    nvtxRangePop();
+#endif
 
-    std::cout << "\n[SIMULATE] Advancing time integration on GPU (LSRK45)..." << std::endl;
-    std::cout << std::setw(8) << "Step" 
-              << std::setw(14) << "Time" 
-              << std::setw(14) << "max|E|" 
-              << std::setw(14) << "max|H|" 
-              << std::setw(16) << "Total Energy" << std::endl;
-    std::cout << "------------------------------------------------------------------" << std::endl;
+    if (Comm::isRoot()) {
+        std::cout << "\n[SIMULATE] Advancing time integration on GPU (LSRK45)..." << std::endl;
+        std::cout << std::setw(8) << "Step" 
+                  << std::setw(14) << "Time" 
+                  << std::setw(14) << "max|E|" 
+                  << std::setw(14) << "max|H|" 
+                  << std::setw(16) << "Total Energy" << std::endl;
+        std::cout << "------------------------------------------------------------------" << std::endl;
+    }
 
     int step = 0;
     while (true) {
@@ -509,42 +558,84 @@ void Case::simulate() {
             currentDt = finalTime - currentTime_;
         }
 
+#ifndef USE_HIP
+        nvtxRangePushA("Case::step");
+#endif
         step++;
         dgSolver_->step(currentDt, currentTime_);
         currentTime_ += currentDt;
         currentStep_ = step;
 
+#ifndef USE_HIP
+        nvtxRangePushA("Case::downloadState");
+#endif
         dgSolver_->downloadState(state_.data(), state_.size());
+#ifndef USE_HIP
+        nvtxRangePop();
+#endif
 
+#ifndef USE_HIP
+        nvtxRangePushA("Case::probesRecord");
+#endif
         probes_.record(step, currentTime_, state_, npts);
+#ifndef USE_HIP
+        nvtxRangePop();
+#endif
 
         bool isFinal = (maxSteps > 0 && step >= maxSteps) || (finalTime > 0.0 && currentTime_ >= finalTime - 1e-13);
 
         // Save HDF5/VTK snapshots according to saveFreq or on final step
         if (hdf5Writer_ && (step % saveFreq == 0 || isFinal)) {
+#ifndef USE_HIP
+            nvtxRangePushA("Case::hdf5WriteStep");
+#endif
+            bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
+                                   saveOptions_.saveDivE || saveOptions_.saveDivH ||
+                                   saveOptions_.saveMagnitudeCurlE || saveOptions_.saveMagnitudeCurlH;
             std::vector<double> divE, divH, curlE, curlH;
-            computeFieldDerivatives(state_.data(), divE, divH, curlE, curlH);
-            Hdf5Writer::DerivedFields derived{divE.data(), divH.data(), curlE.data(), curlH.data()};
+            if (needDerivatives) {
+                computeFieldDerivatives(state_.data(), divE, divH, curlE, curlH);
+            }
+            Hdf5Writer::DerivedFields derived{
+                divE.empty() ? nullptr : divE.data(),
+                divH.empty() ? nullptr : divH.data(),
+                curlE.empty() ? nullptr : curlE.data(),
+                curlH.empty() ? nullptr : curlH.data()
+            };
             hdf5Writer_->writeStep(step, currentTime_, state_.data(), npts, &derived);
+#ifndef USE_HIP
+            nvtxRangePop();
+#endif
         }
 
         // Output diagnostics according to outFreq or on final step
         if (step % outFreq == 0 || isFinal) {
+#ifndef USE_HIP
+            nvtxRangePushA("Case::computeDiagnostics");
+#endif
             double maxE = getMaxE();
             double maxH = getMaxH();
             double energy = computeTotalEnergy();
+#ifndef USE_HIP
+            nvtxRangePop();
+#endif
 
-            if (energyFile_.is_open()) {
-                energyFile_ << step << "," << currentTime_ << "," << maxE << "," << maxH << "," << energy << "\n";
-                energyFile_.flush();
+            if (Comm::isRoot()) {
+                if (energyFile_.is_open()) {
+                    energyFile_ << step << "," << currentTime_ << "," << maxE << "," << maxH << "," << energy << "\n";
+                    energyFile_.flush();
+                }
+
+                std::cout << std::setw(8) << step 
+                          << std::setw(14) << std::fixed << std::setprecision(5) << currentTime_ 
+                          << std::setw(14) << std::fixed << std::setprecision(5) << maxE 
+                          << std::setw(14) << std::fixed << std::setprecision(5) << maxH 
+                          << std::setw(16) << std::scientific << std::setprecision(6) << energy << std::endl;
             }
-
-            std::cout << std::setw(8) << step 
-                      << std::setw(14) << std::fixed << std::setprecision(5) << currentTime_ 
-                      << std::setw(14) << std::fixed << std::setprecision(5) << maxE 
-                      << std::setw(14) << std::fixed << std::setprecision(5) << maxH 
-                      << std::setw(16) << std::scientific << std::setprecision(6) << energy << std::endl;
         }
+#ifndef USE_HIP
+        nvtxRangePop();
+#endif
     }
 
     dgSolver_->downloadState(state_.data(), state_.size());
@@ -562,17 +653,31 @@ void Case::postprocess() {
     bool bSaveOutput = (!outDir.empty() && outDir != "none" && outDir != "None" && outDir != "NONE");
 
     // Finalize probe observations
+#ifndef USE_HIP
+    nvtxRangePushA("Case::probesFinalize");
+#endif
     probes_.finalize();
+#ifndef USE_HIP
+    nvtxRangePop();
+#endif
 
     // Close energy history log
     if (energyFile_.is_open()) {
         energyFile_.close();
-        std::cout << "[POSTPROCESS] Exported energy history to " << outDir << "/energy_history.csv" << std::endl;
+        if (Comm::isRoot()) {
+            std::cout << "[POSTPROCESS] Exported energy history to " << outDir << "/energy_history.csv" << std::endl;
+        }
     }
 
     // Finalize HDF5 time series writer if active
     if (hdf5Writer_) {
+#ifndef USE_HIP
+        nvtxRangePushA("Case::hdf5Close");
+#endif
         hdf5Writer_->close();
+#ifndef USE_HIP
+        nvtxRangePop();
+#endif
     }
 
     // Export final field distributions if enabled and format is not HDF5/VTK
@@ -580,12 +685,16 @@ void Case::postprocess() {
         saveFields(outDir + "/field_final.csv", currentTime_);
     }
 
-    std::cout << "------------------------------------------------------------------" << std::endl;
-    std::cout << "Simulation completed successfully at t = " << std::scientific << std::setprecision(6) << currentTime_ << std::endl;
+    if (Comm::isRoot()) {
+        std::cout << "------------------------------------------------------------------" << std::endl;
+        std::cout << "Simulation completed successfully at t = " << std::scientific << std::setprecision(6) << currentTime_ << std::endl;
+    }
 
     // Execute user-defined postprocessing hook if registered
     if (postprocessingHook_) {
-        std::cout << "[POSTPROCESS] Executing custom user postprocessing hook..." << std::endl;
+        if (Comm::isRoot()) {
+            std::cout << "[POSTPROCESS] Executing custom user postprocessing hook..." << std::endl;
+        }
         postprocessingHook_(*this);
     }
 
@@ -637,7 +746,7 @@ double Case::computeTotalEnergy() const {
         }
     }
 
-    return energy;
+    return Comm::allreduceSum(energy);
 }
 
 double Case::getMaxE() const {
@@ -651,7 +760,7 @@ double Case::getMaxE() const {
         double mag = std::sqrt(Ex[i] * Ex[i] + Ey[i] * Ey[i] + Ez[i] * Ez[i]);
         if (mag > maxVal) maxVal = mag;
     }
-    return maxVal;
+    return Comm::allreduceMax(maxVal);
 }
 
 double Case::getMaxH() const {
@@ -665,7 +774,7 @@ double Case::getMaxH() const {
         double mag = std::sqrt(Hx[i] * Hx[i] + Hy[i] * Hy[i] + Hz[i] * Hz[i]);
         if (mag > maxVal) maxVal = mag;
     }
-    return maxVal;
+    return Comm::allreduceMax(maxVal);
 }
 
 void Case::saveFields(const std::string& filename, double time) const {

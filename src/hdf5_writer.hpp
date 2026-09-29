@@ -51,6 +51,38 @@ public:
     bool initialize(const std::string& h5Path, const Mesh& mesh, bool enableXdmf = true, bool exportContinuous = false);
 
     /**
+     * @brief Selective field export options.
+     */
+    struct FieldSaveOptions {
+        bool saveE = true;
+        bool saveH = true;
+        bool saveCurlE = false;
+        bool saveCurlH = false;
+        bool saveDivE = false;
+        bool saveDivH = false;
+        bool saveMagnitudeE = false;
+        bool saveMagnitudeH = false;
+        bool saveMagnitudeCurlE = false;
+        bool saveMagnitudeCurlH = false;
+        bool saveEnergyDensity = false;
+
+        void enableAllExtras() {
+            saveCurlE = true;
+            saveCurlH = true;
+            saveDivE = true;
+            saveDivH = true;
+            saveMagnitudeE = true;
+            saveMagnitudeH = true;
+            saveMagnitudeCurlE = true;
+            saveMagnitudeCurlH = true;
+            saveEnergyDensity = true;
+        }
+    };
+
+    void setFieldSaveOptions(const FieldSaveOptions& opts);
+    const FieldSaveOptions& getFieldSaveOptions() const;
+
+    /**
      * @brief Appends field snapshot at a given time step.
      * @param step Time step iteration number.
      * @param time Physical simulation time.
@@ -80,7 +112,8 @@ public:
         int npts,
         const std::vector<std::pair<int, double>>& stepTimes,
         int totalCells = 0,
-        bool useHexCells = false
+        bool useHexCells = false,
+        const FieldSaveOptions* options = nullptr
     );
 
 private:

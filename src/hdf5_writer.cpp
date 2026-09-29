@@ -1,4 +1,5 @@
 #include "hdf5_writer.hpp"
+#include "comm.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <cstdlib>
 
 #ifdef NEKWAVE_HAVE_HDF5
 #include <hdf5.h>
@@ -27,6 +29,8 @@ struct Hdf5Writer::Impl {
     bool enableXdmf = true;
     bool exportContinuous = false;
     bool bInitialized = false;
+
+    FieldSaveOptions saveOptions;
 
     int numCgPoints = 0;
     std::vector<int> dgToCg;
@@ -61,7 +65,7 @@ struct Hdf5Writer::Impl {
             fileId = -1;
         }
         if (enableXdmf && !xmfPath.empty()) {
-            writeXdmfDescriptor(xmfPath, fileStem + ".h5", exportContinuous ? numCgPoints : npts, recordedSteps, totalCells, useHexCells);
+            writeXdmfDescriptor(xmfPath, fileStem + ".h5", exportContinuous ? numCgPoints : npts, recordedSteps, totalCells, useHexCells, &saveOptions);
         }
 #else
         if (binFile.is_open()) {
@@ -121,30 +125,39 @@ struct Hdf5Writer::Impl {
         vtu << "      </Points>\n";
 
         // PointData: Vectors and Scalars
-        vtu << "      <PointData Vectors=\"E\" Scalars=\"magnitude_E\">\n";
+        std::string vectorName = saveOptions.saveE ? "E" : (saveOptions.saveH ? "H" : "");
+        std::string scalarName = saveOptions.saveMagnitudeE ? "magnitude_E" : (saveOptions.saveEnergyDensity ? "energy_density" : "");
+        vtu << "      <PointData";
+        if (!vectorName.empty()) vtu << " Vectors=\"" << vectorName << "\"";
+        if (!scalarName.empty()) vtu << " Scalars=\"" << scalarName << "\"";
+        vtu << ">\n";
 
         if (!exportContinuous) {
             // Raw Discontinuous Galerkin point fields
             // 1. E
-            vtu << "        <DataArray type=\"Float64\" Name=\"E\" NumberOfComponents=\"3\" format=\"ascii\">\n";
-            for (int i = 0; i < npts; ++i) {
-                vtu << state[0 * npts + i] << " " 
-                    << state[1 * npts + i] << " " 
-                    << state[2 * npts + i] << "\n";
+            if (saveOptions.saveE) {
+                vtu << "        <DataArray type=\"Float64\" Name=\"E\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+                for (int i = 0; i < npts; ++i) {
+                    vtu << state[0 * npts + i] << " " 
+                        << state[1 * npts + i] << " " 
+                        << state[2 * npts + i] << "\n";
+                }
+                vtu << "        </DataArray>\n";
             }
-            vtu << "        </DataArray>\n";
 
             // 2. H
-            vtu << "        <DataArray type=\"Float64\" Name=\"H\" NumberOfComponents=\"3\" format=\"ascii\">\n";
-            for (int i = 0; i < npts; ++i) {
-                vtu << state[3 * npts + i] << " " 
-                    << state[4 * npts + i] << " " 
-                    << state[5 * npts + i] << "\n";
+            if (saveOptions.saveH) {
+                vtu << "        <DataArray type=\"Float64\" Name=\"H\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+                for (int i = 0; i < npts; ++i) {
+                    vtu << state[3 * npts + i] << " " 
+                        << state[4 * npts + i] << " " 
+                        << state[5 * npts + i] << "\n";
+                }
+                vtu << "        </DataArray>\n";
             }
-            vtu << "        </DataArray>\n";
 
-            // 3. curl_E
-            if (derived && derived->curlE) {
+            // 3. curl_E & magnitude_curl_E
+            if (saveOptions.saveCurlE && derived && derived->curlE) {
                 vtu << "        <DataArray type=\"Float64\" Name=\"curl_E\" NumberOfComponents=\"3\" format=\"ascii\">\n";
                 for (int i = 0; i < npts; ++i) {
                     vtu << derived->curlE[0 * npts + i] << " " 
@@ -152,7 +165,8 @@ struct Hdf5Writer::Impl {
                         << derived->curlE[2 * npts + i] << "\n";
                 }
                 vtu << "        </DataArray>\n";
-
+            }
+            if (saveOptions.saveMagnitudeCurlE && derived && derived->curlE) {
                 vtu << "        <DataArray type=\"Float64\" Name=\"magnitude_curl_E\" NumberOfComponents=\"1\" format=\"ascii\">\n";
                 for (int i = 0; i < npts; ++i) {
                     double cx = derived->curlE[0 * npts + i], cy = derived->curlE[1 * npts + i], cz = derived->curlE[2 * npts + i];
@@ -161,8 +175,8 @@ struct Hdf5Writer::Impl {
                 vtu << "        </DataArray>\n";
             }
 
-            // 4. curl_H
-            if (derived && derived->curlH) {
+            // 4. curl_H & magnitude_curl_H
+            if (saveOptions.saveCurlH && derived && derived->curlH) {
                 vtu << "        <DataArray type=\"Float64\" Name=\"curl_H\" NumberOfComponents=\"3\" format=\"ascii\">\n";
                 for (int i = 0; i < npts; ++i) {
                     vtu << derived->curlH[0 * npts + i] << " " 
@@ -170,7 +184,8 @@ struct Hdf5Writer::Impl {
                         << derived->curlH[2 * npts + i] << "\n";
                 }
                 vtu << "        </DataArray>\n";
-
+            }
+            if (saveOptions.saveMagnitudeCurlH && derived && derived->curlH) {
                 vtu << "        <DataArray type=\"Float64\" Name=\"magnitude_curl_H\" NumberOfComponents=\"1\" format=\"ascii\">\n";
                 for (int i = 0; i < npts; ++i) {
                     double cx = derived->curlH[0 * npts + i], cy = derived->curlH[1 * npts + i], cz = derived->curlH[2 * npts + i];
@@ -180,7 +195,7 @@ struct Hdf5Writer::Impl {
             }
 
             // 5. div_E
-            if (derived && derived->divE) {
+            if (saveOptions.saveDivE && derived && derived->divE) {
                 vtu << "        <DataArray type=\"Float64\" Name=\"div_E\" NumberOfComponents=\"1\" format=\"ascii\">\n";
                 for (int i = 0; i < npts; ++i) {
                     vtu << derived->divE[i] << "\n";
@@ -189,7 +204,7 @@ struct Hdf5Writer::Impl {
             }
 
             // 6. div_H
-            if (derived && derived->divH) {
+            if (saveOptions.saveDivH && derived && derived->divH) {
                 vtu << "        <DataArray type=\"Float64\" Name=\"div_H\" NumberOfComponents=\"1\" format=\"ascii\">\n";
                 for (int i = 0; i < npts; ++i) {
                     vtu << derived->divH[i] << "\n";
@@ -198,29 +213,35 @@ struct Hdf5Writer::Impl {
             }
 
             // 7. magnitude_E
-            vtu << "        <DataArray type=\"Float64\" Name=\"magnitude_E\" NumberOfComponents=\"1\" format=\"ascii\">\n";
-            for (int i = 0; i < npts; ++i) {
-                double ex = state[0 * npts + i], ey = state[1 * npts + i], ez = state[2 * npts + i];
-                vtu << std::sqrt(ex * ex + ey * ey + ez * ez) << "\n";
+            if (saveOptions.saveMagnitudeE) {
+                vtu << "        <DataArray type=\"Float64\" Name=\"magnitude_E\" NumberOfComponents=\"1\" format=\"ascii\">\n";
+                for (int i = 0; i < npts; ++i) {
+                    double ex = state[0 * npts + i], ey = state[1 * npts + i], ez = state[2 * npts + i];
+                    vtu << std::sqrt(ex * ex + ey * ey + ez * ez) << "\n";
+                }
+                vtu << "        </DataArray>\n";
             }
-            vtu << "        </DataArray>\n";
 
             // 8. magnitude_H
-            vtu << "        <DataArray type=\"Float64\" Name=\"magnitude_H\" NumberOfComponents=\"1\" format=\"ascii\">\n";
-            for (int i = 0; i < npts; ++i) {
-                double hx = state[3 * npts + i], hy = state[4 * npts + i], hz = state[5 * npts + i];
-                vtu << std::sqrt(hx * hx + hy * hy + hz * hz) << "\n";
+            if (saveOptions.saveMagnitudeH) {
+                vtu << "        <DataArray type=\"Float64\" Name=\"magnitude_H\" NumberOfComponents=\"1\" format=\"ascii\">\n";
+                for (int i = 0; i < npts; ++i) {
+                    double hx = state[3 * npts + i], hy = state[4 * npts + i], hz = state[5 * npts + i];
+                    vtu << std::sqrt(hx * hx + hy * hy + hz * hz) << "\n";
+                }
+                vtu << "        </DataArray>\n";
             }
-            vtu << "        </DataArray>\n";
 
             // 9. energy_density
-            vtu << "        <DataArray type=\"Float64\" Name=\"energy_density\" NumberOfComponents=\"1\" format=\"ascii\">\n";
-            for (int i = 0; i < npts; ++i) {
-                double ex = state[0 * npts + i], ey = state[1 * npts + i], ez = state[2 * npts + i];
-                double hx = state[3 * npts + i], hy = state[4 * npts + i], hz = state[5 * npts + i];
-                vtu << 0.5 * (ex * ex + ey * ey + ez * ez + hx * hx + hy * hy + hz * hz) << "\n";
+            if (saveOptions.saveEnergyDensity) {
+                vtu << "        <DataArray type=\"Float64\" Name=\"energy_density\" NumberOfComponents=\"1\" format=\"ascii\">\n";
+                for (int i = 0; i < npts; ++i) {
+                    double ex = state[0 * npts + i], ey = state[1 * npts + i], ez = state[2 * npts + i];
+                    double hx = state[3 * npts + i], hy = state[4 * npts + i], hz = state[5 * npts + i];
+                    vtu << 0.5 * (ex * ex + ey * ey + ez * ez + hx * hx + hy * hy + hz * hz) << "\n";
+                }
+                vtu << "        </DataArray>\n";
             }
-            vtu << "        </DataArray>\n";
 
         } else {
             // Continuous CG nodal field averaging across coincident element boundaries
@@ -232,22 +253,26 @@ struct Hdf5Writer::Impl {
 
             for (int i = 0; i < npts; ++i) {
                 int cg = dgToCg[i];
-                cg_Ex[cg] += state[0 * npts + i];
-                cg_Ey[cg] += state[1 * npts + i];
-                cg_Ez[cg] += state[2 * npts + i];
-                cg_Hx[cg] += state[3 * npts + i];
-                cg_Hy[cg] += state[4 * npts + i];
-                cg_Hz[cg] += state[5 * npts + i];
+                if (saveOptions.saveE) {
+                    cg_Ex[cg] += state[0 * npts + i];
+                    cg_Ey[cg] += state[1 * npts + i];
+                    cg_Ez[cg] += state[2 * npts + i];
+                }
+                if (saveOptions.saveH) {
+                    cg_Hx[cg] += state[3 * npts + i];
+                    cg_Hy[cg] += state[4 * npts + i];
+                    cg_Hz[cg] += state[5 * npts + i];
+                }
 
                 if (derived) {
-                    if (derived->divE) cg_divE[cg] += derived->divE[i];
-                    if (derived->divH) cg_divH[cg] += derived->divH[i];
-                    if (derived->curlE) {
+                    if (saveOptions.saveDivE && derived->divE) cg_divE[cg] += derived->divE[i];
+                    if (saveOptions.saveDivH && derived->divH) cg_divH[cg] += derived->divH[i];
+                    if (saveOptions.saveCurlE && derived->curlE) {
                         cg_cEx[cg] += derived->curlE[0 * npts + i];
                         cg_cEy[cg] += derived->curlE[1 * npts + i];
                         cg_cEz[cg] += derived->curlE[2 * npts + i];
                     }
-                    if (derived->curlH) {
+                    if (saveOptions.saveCurlH && derived->curlH) {
                         cg_cHx[cg] += derived->curlH[0 * npts + i];
                         cg_cHy[cg] += derived->curlH[1 * npts + i];
                         cg_cHz[cg] += derived->curlH[2 * npts + i];
@@ -265,27 +290,32 @@ struct Hdf5Writer::Impl {
             }
 
             // 1. E
-            vtu << "        <DataArray type=\"Float64\" Name=\"E\" NumberOfComponents=\"3\" format=\"ascii\">\n";
-            for (int k = 0; k < numCgPoints; ++k) {
-                vtu << cg_Ex[k] << " " << cg_Ey[k] << " " << cg_Ez[k] << "\n";
+            if (saveOptions.saveE) {
+                vtu << "        <DataArray type=\"Float64\" Name=\"E\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+                for (int k = 0; k < numCgPoints; ++k) {
+                    vtu << cg_Ex[k] << " " << cg_Ey[k] << " " << cg_Ez[k] << "\n";
+                }
+                vtu << "        </DataArray>\n";
             }
-            vtu << "        </DataArray>\n";
 
             // 2. H
-            vtu << "        <DataArray type=\"Float64\" Name=\"H\" NumberOfComponents=\"3\" format=\"ascii\">\n";
-            for (int k = 0; k < numCgPoints; ++k) {
-                vtu << cg_Hx[k] << " " << cg_Hy[k] << " " << cg_Hz[k] << "\n";
+            if (saveOptions.saveH) {
+                vtu << "        <DataArray type=\"Float64\" Name=\"H\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+                for (int k = 0; k < numCgPoints; ++k) {
+                    vtu << cg_Hx[k] << " " << cg_Hy[k] << " " << cg_Hz[k] << "\n";
+                }
+                vtu << "        </DataArray>\n";
             }
-            vtu << "        </DataArray>\n";
 
-            // 3. curl_E
-            if (derived && derived->curlE) {
+            // 3. curl_E & magnitude_curl_E
+            if (saveOptions.saveCurlE && derived && derived->curlE) {
                 vtu << "        <DataArray type=\"Float64\" Name=\"curl_E\" NumberOfComponents=\"3\" format=\"ascii\">\n";
                 for (int k = 0; k < numCgPoints; ++k) {
                     vtu << cg_cEx[k] << " " << cg_cEy[k] << " " << cg_cEz[k] << "\n";
                 }
                 vtu << "        </DataArray>\n";
-
+            }
+            if (saveOptions.saveMagnitudeCurlE && derived && derived->curlE) {
                 vtu << "        <DataArray type=\"Float64\" Name=\"magnitude_curl_E\" NumberOfComponents=\"1\" format=\"ascii\">\n";
                 for (int k = 0; k < numCgPoints; ++k) {
                     double cx = cg_cEx[k], cy = cg_cEy[k], cz = cg_cEz[k];
@@ -294,14 +324,15 @@ struct Hdf5Writer::Impl {
                 vtu << "        </DataArray>\n";
             }
 
-            // 4. curl_H
-            if (derived && derived->curlH) {
+            // 4. curl_H & magnitude_curl_H
+            if (saveOptions.saveCurlH && derived && derived->curlH) {
                 vtu << "        <DataArray type=\"Float64\" Name=\"curl_H\" NumberOfComponents=\"3\" format=\"ascii\">\n";
                 for (int k = 0; k < numCgPoints; ++k) {
                     vtu << cg_cHx[k] << " " << cg_cHy[k] << " " << cg_cHz[k] << "\n";
                 }
                 vtu << "        </DataArray>\n";
-
+            }
+            if (saveOptions.saveMagnitudeCurlH && derived && derived->curlH) {
                 vtu << "        <DataArray type=\"Float64\" Name=\"magnitude_curl_H\" NumberOfComponents=\"1\" format=\"ascii\">\n";
                 for (int k = 0; k < numCgPoints; ++k) {
                     double cx = cg_cHx[k], cy = cg_cHy[k], cz = cg_cHz[k];
@@ -311,7 +342,7 @@ struct Hdf5Writer::Impl {
             }
 
             // 5. div_E
-            if (derived && derived->divE) {
+            if (saveOptions.saveDivE && derived && derived->divE) {
                 vtu << "        <DataArray type=\"Float64\" Name=\"div_E\" NumberOfComponents=\"1\" format=\"ascii\">\n";
                 for (int k = 0; k < numCgPoints; ++k) {
                     vtu << cg_divE[k] << "\n";
@@ -320,7 +351,7 @@ struct Hdf5Writer::Impl {
             }
 
             // 6. div_H
-            if (derived && derived->divH) {
+            if (saveOptions.saveDivH && derived && derived->divH) {
                 vtu << "        <DataArray type=\"Float64\" Name=\"div_H\" NumberOfComponents=\"1\" format=\"ascii\">\n";
                 for (int k = 0; k < numCgPoints; ++k) {
                     vtu << cg_divH[k] << "\n";
@@ -329,29 +360,35 @@ struct Hdf5Writer::Impl {
             }
 
             // 7. magnitude_E
-            vtu << "        <DataArray type=\"Float64\" Name=\"magnitude_E\" NumberOfComponents=\"1\" format=\"ascii\">\n";
-            for (int k = 0; k < numCgPoints; ++k) {
-                double ex = cg_Ex[k], ey = cg_Ey[k], ez = cg_Ez[k];
-                vtu << std::sqrt(ex * ex + ey * ey + ez * ez) << "\n";
+            if (saveOptions.saveMagnitudeE) {
+                vtu << "        <DataArray type=\"Float64\" Name=\"magnitude_E\" NumberOfComponents=\"1\" format=\"ascii\">\n";
+                for (int k = 0; k < numCgPoints; ++k) {
+                    double ex = cg_Ex[k], ey = cg_Ey[k], ez = cg_Ez[k];
+                    vtu << std::sqrt(ex * ex + ey * ey + ez * ez) << "\n";
+                }
+                vtu << "        </DataArray>\n";
             }
-            vtu << "        </DataArray>\n";
 
             // 8. magnitude_H
-            vtu << "        <DataArray type=\"Float64\" Name=\"magnitude_H\" NumberOfComponents=\"1\" format=\"ascii\">\n";
-            for (int k = 0; k < numCgPoints; ++k) {
-                double hx = cg_Hx[k], hy = cg_Hy[k], hz = cg_Hz[k];
-                vtu << std::sqrt(hx * hx + hy * hy + hz * hz) << "\n";
+            if (saveOptions.saveMagnitudeH) {
+                vtu << "        <DataArray type=\"Float64\" Name=\"magnitude_H\" NumberOfComponents=\"1\" format=\"ascii\">\n";
+                for (int k = 0; k < numCgPoints; ++k) {
+                    double hx = cg_Hx[k], hy = cg_Hy[k], hz = cg_Hz[k];
+                    vtu << std::sqrt(hx * hx + hy * hy + hz * hz) << "\n";
+                }
+                vtu << "        </DataArray>\n";
             }
-            vtu << "        </DataArray>\n";
 
             // 9. energy_density
-            vtu << "        <DataArray type=\"Float64\" Name=\"energy_density\" NumberOfComponents=\"1\" format=\"ascii\">\n";
-            for (int k = 0; k < numCgPoints; ++k) {
-                double ex = cg_Ex[k], ey = cg_Ey[k], ez = cg_Ez[k];
-                double hx = cg_Hx[k], hy = cg_Hy[k], hz = cg_Hz[k];
-                vtu << 0.5 * (ex * ex + ey * ey + ez * ez + hx * hx + hy * hy + hz * hz) << "\n";
+            if (saveOptions.saveEnergyDensity) {
+                vtu << "        <DataArray type=\"Float64\" Name=\"energy_density\" NumberOfComponents=\"1\" format=\"ascii\">\n";
+                for (int k = 0; k < numCgPoints; ++k) {
+                    double ex = cg_Ex[k], ey = cg_Ey[k], ez = cg_Ez[k];
+                    double hx = cg_Hx[k], hy = cg_Hy[k], hz = cg_Hz[k];
+                    vtu << 0.5 * (ex * ex + ey * ey + ez * ez + hx * hx + hy * hy + hz * hz) << "\n";
+                }
+                vtu << "        </DataArray>\n";
             }
-            vtu << "        </DataArray>\n";
         }
         vtu << "      </PointData>\n";
 
@@ -416,6 +453,14 @@ bool Hdf5Writer::isSupported() {
 #endif
 }
 
+void Hdf5Writer::setFieldSaveOptions(const FieldSaveOptions& opts) {
+    impl_->saveOptions = opts;
+}
+
+const Hdf5Writer::FieldSaveOptions& Hdf5Writer::getFieldSaveOptions() const {
+    return impl_->saveOptions;
+}
+
 bool Hdf5Writer::initialize(const std::string& h5Path, const Mesh& mesh, bool enableXdmf, bool exportContinuous) {
     impl_->close();
 
@@ -438,6 +483,10 @@ bool Hdf5Writer::initialize(const std::string& h5Path, const Mesh& mesh, bool en
     size_t dot = impl_->fileStem.find_last_of('.');
     if (dot != std::string::npos) {
         impl_->fileStem = impl_->fileStem.substr(0, dot);
+    }
+
+    if (Comm::size() > 1) {
+        impl_->fileStem += "_rank" + std::to_string(Comm::rank());
     }
 
     impl_->h5Path = impl_->outDir + "/" + impl_->fileStem + ".h5";
@@ -572,7 +621,13 @@ bool Hdf5Writer::initialize(const std::string& h5Path, const Mesh& mesh, bool en
     }
 
 #ifdef NEKWAVE_HAVE_HDF5
-    impl_->fileId = H5Fcreate(impl_->h5Path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    setenv("HDF5_USE_FILE_LOCKING", "FALSE", 1);
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+#if defined(H5_VERSION_GE) && H5_VERSION_GE(1, 10, 7)
+    H5Pset_file_locking(fapl, false, true);
+#endif
+    impl_->fileId = H5Fcreate(impl_->h5Path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+    H5Pclose(fapl);
     if (impl_->fileId < 0) {
         std::cerr << "[HDF5 ERROR] Could not create HDF5 file: " << impl_->h5Path << std::endl;
         return false;
@@ -682,29 +737,69 @@ bool Hdf5Writer::writeStep(int step, double time, const double* state, int npts,
 
     hsize_t fieldDims[2] = {static_cast<hsize_t>(npts), 3};
     hid_t fieldSpace = H5Screate_simple(2, fieldDims, NULL);
+    hsize_t scalarDims[1] = {static_cast<hsize_t>(npts)};
+    hid_t scalarFieldSpace = H5Screate_simple(1, scalarDims, NULL);
 
-    hid_t dsetE = H5Dcreate2(stepGroup, "E", H5T_IEEE_F64LE, fieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-    std::vector<double> bufE(npts * 3);
-    for (int i = 0; i < npts; ++i) {
-        bufE[3 * i + 0] = state[0 * npts + i];
-        bufE[3 * i + 1] = state[1 * npts + i];
-        bufE[3 * i + 2] = state[2 * npts + i];
+    if (impl_->saveOptions.saveE) {
+        hid_t dsetE = H5Dcreate2(stepGroup, "E", H5T_IEEE_F64LE, fieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        std::vector<double> bufE(npts * 3);
+        for (int i = 0; i < npts; ++i) {
+            bufE[3 * i + 0] = state[0 * npts + i];
+            bufE[3 * i + 1] = state[1 * npts + i];
+            bufE[3 * i + 2] = state[2 * npts + i];
+        }
+        H5Dwrite(dsetE, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufE.data());
+        H5Dclose(dsetE);
     }
-    H5Dwrite(dsetE, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufE.data());
-    H5Dclose(dsetE);
 
-    hid_t dsetH = H5Dcreate2(stepGroup, "H", H5T_IEEE_F64LE, fieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-    std::vector<double> bufH(npts * 3);
-    for (int i = 0; i < npts; ++i) {
-        bufH[3 * i + 0] = state[3 * npts + i];
-        bufH[3 * i + 1] = state[4 * npts + i];
-        bufH[3 * i + 2] = state[5 * npts + i];
+    if (impl_->saveOptions.saveH) {
+        hid_t dsetH = H5Dcreate2(stepGroup, "H", H5T_IEEE_F64LE, fieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        std::vector<double> bufH(npts * 3);
+        for (int i = 0; i < npts; ++i) {
+            bufH[3 * i + 0] = state[3 * npts + i];
+            bufH[3 * i + 1] = state[4 * npts + i];
+            bufH[3 * i + 2] = state[5 * npts + i];
+        }
+        H5Dwrite(dsetH, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufH.data());
+        H5Dclose(dsetH);
     }
-    H5Dwrite(dsetH, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufH.data());
-    H5Dclose(dsetH);
+
+    if (impl_->saveOptions.saveMagnitudeE) {
+        hid_t dsetMagE = H5Dcreate2(stepGroup, "magnitude_E", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        std::vector<double> bufMagE(npts);
+        for (int i = 0; i < npts; ++i) {
+            double ex = state[0 * npts + i], ey = state[1 * npts + i], ez = state[2 * npts + i];
+            bufMagE[i] = std::sqrt(ex * ex + ey * ey + ez * ez);
+        }
+        H5Dwrite(dsetMagE, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufMagE.data());
+        H5Dclose(dsetMagE);
+    }
+
+    if (impl_->saveOptions.saveMagnitudeH) {
+        hid_t dsetMagH = H5Dcreate2(stepGroup, "magnitude_H", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        std::vector<double> bufMagH(npts);
+        for (int i = 0; i < npts; ++i) {
+            double hx = state[3 * npts + i], hy = state[4 * npts + i], hz = state[5 * npts + i];
+            bufMagH[i] = std::sqrt(hx * hx + hy * hy + hz * hz);
+        }
+        H5Dwrite(dsetMagH, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufMagH.data());
+        H5Dclose(dsetMagH);
+    }
+
+    if (impl_->saveOptions.saveEnergyDensity) {
+        hid_t dsetED = H5Dcreate2(stepGroup, "energy_density", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        std::vector<double> bufED(npts);
+        for (int i = 0; i < npts; ++i) {
+            double ex = state[0 * npts + i], ey = state[1 * npts + i], ez = state[2 * npts + i];
+            double hx = state[3 * npts + i], hy = state[4 * npts + i], hz = state[5 * npts + i];
+            bufED[i] = 0.5 * (ex * ex + ey * ey + ez * ez + hx * hx + hy * hy + hz * hz);
+        }
+        H5Dwrite(dsetED, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufED.data());
+        H5Dclose(dsetED);
+    }
 
     if (derived) {
-        if (derived->curlE) {
+        if (impl_->saveOptions.saveCurlE && derived->curlE) {
             hid_t dsetCE = H5Dcreate2(stepGroup, "curl_E", H5T_IEEE_F64LE, fieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
             std::vector<double> bufCE(npts * 3);
             for (int i = 0; i < npts; ++i) {
@@ -715,7 +810,7 @@ bool Hdf5Writer::writeStep(int step, double time, const double* state, int npts,
             H5Dwrite(dsetCE, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufCE.data());
             H5Dclose(dsetCE);
         }
-        if (derived->curlH) {
+        if (impl_->saveOptions.saveCurlH && derived->curlH) {
             hid_t dsetCH = H5Dcreate2(stepGroup, "curl_H", H5T_IEEE_F64LE, fieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
             std::vector<double> bufCH(npts * 3);
             for (int i = 0; i < npts; ++i) {
@@ -726,22 +821,39 @@ bool Hdf5Writer::writeStep(int step, double time, const double* state, int npts,
             H5Dwrite(dsetCH, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufCH.data());
             H5Dclose(dsetCH);
         }
-
-        hsize_t scalarDims[1] = {static_cast<hsize_t>(npts)};
-        hid_t scalarFieldSpace = H5Screate_simple(1, scalarDims, NULL);
-        if (derived->divE) {
+        if (impl_->saveOptions.saveMagnitudeCurlE && derived->curlE) {
+            hid_t dsetMagCE = H5Dcreate2(stepGroup, "magnitude_curl_E", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            std::vector<double> bufMagCE(npts);
+            for (int i = 0; i < npts; ++i) {
+                double cx = derived->curlE[0 * npts + i], cy = derived->curlE[1 * npts + i], cz = derived->curlE[2 * npts + i];
+                bufMagCE[i] = std::sqrt(cx * cx + cy * cy + cz * cz);
+            }
+            H5Dwrite(dsetMagCE, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufMagCE.data());
+            H5Dclose(dsetMagCE);
+        }
+        if (impl_->saveOptions.saveMagnitudeCurlH && derived->curlH) {
+            hid_t dsetMagCH = H5Dcreate2(stepGroup, "magnitude_curl_H", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            std::vector<double> bufMagCH(npts);
+            for (int i = 0; i < npts; ++i) {
+                double cx = derived->curlH[0 * npts + i], cy = derived->curlH[1 * npts + i], cz = derived->curlH[2 * npts + i];
+                bufMagCH[i] = std::sqrt(cx * cx + cy * cy + cz * cz);
+            }
+            H5Dwrite(dsetMagCH, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufMagCH.data());
+            H5Dclose(dsetMagCH);
+        }
+        if (impl_->saveOptions.saveDivE && derived->divE) {
             hid_t dsetDivE = H5Dcreate2(stepGroup, "div_E", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
             H5Dwrite(dsetDivE, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, derived->divE);
             H5Dclose(dsetDivE);
         }
-        if (derived->divH) {
+        if (impl_->saveOptions.saveDivH && derived->divH) {
             hid_t dsetDivH = H5Dcreate2(stepGroup, "div_H", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
             H5Dwrite(dsetDivH, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, derived->divH);
             H5Dclose(dsetDivH);
         }
-        H5Sclose(scalarFieldSpace);
     }
 
+    H5Sclose(scalarFieldSpace);
     H5Sclose(fieldSpace);
     H5Gclose(stepGroup);
 
@@ -791,8 +903,12 @@ bool Hdf5Writer::writeXdmfDescriptor(
     int npts,
     const std::vector<std::pair<int, double>>& stepTimes,
     int totalCells,
-    bool useHexCells)
+    bool useHexCells,
+    const FieldSaveOptions* options)
 {
+    FieldSaveOptions defaultOpts;
+    const FieldSaveOptions& opts = (options != nullptr) ? *options : defaultOpts;
+
     std::ofstream xmf(xmfPath);
     if (!xmf.is_open()) return false;
 
@@ -823,17 +939,93 @@ bool Hdf5Writer::writeXdmfDescriptor(
         xmf << "          </DataItem>\n";
         xmf << "        </Geometry>\n";
 
-        xmf << "        <Attribute Name=\"E\" AttributeType=\"Vector\" Center=\"Node\">\n";
-        xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-        xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/E\n";
-        xmf << "          </DataItem>\n";
-        xmf << "        </Attribute>\n";
+        if (opts.saveE) {
+            xmf << "        <Attribute Name=\"E\" AttributeType=\"Vector\" Center=\"Node\">\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
+            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/E\n";
+            xmf << "          </DataItem>\n";
+            xmf << "        </Attribute>\n";
+        }
 
-        xmf << "        <Attribute Name=\"H\" AttributeType=\"Vector\" Center=\"Node\">\n";
-        xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-        xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/H\n";
-        xmf << "          </DataItem>\n";
-        xmf << "        </Attribute>\n";
+        if (opts.saveH) {
+            xmf << "        <Attribute Name=\"H\" AttributeType=\"Vector\" Center=\"Node\">\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
+            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/H\n";
+            xmf << "          </DataItem>\n";
+            xmf << "        </Attribute>\n";
+        }
+
+        if (opts.saveCurlE) {
+            xmf << "        <Attribute Name=\"curl_E\" AttributeType=\"Vector\" Center=\"Node\">\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
+            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/curl_E\n";
+            xmf << "          </DataItem>\n";
+            xmf << "        </Attribute>\n";
+        }
+
+        if (opts.saveCurlH) {
+            xmf << "        <Attribute Name=\"curl_H\" AttributeType=\"Vector\" Center=\"Node\">\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
+            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/curl_H\n";
+            xmf << "          </DataItem>\n";
+            xmf << "        </Attribute>\n";
+        }
+
+        if (opts.saveDivE) {
+            xmf << "        <Attribute Name=\"div_E\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
+            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/div_E\n";
+            xmf << "          </DataItem>\n";
+            xmf << "        </Attribute>\n";
+        }
+
+        if (opts.saveDivH) {
+            xmf << "        <Attribute Name=\"div_H\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
+            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/div_H\n";
+            xmf << "          </DataItem>\n";
+            xmf << "        </Attribute>\n";
+        }
+
+        if (opts.saveMagnitudeE) {
+            xmf << "        <Attribute Name=\"magnitude_E\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
+            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/magnitude_E\n";
+            xmf << "          </DataItem>\n";
+            xmf << "        </Attribute>\n";
+        }
+
+        if (opts.saveMagnitudeH) {
+            xmf << "        <Attribute Name=\"magnitude_H\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
+            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/magnitude_H\n";
+            xmf << "          </DataItem>\n";
+            xmf << "        </Attribute>\n";
+        }
+
+        if (opts.saveMagnitudeCurlE) {
+            xmf << "        <Attribute Name=\"magnitude_curl_E\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
+            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/magnitude_curl_E\n";
+            xmf << "          </DataItem>\n";
+            xmf << "        </Attribute>\n";
+        }
+
+        if (opts.saveMagnitudeCurlH) {
+            xmf << "        <Attribute Name=\"magnitude_curl_H\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
+            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/magnitude_curl_H\n";
+            xmf << "          </DataItem>\n";
+            xmf << "        </Attribute>\n";
+        }
+
+        if (opts.saveEnergyDensity) {
+            xmf << "        <Attribute Name=\"energy_density\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
+            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/energy_density\n";
+            xmf << "          </DataItem>\n";
+            xmf << "        </Attribute>\n";
+        }
 
         xmf << "      </Grid>\n";
     }

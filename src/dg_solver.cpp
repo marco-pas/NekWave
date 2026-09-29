@@ -1,27 +1,19 @@
 #include "dg_solver.hpp"
 #include "mesh.hpp"
+#include "comm.hpp"
 #include "device/dg_kernels.hpp"
+#include "device/gpu_runtime.hpp"
 
-#include <cuda_runtime.h>
+#ifdef NEKWAVE_ENABLE_MPI
+#include <mpi.h>
+#endif
+#ifndef USE_HIP
+#include <nvtx3/nvToolsExt.h>
+#endif
 #include <iostream>
 #include <vector>
 #include <cassert>
 #include <cstdio>
-
-// ==============================================================================
-// Macro for CUDA Runtime API Error Checking
-// ==============================================================================
-#ifndef NW_GPU_CHECK
-#define NW_GPU_CHECK(call)                                                      \
-    do {                                                                        \
-        cudaError_t err = (call);                                               \
-        if (err != cudaSuccess) {                                               \
-            std::fprintf(stderr, "[CUDA ERROR] %s:%d: %s (code %d)\n",          \
-                         __FILE__, __LINE__, cudaGetErrorString(err), (int)err);\
-            std::abort();                                                       \
-        }                                                                       \
-    } while (0)
-#endif
 
 // ==============================================================================
 // DgSolver::Impl - Fully GPU-Resident Discontinuous Galerkin Maxwell Engine
@@ -52,6 +44,9 @@ public:
         nelt_ = mesh.getNumElements();
         nxyz_ = mesh.getNumPointsPerElement();
         npts_ = mesh.getTotalPoints();
+        numHaloPoints_ = mesh.isPartitioned() ? mesh.getNumHaloPoints() : 0;
+        stateStride_ = npts_ + numHaloPoints_;
+        haloExchanges_ = mesh.getMpiHalos();
         totalEntries_ = 6 * npts_; // 3 electric + 3 magnetic components
         c0_ = c0;                  // 0.0 = Central (conservative), 1.0 = Upwind (dissipative)
 
@@ -121,13 +116,58 @@ public:
         // ----------------------------------------------------------------------
         // 1. Allocate State, Auxiliary, and Residual GPU Buffers
         // ----------------------------------------------------------------------
-        // Memory layout here, totalEntries_ = 6
-        // This is SoA: Ex1, Ex2, ..., Ey1, Ey2, ..., Hx1, Hx2, ...
-        // Good for the GPU, as global bndwidth is optimized
-        NW_GPU_CHECK(cudaMalloc(&d_state_, totalEntries_ * sizeof(double)));
+        // Memory layout here, totalEntries_ = 6 * npts_
+        // d_state_ allocates 6 * stateStride_ (where stateStride_ = npts_ + numHaloPoints_)
+        // Local collocation points occupy [0, npts_ - 1], followed by halo ghost slots
+        NW_GPU_CHECK(cudaMalloc(&d_state_, 6 * stateStride_ * sizeof(double)));
+        NW_GPU_CHECK(cudaMemsetAsync(d_state_, 0, 6 * stateStride_ * sizeof(double), stream_));
         NW_GPU_CHECK(cudaMalloc(&d_k_, totalEntries_ * sizeof(double)));
         NW_GPU_CHECK(cudaMalloc(&d_rhs_, totalEntries_ * sizeof(double)));
         NW_GPU_CHECK(cudaMemsetAsync(d_k_, 0, totalEntries_ * sizeof(double), stream_));
+
+        // ----------------------------------------------------------------------
+        // 1b. Allocate MPI Halo Exchange Buffers & Metadata (if partitioned)
+        // ----------------------------------------------------------------------
+        if (numHaloPoints_ > 0) {
+            exchangeBufOffsets_.resize(haloExchanges_.size());
+            int curOffset = 0;
+            for (size_t h = 0; h < haloExchanges_.size(); ++h) {
+                exchangeBufOffsets_[h] = curOffset;
+                curOffset += 6 * haloExchanges_[h].numPoints;
+            }
+
+            std::vector<int> h_sendVolIndices(numHaloPoints_);
+            std::vector<int> h_sendBufOffsets(numHaloPoints_);
+            std::vector<int> h_recvBufOffsets(numHaloPoints_);
+            std::vector<int> h_exchangeSizes(numHaloPoints_);
+
+            for (size_t h = 0; h < haloExchanges_.size(); ++h) {
+                int base_buf = exchangeBufOffsets_[h];
+                int M = haloExchanges_[h].numPoints;
+                for (int p = 0; p < M; ++p) {
+                    int j = haloExchanges_[h].ghostOffset + p;
+                    h_sendVolIndices[j] = haloExchanges_[h].sendVolIndices[p];
+                    h_sendBufOffsets[j] = base_buf + p;
+                    h_recvBufOffsets[j] = base_buf + p;
+                    h_exchangeSizes[j] = M;
+                }
+            }
+
+            NW_GPU_CHECK(cudaMalloc(&d_sendVolIndices_, numHaloPoints_ * sizeof(int)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_sendVolIndices_, h_sendVolIndices.data(), numHaloPoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_sendBufOffsets_, numHaloPoints_ * sizeof(int)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_sendBufOffsets_, h_sendBufOffsets.data(), numHaloPoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_recvBufOffsets_, numHaloPoints_ * sizeof(int)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_recvBufOffsets_, h_recvBufOffsets.data(), numHaloPoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_exchangeSizes_, numHaloPoints_ * sizeof(int)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_exchangeSizes_, h_exchangeSizes.data(), numHaloPoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_mpiSendBuf_, 6 * numHaloPoints_ * sizeof(double)));
+            NW_GPU_CHECK(cudaMalloc(&d_mpiRecvBuf_, 6 * numHaloPoints_ * sizeof(double)));
+        }
 
         // ----------------------------------------------------------------------
         // 2. Allocate & Copy 1D GLL Differentiation Matrix D & Quadrature Weights
@@ -202,14 +242,44 @@ public:
 
     void uploadState(const double* hostState, size_t size) {
         assert(bInitialized_ && size == static_cast<size_t>(totalEntries_));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_state_, hostState, size * sizeof(double), cudaMemcpyHostToDevice, stream_));
+#ifndef USE_HIP
+        nvtxRangePushA("DgSolver::uploadState");
+#endif
+        if (numHaloPoints_ == 0) {
+            NW_GPU_CHECK(cudaMemcpyAsync(d_state_, hostState, size * sizeof(double), cudaMemcpyHostToDevice, stream_));
+        } else {
+            NW_GPU_CHECK(cudaMemcpy2DAsync(
+                d_state_, stateStride_ * sizeof(double),
+                hostState, npts_ * sizeof(double),
+                npts_ * sizeof(double), 6,
+                cudaMemcpyHostToDevice, stream_
+            ));
+        }
         NW_GPU_CHECK(cudaStreamSynchronize(stream_));
+#ifndef USE_HIP
+        nvtxRangePop();
+#endif
     }
 
     void downloadState(double* hostState, size_t size) const {
         assert(bInitialized_ && size == static_cast<size_t>(totalEntries_));
-        NW_GPU_CHECK(cudaMemcpyAsync(hostState, d_state_, size * sizeof(double), cudaMemcpyDeviceToHost, stream_));
+#ifndef USE_HIP
+        nvtxRangePushA("DgSolver::downloadState");
+#endif
+        if (numHaloPoints_ == 0) {
+            NW_GPU_CHECK(cudaMemcpyAsync(hostState, d_state_, size * sizeof(double), cudaMemcpyDeviceToHost, stream_));
+        } else {
+            NW_GPU_CHECK(cudaMemcpy2DAsync(
+                hostState, npts_ * sizeof(double),
+                d_state_, stateStride_ * sizeof(double),
+                npts_ * sizeof(double), 6,
+                cudaMemcpyDeviceToHost, stream_
+            ));
+        }
         NW_GPU_CHECK(cudaStreamSynchronize(stream_));
+#ifndef USE_HIP
+        nvtxRangePop();
+#endif
     }
 
     /**
@@ -220,12 +290,14 @@ public:
      *      dH/dt = -(1/mu)  * curl(E) - (1/mu)  * M^{-1} [ F^*_H ]
      *
      * In each stage:
-     *   1) Volume curl evaluated directly in shared-memory on chip (+curl(H), -curl(E))
-     *   2) Interior fields restricted to element face quadrature nodes (fEN, fHN)
-     *   3) Numerical surface Riemann fluxes computed (Central vs Upwind + PEC)
-     *   4) Numerical surface fluxes lifted into volume residuals (atomic additions)
-     *   5) Scaled by exact diagonal inverse mass matrix: 1 / (J * w_i * w_j * w_k)
-     *   6) LSRK45 state & auxiliary vector update:
+     *   1) Non-blocking MPI_Irecv / MPI_Isend halo exchange for cut faces (overlapped with volume curl)
+     *   2) Volume curl evaluated directly in shared-memory on chip (+curl(H), -curl(E))
+     *   3) MPI_Waitall + unpack received ghost traces into d_state_
+     *   4) Interior fields restricted to element face quadrature nodes (fEN, fHN)
+     *   5) Numerical surface Riemann fluxes computed (Central vs Upwind + PEC)
+     *   6) Numerical surface fluxes lifted into volume residuals (atomic additions)
+     *   7) Scaled by exact diagonal inverse mass matrix: 1 / (J * w_i * w_j * w_k)
+     *   8) LSRK45 state & auxiliary vector update:
      *          k = a_s * k + dt * rhs
      *          state = state + b_s * k
      *
@@ -234,16 +306,19 @@ public:
     void step(double dt, double time) {
         (void)time;
         assert(bInitialized_);
+#ifndef USE_HIP
+        nvtxRangePushA("DgSolver::step");
+#endif
 
-        // Pointers into the 6 field components of state_
-        const double* Ex = d_state_ + 0 * npts_;
-        const double* Ey = d_state_ + 1 * npts_;
-        const double* Ez = d_state_ + 2 * npts_;
-        const double* Hx = d_state_ + 3 * npts_;
-        const double* Hy = d_state_ + 4 * npts_;
-        const double* Hz = d_state_ + 5 * npts_;
+        // Pointers into the 6 field components of state_ (using stateStride_)
+        const double* Ex = d_state_ + 0 * stateStride_;
+        const double* Ey = d_state_ + 1 * stateStride_;
+        const double* Ez = d_state_ + 2 * stateStride_;
+        const double* Hx = d_state_ + 3 * stateStride_;
+        const double* Hy = d_state_ + 4 * stateStride_;
+        const double* Hz = d_state_ + 5 * stateStride_;
 
-        // Pointers into the 6 field components of rhs_
+        // Pointers into the 6 field components of rhs_ (local volume points only)
         double* resEx = d_rhs_ + 0 * npts_;
         double* resEy = d_rhs_ + 1 * npts_;
         double* resEz = d_rhs_ + 2 * npts_;
@@ -253,6 +328,64 @@ public:
 
         // Advance through the 5 stages of Low-Storage Runge-Kutta (LSRK45)
         for (int stage = 0; stage < 5; ++stage) {
+#ifndef USE_HIP
+            nvtxRangePushA("LSRK45_Stage");
+#endif
+#ifdef NEKWAVE_ENABLE_MPI
+            std::vector<MPI_Request> mpiReqs;
+            if (numHaloPoints_ > 0) {
+#ifndef USE_HIP
+                nvtxRangePushA("MPI_Irecv");
+#endif
+                mpiReqs.reserve(2 * haloExchanges_.size());
+                // 1. Post non-blocking receives for ghost traces
+                for (size_t h = 0; h < haloExchanges_.size(); ++h) {
+                    const auto& ex = haloExchanges_[h];
+                    int tag = 2000 + stage;
+                    MPI_Request req;
+                    MPI_Irecv(d_mpiRecvBuf_ + exchangeBufOffsets_[h], 6 * ex.numPoints, MPI_DOUBLE,
+                              ex.neighborRank, tag, MPI_COMM_WORLD, &req);
+                    mpiReqs.push_back(req);
+                }
+#ifndef USE_HIP
+                nvtxRangePop();
+#endif
+
+#ifndef USE_HIP
+                nvtxRangePushA("MPI_PackHalo");
+#endif
+                // 2. Pack send buffer on GPU from local volume traces
+                nekwave::device::launch_pack_halo(
+                    d_state_, d_mpiSendBuf_, d_sendVolIndices_,
+                    d_sendBufOffsets_, d_exchangeSizes_,
+                    numHaloPoints_, stateStride_, stream_
+                );
+                NW_GPU_CHECK(cudaStreamSynchronize(stream_));
+#ifndef USE_HIP
+                nvtxRangePop();
+#endif
+
+#ifndef USE_HIP
+                nvtxRangePushA("MPI_Isend");
+#endif
+                // 3. Post non-blocking sends directly from GPU memory (CUDA-aware MPI)
+                for (size_t h = 0; h < haloExchanges_.size(); ++h) {
+                    const auto& ex = haloExchanges_[h];
+                    int tag = 2000 + stage;
+                    MPI_Request req;
+                    MPI_Isend(d_mpiSendBuf_ + exchangeBufOffsets_[h], 6 * ex.numPoints, MPI_DOUBLE,
+                              ex.neighborRank, tag, MPI_COMM_WORLD, &req);
+                    mpiReqs.push_back(req);
+                }
+#ifndef USE_HIP
+                nvtxRangePop();
+#endif
+            }
+#endif
+
+#ifndef USE_HIP
+            nvtxRangePushA("Launch_VolumeCurl");
+#endif
             // ------------------------------------------------------------------
             // Step 1: Volume curl of H for Electric field residual: +curl(H)
             // Evaluates dE/dt = +(1/eps) * curl(H) in reference curvilinear coordinates
@@ -278,14 +411,45 @@ public:
                 d_rz_, d_sz_, d_tz_,
                 -1.0, N_, nelt_, stream_
             );
+#ifndef USE_HIP
+            nvtxRangePop();
+#endif
 
+#ifdef NEKWAVE_ENABLE_MPI
+            // Synchronize MPI communication before surface flux evaluation
+            if (numHaloPoints_ > 0) {
+#ifndef USE_HIP
+                nvtxRangePushA("MPI_Waitall");
+#endif
+                MPI_Waitall(static_cast<int>(mpiReqs.size()), mpiReqs.data(), MPI_STATUSES_IGNORE);
+#ifndef USE_HIP
+                nvtxRangePop();
+#endif
+
+#ifndef USE_HIP
+                nvtxRangePushA("MPI_UnpackHalo");
+#endif
+                // Unpack received ghost data into ghost slots of d_state_
+                nekwave::device::launch_unpack_halo(
+                    d_mpiRecvBuf_, d_state_, d_recvBufOffsets_,
+                    d_exchangeSizes_, numHaloPoints_, npts_, stateStride_, stream_
+                );
+#ifndef USE_HIP
+                nvtxRangePop();
+#endif
+            }
+#endif
+
+#ifndef USE_HIP
+            nvtxRangePushA("Launch_SurfaceFluxes");
+#endif
             // ------------------------------------------------------------------
             // Step 3: Restrict volume solution fields to face traces (fEN, fHN)
             // Corresponds to cem_maxwell_restrict_to_face in NekCEM
             // ------------------------------------------------------------------
             nekwave::device::launch_restrict_faces(
                 d_state_, d_fEN_, d_fHN_, d_volIdxMinus_,
-                totalFacePoints_, npts_, stream_
+                totalFacePoints_, stateStride_, stream_
             );
 
             // ------------------------------------------------------------------
@@ -299,7 +463,7 @@ public:
             // ------------------------------------------------------------------
             nekwave::device::launch_compute_flux(
                 d_state_, d_fEN_, d_fHN_, d_volIdxPlus_, d_bcType_,
-                d_nx_, d_ny_, d_nz_, d_flux_, c0_, totalFacePoints_, npts_, stream_
+                d_nx_, d_ny_, d_nz_, d_flux_, c0_, totalFacePoints_, stateStride_, stream_
             );
 
             // ------------------------------------------------------------------
@@ -323,7 +487,13 @@ public:
             nekwave::device::launch_inv_mass(
                 d_rhs_, d_jac_, d_w3_, nelt_, nxyz_, npts_, stream_
             );
+#ifndef USE_HIP
+            nvtxRangePop();
+#endif
 
+#ifndef USE_HIP
+            nvtxRangePushA("Launch_UpdateLSRK45");
+#endif
             // ------------------------------------------------------------------
             // Step 7: Update LSRK45 state & auxiliary vector 'k'
             // Carpenter & Kennedy (1994) low-storage state update:
@@ -331,12 +501,29 @@ public:
             //   state = state + b_s * k
             // ------------------------------------------------------------------
             nekwave::device::launch_lsrk45_update(
-                d_state_, d_k_, d_rhs_, rk4a_[stage], rk4b_[stage], dt, totalEntries_, stream_
+                d_state_, d_k_, d_rhs_, rk4a_[stage], rk4b_[stage], dt, npts_, stateStride_, stream_
             );
+#ifndef USE_HIP
+            nvtxRangePop();
+#endif
+
+#ifndef USE_HIP
+            nvtxRangePop(); // LSRK45_Stage
+#endif
         }
 
         // Stream synchronization only occurs at the end of the full time step
+#ifndef USE_HIP
+        nvtxRangePushA("StreamSynchronize");
+#endif
         NW_GPU_CHECK(cudaStreamSynchronize(stream_));
+#ifndef USE_HIP
+        nvtxRangePop();
+#endif
+
+#ifndef USE_HIP
+        nvtxRangePop(); // DgSolver::step
+#endif
     }
 
     void freeBuffers() {
@@ -374,6 +561,18 @@ public:
         cudaFree(d_fHN_); d_fHN_ = nullptr;
         cudaFree(d_flux_); d_flux_ = nullptr;
 
+        if (d_sendVolIndices_) { cudaFree(d_sendVolIndices_); d_sendVolIndices_ = nullptr; }
+        if (d_sendBufOffsets_) { cudaFree(d_sendBufOffsets_); d_sendBufOffsets_ = nullptr; }
+        if (d_recvBufOffsets_) { cudaFree(d_recvBufOffsets_); d_recvBufOffsets_ = nullptr; }
+        if (d_exchangeSizes_) { cudaFree(d_exchangeSizes_); d_exchangeSizes_ = nullptr; }
+        if (d_mpiSendBuf_) { cudaFree(d_mpiSendBuf_); d_mpiSendBuf_ = nullptr; }
+        if (d_mpiRecvBuf_) { cudaFree(d_mpiRecvBuf_); d_mpiRecvBuf_ = nullptr; }
+
+        numHaloPoints_ = 0;
+        stateStride_ = 0;
+        haloExchanges_.clear();
+        exchangeBufOffsets_.clear();
+
         if (stream_) {
             cudaStreamDestroy(stream_);
             stream_ = nullptr;
@@ -390,12 +589,17 @@ private:
     int nelt_;
     int nxyz_;
     int npts_;
+    int numHaloPoints_;
+    int stateStride_;
     int totalEntries_;
     int totalFacePoints_;
     double c0_;
 
     std::vector<double> rk4a_;
     std::vector<double> rk4b_;
+
+    std::vector<MpiHaloExchangeInfo> haloExchanges_;
+    std::vector<int> exchangeBufOffsets_;
 
     // Device memory buffer pointers
     double* d_state_ = nullptr;
@@ -421,6 +625,14 @@ private:
     double* d_fEN_ = nullptr;
     double* d_fHN_ = nullptr;
     double* d_flux_ = nullptr;
+
+    // MPI Halo exchange device buffers
+    int* d_sendVolIndices_ = nullptr;
+    int* d_sendBufOffsets_ = nullptr;
+    int* d_recvBufOffsets_ = nullptr;
+    int* d_exchangeSizes_ = nullptr;
+    double* d_mpiSendBuf_ = nullptr;
+    double* d_mpiRecvBuf_ = nullptr;
 };
 
 // ==============================================================================

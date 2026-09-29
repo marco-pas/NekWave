@@ -59,9 +59,16 @@ public:
 
     // User customization hooks
     void setInitialCondition(InitialConditionFn fn);
+    void setInitialConditionHook(InitialConditionFn fn) { setInitialCondition(fn); }
     void setPostprocessingHook(PostprocessingFn fn);
     void addProbe(double x, double y, double z);
     void addRelativeProbe(double rx, double ry, double rz);
+
+    // Field save customization
+    using SaveOptions = Hdf5Writer::FieldSaveOptions;
+    void setSaveOptions(const SaveOptions& opts) { saveOptions_ = opts; }
+    const SaveOptions& saveOptions() const { return saveOptions_; }
+    SaveOptions& saveOptions() { return saveOptions_; }
 
     // 3-Phase Simulation Lifecycle
     void preprocess();
@@ -137,6 +144,7 @@ private:
     bool bIsPreprocessed_;
     bool bIsSimulated_;
     bool bIsPostprocessed_;
+    SaveOptions saveOptions_;
 };
 
 #endif // NW_SRC_CASE_HPP

@@ -2,27 +2,7 @@
 #define NW_DEVICE_DG_KERNELS_HPP
 
 #include <cstddef>
-#include <cuda_runtime.h>
-
-/**
- * @file dg_kernels.hpp
- * @brief Clean C++ launcher interface for NekWave DG-SEM device kernels.
- *
- * Exposes dispatch functions that configure launch grids, thread blocks,
- * and shared memory for GPU kernels without leaking CUDA execution syntax (<<<...>>>)
- * into high-level solver code.
- */
-
-// Error-checking helper for CUDA API invocations
-#ifndef NW_GPU_CHECK
-#define NW_GPU_CHECK(call) do { \
-    cudaError_t err = (call); \
-    if (err != cudaSuccess) { \
-        std::fprintf(stderr, "[NekWave GPU ERROR] %s at %s:%d\n", \
-                     cudaGetErrorString(err), __FILE__, __LINE__); \
-    } \
-} while(0)
-#endif
+#include "gpu_runtime.hpp"
 
 namespace nekwave {
 namespace device {
@@ -45,7 +25,7 @@ void launch_volume_curl(
  */
 void launch_restrict_faces(
     const double* d_state, double* d_fEN, double* d_fHN,
-    const int* d_volIdxMinus, int totalFacePoints, int npts,
+    const int* d_volIdxMinus, int totalFacePoints, int stateStride,
     cudaStream_t stream = nullptr
 );
 
@@ -56,7 +36,7 @@ void launch_compute_flux(
     const double* d_state, const double* d_fEN, const double* d_fHN,
     const int* d_volIdxPlus, const int* d_isPEC,
     const double* d_nx, const double* d_ny, const double* d_nz,
-    double* d_flux, double c0, int totalFacePoints, int npts,
+    double* d_flux, double c0, int totalFacePoints, int stateStride,
     cudaStream_t stream = nullptr
 );
 
@@ -83,7 +63,27 @@ void launch_inv_mass(
  */
 void launch_lsrk45_update(
     double* d_state, double* d_k, const double* d_rhs,
-    double rk4a, double rk4b, double dt, int totalEntries,
+    double rk4a, double rk4b, double dt, int npts, int stateStride,
+    cudaStream_t stream = nullptr
+);
+
+/**
+ * @brief Packs cut face trace values from d_state into contiguous MPI send buffer.
+ */
+void launch_pack_halo(
+    const double* d_state, double* d_sendBuf,
+    const int* d_sendVolIndices, const int* d_sendBufOffsets,
+    const int* d_exchangeSizes, int numHaloPoints, int stateStride,
+    cudaStream_t stream = nullptr
+);
+
+/**
+ * @brief Unpacks received MPI buffer into the ghost region of d_state.
+ */
+void launch_unpack_halo(
+    const double* d_recvBuf, double* d_state,
+    const int* d_recvBufOffsets, const int* d_exchangeSizes,
+    int numHaloPoints, int npts, int stateStride,
     cudaStream_t stream = nullptr
 );
 

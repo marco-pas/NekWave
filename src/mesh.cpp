@@ -3,6 +3,9 @@
 // In future Neko's .nmsh format or native Gmsh)
 
 #include "mesh.hpp"
+#ifndef USE_HIP
+#include <nvtx3/nvToolsExt.h>
+#endif
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -38,7 +41,9 @@ static double legendrePolyDeriv(int n, double x) {
 // @@ Mesh constructor
 Mesh::Mesh(int N, int numElements)
     : m_N(N),
-      m_numElements(numElements) {
+      m_numElements(numElements),
+      m_bIsPartitioned(false),
+      m_numHaloPoints(0) {
     m_numPointsPerElement = m_N * m_N * m_N;
     m_totalPoints = m_numElements * m_numPointsPerElement;
 }
@@ -676,6 +681,9 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                          bool periodicX, bool periodicY, bool periodicZ) {
     if (nelx < 1 || nely < 1 || nelz < 1) return false;
 
+#ifndef USE_HIP
+    nvtxRangePushA("Mesh::createBoxMesh");
+#endif
     m_numElements = nelx * nely * nelz;
     m_totalPoints = m_numElements * m_numPointsPerElement;
     setupGLL();
@@ -822,6 +830,9 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
     computeMetricsFromCorners();
     setupFaceData();
 
+#ifndef USE_HIP
+    nvtxRangePop();
+#endif
     return true;
 }
 
@@ -966,6 +977,9 @@ int Mesh::getFaceNodeVolIndex(int elemId, int faceId, int p, int q) const {
 // @@ computing outward physical normal vectors, face quadrature weights, and neighbor node connectivity
 // PIOLA transform & NANSON formula: n * dA = J * J^{-T} * n_ref * dA_ref
 void Mesh::setupFaceData() {
+#ifndef USE_HIP
+    nvtxRangePushA("Mesh::setupFaceData");
+#endif
     m_faceData.clear();
     m_faceData.reserve(m_faces.size());
 
@@ -1054,4 +1068,333 @@ void Mesh::setupFaceData() {
         }
         m_faceData.push_back(efd);
     }
+#ifndef USE_HIP
+    nvtxRangePop();
+#endif
+}
+
+// @@ multi-GPU MPI domain decomposition (Recursive Coordinate Bisection)
+bool Mesh::partition(int rank, int numRanks) {
+    if (numRanks <= 1) {
+        m_bIsPartitioned = false;
+        m_numHaloPoints = 0;
+        m_mpiHalos.clear();
+        return true;
+    }
+
+#ifndef USE_HIP
+    nvtxRangePushA("Mesh::partition");
+#endif
+    int totalElems = m_numElements;
+    if (totalElems < numRanks) {
+        std::cerr << "[MPI ERROR] Total elements (" << totalElems 
+                  << ") is less than number of ranks (" << numRanks << ")!" << std::endl;
+#ifndef USE_HIP
+        nvtxRangePop();
+#endif
+        return false;
+    }
+
+    // 1. Calculate centroid for each element
+    struct ElemCentroid {
+        int elemId;
+        double cx, cy, cz;
+    };
+    std::vector<ElemCentroid> centroids(totalElems);
+    double minX = 1e30, maxX = -1e30;
+    double minY = 1e30, maxY = -1e30;
+    double minZ = 1e30, maxZ = -1e30;
+
+    for (int e = 0; e < totalElems; ++e) {
+        double cx = 0.0, cy = 0.0, cz = 0.0;
+        for (int v = 0; v < 8; ++v) {
+            cx += m_elementCorners[e][v][0];
+            cy += m_elementCorners[e][v][1];
+            cz += m_elementCorners[e][v][2];
+        }
+        cx *= 0.125; cy *= 0.125; cz *= 0.125;
+        centroids[e] = {e, cx, cy, cz};
+        minX = std::min(minX, cx); maxX = std::max(maxX, cx);
+        minY = std::min(minY, cy); maxY = std::max(maxY, cy);
+        minZ = std::min(minZ, cz); maxZ = std::max(maxZ, cz);
+    }
+
+    // Determine principal axis for partitioning (longest domain extent)
+    double spanX = maxX - minX;
+    double spanY = maxY - minY;
+    double spanZ = maxZ - minZ;
+
+    if (spanX >= spanY && spanX >= spanZ) {
+        std::sort(centroids.begin(), centroids.end(), [](const ElemCentroid& a, const ElemCentroid& b) {
+            return a.cx < b.cx;
+        });
+    } else if (spanY >= spanX && spanY >= spanZ) {
+        std::sort(centroids.begin(), centroids.end(), [](const ElemCentroid& a, const ElemCentroid& b) {
+            return a.cy < b.cy;
+        });
+    } else {
+        std::sort(centroids.begin(), centroids.end(), [](const ElemCentroid& a, const ElemCentroid& b) {
+            return a.cz < b.cz;
+        });
+    }
+
+    // 2. Assign elements to ranks
+    std::vector<int> elemOwner(totalElems, -1);
+    for (int i = 0; i < totalElems; ++i) {
+        int assignedRank = (i * numRanks) / totalElems;
+        elemOwner[centroids[i].elemId] = assignedRank;
+    }
+
+    // Identify local elements for this rank
+    std::vector<int> localElemIds;
+    std::vector<int> globalToLocalElem(totalElems, -1);
+    for (int e = 0; e < totalElems; ++e) {
+        if (elemOwner[e] == rank) {
+            globalToLocalElem[e] = static_cast<int>(localElemIds.size());
+            localElemIds.push_back(e);
+        }
+    }
+
+    int localNumElems = static_cast<int>(localElemIds.size());
+    int nxyz = m_numPointsPerElement;
+    int localTotalPoints = localNumElems * nxyz;
+
+    // 3. Extract local element metrics and coordinates
+    std::vector<double> new_coord_x(localTotalPoints);
+    std::vector<double> new_coord_y(localTotalPoints);
+    std::vector<double> new_coord_z(localTotalPoints);
+    std::vector<double> new_rx(localTotalPoints);
+    std::vector<double> new_sx(localTotalPoints);
+    std::vector<double> new_tx(localTotalPoints);
+    std::vector<double> new_ry(localTotalPoints);
+    std::vector<double> new_sy(localTotalPoints);
+    std::vector<double> new_ty(localTotalPoints);
+    std::vector<double> new_rz(localTotalPoints);
+    std::vector<double> new_sz(localTotalPoints);
+    std::vector<double> new_tz(localTotalPoints);
+    std::vector<double> new_jac(localTotalPoints);
+    std::vector<std::array<std::array<double, 3>, 8>> new_corners(localNumElems);
+
+    for (int locE = 0; locE < localNumElems; ++locE) {
+        int globE = localElemIds[locE];
+        new_corners[locE] = m_elementCorners[globE];
+        int globOffset = globE * nxyz;
+        int locOffset = locE * nxyz;
+        for (int p = 0; p < nxyz; ++p) {
+            new_coord_x[locOffset + p] = m_coord_x[globOffset + p];
+            new_coord_y[locOffset + p] = m_coord_y[globOffset + p];
+            new_coord_z[locOffset + p] = m_coord_z[globOffset + p];
+            new_rx[locOffset + p] = m_rx[globOffset + p];
+            new_sx[locOffset + p] = m_sx[globOffset + p];
+            new_tx[locOffset + p] = m_tx[globOffset + p];
+            new_ry[locOffset + p] = m_ry[globOffset + p];
+            new_sy[locOffset + p] = m_sy[globOffset + p];
+            new_ty[locOffset + p] = m_ty[globOffset + p];
+            new_rz[locOffset + p] = m_rz[globOffset + p];
+            new_sz[locOffset + p] = m_sz[globOffset + p];
+            new_tz[locOffset + p] = m_tz[globOffset + p];
+            new_jac[locOffset + p] = m_jac[globOffset + p];
+        }
+    }
+
+    // 4. Identify cut faces and build halo exchange structures
+    struct CutFaceRef {
+        int globE;
+        int faceId;
+        int nbrGlobE;
+        int nbrFaceId;
+        int nbrRank;
+        std::tuple<long long, long long, long long> centroidKey;
+        size_t faceDataIdx;
+    };
+
+    std::map<int, std::vector<CutFaceRef>> rankCutFaces;
+
+    for (size_t fIdx = 0; fIdx < m_faces.size(); ++fIdx) {
+        const auto& f = m_faces[fIdx];
+        int globE = f.elementId;
+        int nbrGlobE = f.neighborElementId;
+        if (nbrGlobE >= 0 && elemOwner[globE] != elemOwner[nbrGlobE]) {
+            int ownerA = elemOwner[globE];
+            int ownerB = elemOwner[nbrGlobE];
+
+            if (ownerA == rank || ownerB == rank) {
+                int otherRank = (ownerA == rank) ? ownerB : ownerA;
+
+                double fcx = 0.0, fcy = 0.0, fcz = 0.0;
+                const auto& pts = m_faceData[fIdx].points;
+                for (const auto& pt : pts) {
+                    fcx += m_coord_x[pt.volIdxMinus];
+                    fcy += m_coord_y[pt.volIdxMinus];
+                    fcz += m_coord_z[pt.volIdxMinus];
+                }
+                if (!pts.empty()) {
+                    fcx /= pts.size(); fcy /= pts.size(); fcz /= pts.size();
+                }
+                auto key = std::make_tuple(
+                    static_cast<long long>(std::round(fcx * 100000.0)),
+                    static_cast<long long>(std::round(fcy * 100000.0)),
+                    static_cast<long long>(std::round(fcz * 100000.0))
+                );
+
+                if (ownerA == rank) {
+                    rankCutFaces[otherRank].push_back({globE, f.faceId, nbrGlobE, f.neighborFaceId, otherRank, key, fIdx});
+                }
+            }
+        }
+    }
+
+    // Sort cut faces for each neighbor rank canonically
+    for (auto& kv : rankCutFaces) {
+        std::sort(kv.second.begin(), kv.second.end(), [](const CutFaceRef& a, const CutFaceRef& b) {
+            if (a.centroidKey != b.centroidKey) return a.centroidKey < b.centroidKey;
+            if (std::min(a.globE, a.nbrGlobE) != std::min(b.globE, b.nbrGlobE))
+                return std::min(a.globE, a.nbrGlobE) < std::min(b.globE, b.nbrGlobE);
+            return std::max(a.globE, a.nbrGlobE) < std::max(b.globE, b.nbrGlobE);
+        });
+    }
+
+    // 5. Build MpiHaloExchangeInfo and assign ghost node offsets
+    m_mpiHalos.clear();
+    int currentGhostOffset = 0;
+    std::map<std::pair<size_t, size_t>, int> facePtToGhost;
+
+    for (const auto& kv : rankCutFaces) {
+        int nbrRank = kv.first;
+        const auto& cutList = kv.second;
+
+        MpiHaloExchangeInfo halo;
+        halo.neighborRank = nbrRank;
+        halo.ghostOffset = currentGhostOffset;
+
+        for (const auto& cut : cutList) {
+            const auto& origPts = m_faceData[cut.faceDataIdx].points;
+            int locE = globalToLocalElem[cut.globE];
+
+            struct PtSort {
+                size_t ptIdx;
+                int locVolMinus;
+                std::tuple<long long, long long, long long> ptKey;
+            };
+            std::vector<PtSort> sortedPts(origPts.size());
+            for (size_t p = 0; p < origPts.size(); ++p) {
+                int globVM = origPts[p].volIdxMinus;
+                double px = m_coord_x[globVM];
+                double py = m_coord_y[globVM];
+                double pz = m_coord_z[globVM];
+                auto pkey = std::make_tuple(
+                    static_cast<long long>(std::round(px * 1000000.0)),
+                    static_cast<long long>(std::round(py * 1000000.0)),
+                    static_cast<long long>(std::round(pz * 1000000.0))
+                );
+                int locVM = locE * nxyz + (globVM % nxyz);
+                sortedPts[p] = {p, locVM, pkey};
+            }
+            std::sort(sortedPts.begin(), sortedPts.end(), [](const PtSort& a, const PtSort& b) {
+                return a.ptKey < b.ptKey;
+            });
+
+            for (size_t sp = 0; sp < sortedPts.size(); ++sp) {
+                halo.sendVolIndices.push_back(sortedPts[sp].locVolMinus);
+                int ghostIdx = localTotalPoints + currentGhostOffset;
+                facePtToGhost[{cut.faceDataIdx, sortedPts[sp].ptIdx}] = ghostIdx;
+                currentGhostOffset++;
+            }
+        }
+        halo.numPoints = static_cast<int>(halo.sendVolIndices.size());
+        m_mpiHalos.push_back(halo);
+    }
+    m_numHaloPoints = currentGhostOffset;
+
+    // 6. Build partitioned m_faceData and m_faces for this rank
+    std::vector<FaceInfo> new_faces;
+    std::vector<ElementFaceData> new_faceData;
+
+    for (size_t fIdx = 0; fIdx < m_faces.size(); ++fIdx) {
+        const auto& f = m_faces[fIdx];
+        int globE = f.elementId;
+        if (elemOwner[globE] != rank) continue;
+
+        int locE = globalToLocalElem[globE];
+        int globNbr = f.neighborElementId;
+
+        FaceInfo newF = f;
+        newF.elementId = locE;
+
+        ElementFaceData newEfd;
+        newEfd.elementId = locE;
+        newEfd.faceId = f.faceId;
+
+        const auto& origEfd = m_faceData[fIdx];
+        newEfd.points.reserve(origEfd.points.size());
+
+        if (globNbr < 0) {
+            newF.neighborElementId = -1;
+            newF.neighborFaceId = -1;
+            newEfd.bcType = f.bcType;
+            for (const auto& pt : origEfd.points) {
+                FacePointData npt = pt;
+                npt.volIdxMinus = locE * nxyz + (pt.volIdxMinus % nxyz);
+                npt.volIdxPlus = -1;
+                newEfd.points.push_back(npt);
+            }
+        } else if (elemOwner[globNbr] == rank) {
+            int locNbr = globalToLocalElem[globNbr];
+            newF.neighborElementId = locNbr;
+            newEfd.bcType = f.bcType;
+            for (const auto& pt : origEfd.points) {
+                FacePointData npt = pt;
+                npt.volIdxMinus = locE * nxyz + (pt.volIdxMinus % nxyz);
+                npt.volIdxPlus = locNbr * nxyz + (pt.volIdxPlus % nxyz);
+                newEfd.points.push_back(npt);
+            }
+        } else {
+            // MPI Cut Face
+            newF.neighborElementId = -1;
+            newF.bcType = "MPI";
+            newEfd.bcType = "MPI";
+            for (size_t p = 0; p < origEfd.points.size(); ++p) {
+                FacePointData npt = origEfd.points[p];
+                npt.volIdxMinus = locE * nxyz + (origEfd.points[p].volIdxMinus % nxyz);
+                npt.volIdxPlus = facePtToGhost[{fIdx, p}];
+                newEfd.points.push_back(npt);
+            }
+        }
+
+        new_faces.push_back(newF);
+        new_faceData.push_back(newEfd);
+    }
+
+    // 7. Commit partitioned mesh state
+    m_numElements = localNumElems;
+    m_totalPoints = localTotalPoints;
+    m_coord_x = std::move(new_coord_x);
+    m_coord_y = std::move(new_coord_y);
+    m_coord_z = std::move(new_coord_z);
+    m_rx = std::move(new_rx);
+    m_sx = std::move(new_sx);
+    m_tx = std::move(new_tx);
+    m_ry = std::move(new_ry);
+    m_sy = std::move(new_sy);
+    m_ty = std::move(new_ty);
+    m_rz = std::move(new_rz);
+    m_sz = std::move(new_sz);
+    m_tz = std::move(new_tz);
+    m_jac = std::move(new_jac);
+    m_elementCorners = std::move(new_corners);
+    m_faces = std::move(new_faces);
+    m_faceData = std::move(new_faceData);
+
+    m_bIsPartitioned = true;
+
+    std::cout << "[MPI] Rank " << rank << " mesh partitioned: " 
+              << m_numElements << " of " << totalElems << " elements, "
+              << m_totalPoints << " local nodes, "
+              << m_numHaloPoints << " halo ghost nodes across "
+              << m_mpiHalos.size() << " neighbor rank(s)." << std::endl;
+
+#ifndef USE_HIP
+    nvtxRangePop();
+#endif
+    return true;
 }

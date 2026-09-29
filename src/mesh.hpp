@@ -37,6 +37,14 @@ struct ElementFaceData {
     std::vector<FacePointData> points;
 };
 
+// @@ MpiHaloExchangeInfo struct to hold boundary exchange mappings between MPI ranks
+struct MpiHaloExchangeInfo {
+    int neighborRank;
+    int numPoints;
+    std::vector<int> sendVolIndices;   // Local volume node indices to pack into send buffer (minus side)
+    int ghostOffset;                   // Offset in ghost slice of state where received trace begins
+};
+
 // @@ Mesh class which handles spatial domain, geometry, and .rea parsing
 // Precomputation & Geometric Discretization
 // Maps reference coordinates (r, s, t) in [-1, 1]^3 to physical hex elements
@@ -143,6 +151,12 @@ public:
     // @@ element corners in physical space
     const std::vector<std::array<std::array<double, 3>, 8>>& getElementCorners() const { return m_elementCorners; }
 
+    // @@ multi-GPU MPI domain decomposition
+    bool partition(int rank, int numRanks);
+    bool isPartitioned() const { return m_bIsPartitioned; }
+    int getNumHaloPoints() const { return m_numHaloPoints; }
+    const std::vector<MpiHaloExchangeInfo>& getMpiHalos() const { return m_mpiHalos; }
+
 private:
     // @@ store polynomial degree parameters
     int m_N;
@@ -196,6 +210,11 @@ private:
     // @@ helper to compute face normals, area metrics, and neighbor node matching
     // NANSON RELATIONS & PIOLA: Precomputes n * dA = J * J^{-T} * n_ref * dA_ref and trace indices
     void setupFaceData();
+
+    // @@ MPI domain decomposition state
+    bool m_bIsPartitioned;
+    int m_numHaloPoints;
+    std::vector<MpiHaloExchangeInfo> m_mpiHalos;
 };
 
 #endif // NW_SRC_MESH_HPP

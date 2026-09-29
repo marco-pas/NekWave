@@ -1,6 +1,5 @@
 #include "dg_kernels.hpp"
-
-#include <cuda_runtime.h>
+#include "gpu_runtime.hpp"
 #include <cstdio>
 
 // ==============================================================================
@@ -170,20 +169,20 @@ __global__ void gpu_restrict_faces_kernel(
     double* __restrict__ fEN,
     double* __restrict__ fHN,
     const int* __restrict__ volIdxMinus,
-    int totalFacePoints, int npts)
+    int totalFacePoints, int stateStride)
 {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p < totalFacePoints) {
         int vM = volIdxMinus[p];
         // Restrict electric field traces: E^-
-        fEN[0 * totalFacePoints + p] = state[0 * npts + vM];
-        fEN[1 * totalFacePoints + p] = state[1 * npts + vM];
-        fEN[2 * totalFacePoints + p] = state[2 * npts + vM];
+        fEN[0 * totalFacePoints + p] = state[0 * stateStride + vM];
+        fEN[1 * totalFacePoints + p] = state[1 * stateStride + vM];
+        fEN[2 * totalFacePoints + p] = state[2 * stateStride + vM];
 
         // Restrict magnetic field traces: H^-
-        fHN[0 * totalFacePoints + p] = state[3 * npts + vM];
-        fHN[1 * totalFacePoints + p] = state[4 * npts + vM];
-        fHN[2 * totalFacePoints + p] = state[5 * npts + vM];
+        fHN[0 * totalFacePoints + p] = state[3 * stateStride + vM];
+        fHN[1 * totalFacePoints + p] = state[4 * stateStride + vM];
+        fHN[2 * totalFacePoints + p] = state[5 * stateStride + vM];
     }
 }
 
@@ -225,7 +224,7 @@ __global__ void gpu_compute_flux_kernel(
     const double* __restrict__ ny,
     const double* __restrict__ nz,
     double* __restrict__ flux,
-    double c0, int totalFacePoints, int npts)
+    double c0, int totalFacePoints, int stateStride)
 {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p < totalFacePoints) {
@@ -250,12 +249,12 @@ __global__ void gpu_compute_flux_kernel(
         } else {
             // Internal connection face: evaluate difference with neighbor trace (plus side)
             int vP = volIdxPlus[p];
-            dEx = state[0 * npts + vP] - Ex_m;
-            dEy = state[1 * npts + vP] - Ey_m;
-            dEz = state[2 * npts + vP] - Ez_m;
-            dHx = state[3 * npts + vP] - Hx_m;
-            dHy = state[4 * npts + vP] - Hy_m;
-            dHz = state[5 * npts + vP] - Hz_m;
+            dEx = state[0 * stateStride + vP] - Ex_m;
+            dEy = state[1 * stateStride + vP] - Ey_m;
+            dEz = state[2 * stateStride + vP] - Ez_m;
+            dHx = state[3 * stateStride + vP] - Hx_m;
+            dHy = state[4 * stateStride + vP] - Hy_m;
+            dHz = state[5 * stateStride + vP] - Hz_m;
         }
 
         double n_x = nx[p], n_y = ny[p], n_z = nz[p];
@@ -386,20 +385,67 @@ __global__ void gpu_inv_mass_kernel(
  *      k = a_s * k + dt * rhs
  *      state = state + b_s * k
  *
- * Operates across all 6 electromagnetic fields simultaneously (totalEntries = 6 * npts).
+ * Operates across all 6 electromagnetic fields simultaneously for local volume points.
  */
 __global__ void gpu_lsrk45_update_kernel(
     double* __restrict__ state,
     double* __restrict__ k,
     const double* __restrict__ rhs,
     double a_s, double b_s, double dt,
-    int totalEntries)
+    int npts, int stateStride)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < totalEntries) {
+    if (i < 6 * npts) {
+        int comp = i / npts;
+        int p = i % npts;
         double ki = a_s * k[i] + dt * rhs[i];
         k[i] = ki;
-        state[i] += b_s * ki;
+        state[comp * stateStride + p] += b_s * ki;
+    }
+}
+
+/**
+ * @brief Packs cut face trace values into a contiguous MPI send buffer.
+ */
+__global__ void gpu_pack_halo_kernel(
+    const double* __restrict__ state,
+    double* __restrict__ sendBuf,
+    const int* __restrict__ sendVolIndices,
+    const int* __restrict__ sendBufOffsets,
+    const int* __restrict__ exchangeSizes,
+    int numHaloPoints, int stateStride)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < numHaloPoints) {
+        int v = sendVolIndices[j];
+        int base = sendBufOffsets[j];
+        int M = exchangeSizes[j];
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) {
+            sendBuf[base + c * M] = state[c * stateStride + v];
+        }
+    }
+}
+
+/**
+ * @brief Unpacks received MPI buffer into the ghost region of d_state.
+ */
+__global__ void gpu_unpack_halo_kernel(
+    const double* __restrict__ recvBuf,
+    double* __restrict__ state,
+    const int* __restrict__ recvBufOffsets,
+    const int* __restrict__ exchangeSizes,
+    int numHaloPoints, int npts, int stateStride)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < numHaloPoints) {
+        int base = recvBufOffsets[j];
+        int M = exchangeSizes[j];
+        int ghostVolIdx = npts + j;
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) {
+            state[c * stateStride + ghostVolIdx] = recvBuf[base + c * M];
+        }
     }
 }
 
@@ -446,14 +492,14 @@ void launch_volume_curl(
  */
 void launch_restrict_faces(
     const double* d_state, double* d_fEN, double* d_fHN,
-    const int* d_volIdxMinus, int totalFacePoints, int npts,
+    const int* d_volIdxMinus, int totalFacePoints, int stateStride,
     cudaStream_t stream)
 {
     int blockSize = 256;
     int numBlocks = (totalFacePoints + blockSize - 1) / blockSize;
 
     gpu_restrict_faces_kernel<<<numBlocks, blockSize, 0, stream>>>(
-        d_state, d_fEN, d_fHN, d_volIdxMinus, totalFacePoints, npts
+        d_state, d_fEN, d_fHN, d_volIdxMinus, totalFacePoints, stateStride
     );
     NW_GPU_CHECK(cudaGetLastError());
 }
@@ -465,7 +511,7 @@ void launch_compute_flux(
     const double* d_state, const double* d_fEN, const double* d_fHN,
     const int* d_volIdxPlus, const int* d_isPEC,
     const double* d_nx, const double* d_ny, const double* d_nz,
-    double* d_flux, double c0, int totalFacePoints, int npts,
+    double* d_flux, double c0, int totalFacePoints, int stateStride,
     cudaStream_t stream)
 {
     int blockSize = 256;
@@ -473,7 +519,7 @@ void launch_compute_flux(
 
     gpu_compute_flux_kernel<<<numBlocks, blockSize, 0, stream>>>(
         d_state, d_fEN, d_fHN, d_volIdxPlus, d_isPEC,
-        d_nx, d_ny, d_nz, d_flux, c0, totalFacePoints, npts
+        d_nx, d_ny, d_nz, d_flux, c0, totalFacePoints, stateStride
     );
     NW_GPU_CHECK(cudaGetLastError());
 }
@@ -517,14 +563,55 @@ void launch_inv_mass(
  */
 void launch_lsrk45_update(
     double* d_state, double* d_k, const double* d_rhs,
-    double rk4a, double rk4b, double dt, int totalEntries,
+    double rk4a, double rk4b, double dt, int npts, int stateStride,
     cudaStream_t stream)
 {
+    int totalEntries = 6 * npts;
     int blockSize = 256;
     int numBlocks = (totalEntries + blockSize - 1) / blockSize;
 
     gpu_lsrk45_update_kernel<<<numBlocks, blockSize, 0, stream>>>(
-        d_state, d_k, d_rhs, rk4a, rk4b, dt, totalEntries
+        d_state, d_k, d_rhs, rk4a, rk4b, dt, npts, stateStride
+    );
+    NW_GPU_CHECK(cudaGetLastError());
+}
+
+/**
+ * @brief Packs cut face trace values from d_state into contiguous MPI send buffer.
+ */
+void launch_pack_halo(
+    const double* d_state, double* d_sendBuf,
+    const int* d_sendVolIndices, const int* d_sendBufOffsets,
+    const int* d_exchangeSizes, int numHaloPoints, int stateStride,
+    cudaStream_t stream)
+{
+    if (numHaloPoints <= 0) return;
+    int blockSize = 256;
+    int numBlocks = (numHaloPoints + blockSize - 1) / blockSize;
+
+    gpu_pack_halo_kernel<<<numBlocks, blockSize, 0, stream>>>(
+        d_state, d_sendBuf, d_sendVolIndices, d_sendBufOffsets,
+        d_exchangeSizes, numHaloPoints, stateStride
+    );
+    NW_GPU_CHECK(cudaGetLastError());
+}
+
+/**
+ * @brief Unpacks received MPI buffer into the ghost region of d_state.
+ */
+void launch_unpack_halo(
+    const double* d_recvBuf, double* d_state,
+    const int* d_recvBufOffsets, const int* d_exchangeSizes,
+    int numHaloPoints, int npts, int stateStride,
+    cudaStream_t stream)
+{
+    if (numHaloPoints <= 0) return;
+    int blockSize = 256;
+    int numBlocks = (numHaloPoints + blockSize - 1) / blockSize;
+
+    gpu_unpack_halo_kernel<<<numBlocks, blockSize, 0, stream>>>(
+        d_recvBuf, d_state, d_recvBufOffsets,
+        d_exchangeSizes, numHaloPoints, npts, stateStride
     );
     NW_GPU_CHECK(cudaGetLastError());
 }
