@@ -275,7 +275,7 @@ Replace heavy ASCII CSV exports (`field_final.csv`) with a high-performance bina
   * Allows direct time series visualization, streamlines, vector glyphs, and slicing in ParaView or VisIt without post-processing plugins.
 * **Portable IEEE-754 Binary Fallback**:
   * When native `libhdf5` is not detected at compile time, NekWave automatically switches to an optimized binary format (`NEKWAVE_BIN_V1`) without crashing or requiring external libraries.
-  * Emits an accompanying `scripts/convert_to_hdf5.py` tool to convert `.bin` files into standard HDF5 `.h5` files with full metadata.
+  * Emits an accompanying `tools/convert_to_hdf5.py` tool to convert `.bin` files into standard HDF5 `.h5` files with full metadata.
 
 ### 2. Configuration & Lifecycle Integration
 * Added parameters to `Config` (`src/config.hpp`):
