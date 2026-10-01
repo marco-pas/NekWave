@@ -38,3 +38,13 @@ set_target_properties(analytical_export PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples/numerical_analysis/analytical_export"
 )
 
+# ------------------------------------------------------------------------------
+# Example 5: High-Order Spatial Convergence Benchmark (h- and p-Refinement)
+# ------------------------------------------------------------------------------
+add_executable(convergence_test numerical_analysis/convergence_test/convergence_test.cpp)
+target_link_libraries(convergence_test PRIVATE nekwave_core)
+set_target_properties(convergence_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples/numerical_analysis/convergence_test"
+)
+
+
