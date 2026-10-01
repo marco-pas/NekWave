@@ -116,6 +116,20 @@ public:
         const FieldSaveOptions* options = nullptr
     );
 
+    /**
+     * @brief Writes a master companion XDMF XML file combining all MPI rank partitions.
+     */
+    static bool writeMasterXdmfDescriptor(
+        const std::string& xmfPath,
+        const std::string& baseStem,
+        int numRanks,
+        const std::vector<int>& allNpts,
+        const std::vector<int>& allTotalCells,
+        const std::vector<std::pair<int, double>>& stepTimes,
+        bool useHexCells = false,
+        const FieldSaveOptions* options = nullptr
+    );
+
 private:
     struct Impl;
     Impl* impl_;

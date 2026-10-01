@@ -17,6 +17,7 @@
 struct Hdf5Writer::Impl {
     std::string outDir;
     std::string fileStem;
+    std::string baseStem;
     std::string h5Path;
     std::string xmfPath;
     std::string pvdPath;
@@ -64,9 +65,26 @@ struct Hdf5Writer::Impl {
             H5Fclose(fileId);
             fileId = -1;
         }
+        int outPts = exportContinuous ? numCgPoints : npts;
         if (enableXdmf && !xmfPath.empty()) {
-            writeXdmfDescriptor(xmfPath, fileStem + ".h5", exportContinuous ? numCgPoints : npts, recordedSteps, totalCells, useHexCells, &saveOptions);
+            writeXdmfDescriptor(xmfPath, fileStem + ".h5", outPts, recordedSteps, totalCells, useHexCells, &saveOptions);
         }
+
+#ifdef NEKWAVE_ENABLE_MPI
+        if (Comm::size() > 1 && enableXdmf) {
+            int localTotalCells = totalCells;
+            std::vector<int> allNpts(Comm::size(), 0);
+            std::vector<int> allTotalCells(Comm::size(), 0);
+
+            MPI_Gather(&outPts, 1, MPI_INT, allNpts.data(), 1, MPI_INT, 0, Comm::world());
+            MPI_Gather(&localTotalCells, 1, MPI_INT, allTotalCells.data(), 1, MPI_INT, 0, Comm::world());
+
+            if (Comm::isRoot()) {
+                std::string masterXmfPath = outDir + "/" + baseStem + ".xmf";
+                writeMasterXdmfDescriptor(masterXmfPath, baseStem, Comm::size(), allNpts, allTotalCells, recordedSteps, useHexCells, &saveOptions);
+            }
+        }
+#endif
 #else
         if (binFile.is_open()) {
             binFile.close();
@@ -484,6 +502,7 @@ bool Hdf5Writer::initialize(const std::string& h5Path, const Mesh& mesh, bool en
     if (dot != std::string::npos) {
         impl_->fileStem = impl_->fileStem.substr(0, dot);
     }
+    impl_->baseStem = impl_->fileStem;
 
     if (Comm::size() > 1) {
         impl_->fileStem += "_rank" + std::to_string(Comm::rank());
@@ -660,15 +679,18 @@ bool Hdf5Writer::initialize(const std::string& h5Path, const Mesh& mesh, bool en
 
     H5Sclose(scalarSpace);
 
+    int outPts = impl_->exportContinuous ? impl_->numCgPoints : impl_->npts;
+    const double* coordPtr = impl_->exportContinuous ? impl_->cgCoords.data() : impl_->meshCoords.data();
+
     hid_t meshGroup = H5Gcreate2(impl_->fileId, "/mesh", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-    hsize_t coordDims[2] = {static_cast<hsize_t>(npts), 3};
+    hsize_t coordDims[2] = {static_cast<hsize_t>(outPts), 3};
     hid_t coordSpace = H5Screate_simple(2, coordDims, NULL);
     hid_t coordDset = H5Dcreate2(meshGroup, "coordinates", H5T_IEEE_F64LE, coordSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-    H5Dwrite(coordDset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, impl_->meshCoords.data());
+    H5Dwrite(coordDset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, coordPtr);
     H5Dclose(coordDset);
     H5Sclose(coordSpace);
 
-    hsize_t jacDims[1] = {static_cast<hsize_t>(npts)};
+    hsize_t jacDims[1] = {static_cast<hsize_t>(impl_->npts)};
     hid_t jacSpace = H5Screate_simple(1, jacDims, NULL);
     hid_t jacDset = H5Dcreate2(meshGroup, "jacobian", H5T_IEEE_F64LE, jacSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
     H5Dwrite(jacDset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, mesh.getJac().data());
@@ -689,7 +711,7 @@ bool Hdf5Writer::initialize(const std::string& h5Path, const Mesh& mesh, bool en
     impl_->timeSeriesGroup = H5Gcreate2(impl_->fileId, "/time_series", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
 
     std::cout << "[HDF5] Initialized binary HDF5 archive: " << impl_->h5Path 
-              << " (" << npts << " collocation nodes)" << std::endl;
+              << " (" << outPts << " collocation nodes)" << std::endl;
 #else
     impl_->binFile.open(impl_->binPath, std::ios::binary | std::ios::trunc);
     if (!impl_->binFile.is_open()) {
@@ -735,18 +757,55 @@ bool Hdf5Writer::writeStep(int step, double time, const double* state, int npts,
     H5Aclose(attrStep);
     H5Sclose(scalarSpace);
 
-    hsize_t fieldDims[2] = {static_cast<hsize_t>(npts), 3};
+    int outPts = impl_->exportContinuous ? impl_->numCgPoints : impl_->npts;
+    hsize_t fieldDims[2] = {static_cast<hsize_t>(outPts), 3};
     hid_t fieldSpace = H5Screate_simple(2, fieldDims, NULL);
-    hsize_t scalarDims[1] = {static_cast<hsize_t>(npts)};
+    hsize_t scalarDims[1] = {static_cast<hsize_t>(outPts)};
     hid_t scalarFieldSpace = H5Screate_simple(1, scalarDims, NULL);
+
+    std::vector<double> cg_Ex, cg_Ey, cg_Ez, cg_Hx, cg_Hy, cg_Hz;
+    if (impl_->exportContinuous) {
+        cg_Ex.assign(outPts, 0.0);
+        cg_Ey.assign(outPts, 0.0);
+        cg_Ez.assign(outPts, 0.0);
+        cg_Hx.assign(outPts, 0.0);
+        cg_Hy.assign(outPts, 0.0);
+        cg_Hz.assign(outPts, 0.0);
+        for (int i = 0; i < npts; ++i) {
+            int c = impl_->dgToCg[i];
+            cg_Ex[c] += state[0 * npts + i];
+            cg_Ey[c] += state[1 * npts + i];
+            cg_Ez[c] += state[2 * npts + i];
+            cg_Hx[c] += state[3 * npts + i];
+            cg_Hy[c] += state[4 * npts + i];
+            cg_Hz[c] += state[5 * npts + i];
+        }
+        for (int k = 0; k < outPts; ++k) {
+            double w = impl_->cgMultiplicityInv[k];
+            cg_Ex[k] *= w;
+            cg_Ey[k] *= w;
+            cg_Ez[k] *= w;
+            cg_Hx[k] *= w;
+            cg_Hy[k] *= w;
+            cg_Hz[k] *= w;
+        }
+    }
 
     if (impl_->saveOptions.saveE) {
         hid_t dsetE = H5Dcreate2(stepGroup, "E", H5T_IEEE_F64LE, fieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        std::vector<double> bufE(npts * 3);
-        for (int i = 0; i < npts; ++i) {
-            bufE[3 * i + 0] = state[0 * npts + i];
-            bufE[3 * i + 1] = state[1 * npts + i];
-            bufE[3 * i + 2] = state[2 * npts + i];
+        std::vector<double> bufE(outPts * 3);
+        if (impl_->exportContinuous) {
+            for (int i = 0; i < outPts; ++i) {
+                bufE[3 * i + 0] = cg_Ex[i];
+                bufE[3 * i + 1] = cg_Ey[i];
+                bufE[3 * i + 2] = cg_Ez[i];
+            }
+        } else {
+            for (int i = 0; i < npts; ++i) {
+                bufE[3 * i + 0] = state[0 * npts + i];
+                bufE[3 * i + 1] = state[1 * npts + i];
+                bufE[3 * i + 2] = state[2 * npts + i];
+            }
         }
         H5Dwrite(dsetE, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufE.data());
         H5Dclose(dsetE);
@@ -754,11 +813,19 @@ bool Hdf5Writer::writeStep(int step, double time, const double* state, int npts,
 
     if (impl_->saveOptions.saveH) {
         hid_t dsetH = H5Dcreate2(stepGroup, "H", H5T_IEEE_F64LE, fieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        std::vector<double> bufH(npts * 3);
-        for (int i = 0; i < npts; ++i) {
-            bufH[3 * i + 0] = state[3 * npts + i];
-            bufH[3 * i + 1] = state[4 * npts + i];
-            bufH[3 * i + 2] = state[5 * npts + i];
+        std::vector<double> bufH(outPts * 3);
+        if (impl_->exportContinuous) {
+            for (int i = 0; i < outPts; ++i) {
+                bufH[3 * i + 0] = cg_Hx[i];
+                bufH[3 * i + 1] = cg_Hy[i];
+                bufH[3 * i + 2] = cg_Hz[i];
+            }
+        } else {
+            for (int i = 0; i < npts; ++i) {
+                bufH[3 * i + 0] = state[3 * npts + i];
+                bufH[3 * i + 1] = state[4 * npts + i];
+                bufH[3 * i + 2] = state[5 * npts + i];
+            }
         }
         H5Dwrite(dsetH, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufH.data());
         H5Dclose(dsetH);
@@ -766,10 +833,17 @@ bool Hdf5Writer::writeStep(int step, double time, const double* state, int npts,
 
     if (impl_->saveOptions.saveMagnitudeE) {
         hid_t dsetMagE = H5Dcreate2(stepGroup, "magnitude_E", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        std::vector<double> bufMagE(npts);
-        for (int i = 0; i < npts; ++i) {
-            double ex = state[0 * npts + i], ey = state[1 * npts + i], ez = state[2 * npts + i];
-            bufMagE[i] = std::sqrt(ex * ex + ey * ey + ez * ez);
+        std::vector<double> bufMagE(outPts);
+        if (impl_->exportContinuous) {
+            for (int i = 0; i < outPts; ++i) {
+                double ex = cg_Ex[i], ey = cg_Ey[i], ez = cg_Ez[i];
+                bufMagE[i] = std::sqrt(ex * ex + ey * ey + ez * ez);
+            }
+        } else {
+            for (int i = 0; i < npts; ++i) {
+                double ex = state[0 * npts + i], ey = state[1 * npts + i], ez = state[2 * npts + i];
+                bufMagE[i] = std::sqrt(ex * ex + ey * ey + ez * ez);
+            }
         }
         H5Dwrite(dsetMagE, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufMagE.data());
         H5Dclose(dsetMagE);
@@ -777,10 +851,17 @@ bool Hdf5Writer::writeStep(int step, double time, const double* state, int npts,
 
     if (impl_->saveOptions.saveMagnitudeH) {
         hid_t dsetMagH = H5Dcreate2(stepGroup, "magnitude_H", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        std::vector<double> bufMagH(npts);
-        for (int i = 0; i < npts; ++i) {
-            double hx = state[3 * npts + i], hy = state[4 * npts + i], hz = state[5 * npts + i];
-            bufMagH[i] = std::sqrt(hx * hx + hy * hy + hz * hz);
+        std::vector<double> bufMagH(outPts);
+        if (impl_->exportContinuous) {
+            for (int i = 0; i < outPts; ++i) {
+                double hx = cg_Hx[i], hy = cg_Hy[i], hz = cg_Hz[i];
+                bufMagH[i] = std::sqrt(hx * hx + hy * hy + hz * hz);
+            }
+        } else {
+            for (int i = 0; i < npts; ++i) {
+                double hx = state[3 * npts + i], hy = state[4 * npts + i], hz = state[5 * npts + i];
+                bufMagH[i] = std::sqrt(hx * hx + hy * hy + hz * hz);
+            }
         }
         H5Dwrite(dsetMagH, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufMagH.data());
         H5Dclose(dsetMagH);
@@ -788,67 +869,143 @@ bool Hdf5Writer::writeStep(int step, double time, const double* state, int npts,
 
     if (impl_->saveOptions.saveEnergyDensity) {
         hid_t dsetED = H5Dcreate2(stepGroup, "energy_density", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        std::vector<double> bufED(npts);
-        for (int i = 0; i < npts; ++i) {
-            double ex = state[0 * npts + i], ey = state[1 * npts + i], ez = state[2 * npts + i];
-            double hx = state[3 * npts + i], hy = state[4 * npts + i], hz = state[5 * npts + i];
-            bufED[i] = 0.5 * (ex * ex + ey * ey + ez * ez + hx * hx + hy * hy + hz * hz);
+        std::vector<double> bufED(outPts);
+        if (impl_->exportContinuous) {
+            for (int i = 0; i < outPts; ++i) {
+                double ex = cg_Ex[i], ey = cg_Ey[i], ez = cg_Ez[i];
+                double hx = cg_Hx[i], hy = cg_Hy[i], hz = cg_Hz[i];
+                bufED[i] = 0.5 * (ex * ex + ey * ey + ez * ez + hx * hx + hy * hy + hz * hz);
+            }
+        } else {
+            for (int i = 0; i < npts; ++i) {
+                double ex = state[0 * npts + i], ey = state[1 * npts + i], ez = state[2 * npts + i];
+                double hx = state[3 * npts + i], hy = state[4 * npts + i], hz = state[5 * npts + i];
+                bufED[i] = 0.5 * (ex * ex + ey * ey + ez * ez + hx * hx + hy * hy + hz * hz);
+            }
         }
         H5Dwrite(dsetED, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufED.data());
         H5Dclose(dsetED);
     }
 
     if (derived) {
+        std::vector<double> cg_divE, cg_divH, cg_curlE, cg_curlH;
+        if (impl_->exportContinuous) {
+            if (derived->divE) {
+                cg_divE.assign(outPts, 0.0);
+                for (int i = 0; i < npts; ++i) cg_divE[impl_->dgToCg[i]] += derived->divE[i];
+                for (int k = 0; k < outPts; ++k) cg_divE[k] *= impl_->cgMultiplicityInv[k];
+            }
+            if (derived->divH) {
+                cg_divH.assign(outPts, 0.0);
+                for (int i = 0; i < npts; ++i) cg_divH[impl_->dgToCg[i]] += derived->divH[i];
+                for (int k = 0; k < outPts; ++k) cg_divH[k] *= impl_->cgMultiplicityInv[k];
+            }
+            if (derived->curlE) {
+                cg_curlE.assign(outPts * 3, 0.0);
+                for (int i = 0; i < npts; ++i) {
+                    int c = impl_->dgToCg[i];
+                    cg_curlE[3 * c + 0] += derived->curlE[0 * npts + i];
+                    cg_curlE[3 * c + 1] += derived->curlE[1 * npts + i];
+                    cg_curlE[3 * c + 2] += derived->curlE[2 * npts + i];
+                }
+                for (int k = 0; k < outPts; ++k) {
+                    double w = impl_->cgMultiplicityInv[k];
+                    cg_curlE[3 * k + 0] *= w;
+                    cg_curlE[3 * k + 1] *= w;
+                    cg_curlE[3 * k + 2] *= w;
+                }
+            }
+            if (derived->curlH) {
+                cg_curlH.assign(outPts * 3, 0.0);
+                for (int i = 0; i < npts; ++i) {
+                    int c = impl_->dgToCg[i];
+                    cg_curlH[3 * c + 0] += derived->curlH[0 * npts + i];
+                    cg_curlH[3 * c + 1] += derived->curlH[1 * npts + i];
+                    cg_curlH[3 * c + 2] += derived->curlH[2 * npts + i];
+                }
+                for (int k = 0; k < outPts; ++k) {
+                    double w = impl_->cgMultiplicityInv[k];
+                    cg_curlH[3 * k + 0] *= w;
+                    cg_curlH[3 * k + 1] *= w;
+                    cg_curlH[3 * k + 2] *= w;
+                }
+            }
+        }
+
         if (impl_->saveOptions.saveCurlE && derived->curlE) {
             hid_t dsetCE = H5Dcreate2(stepGroup, "curl_E", H5T_IEEE_F64LE, fieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-            std::vector<double> bufCE(npts * 3);
-            for (int i = 0; i < npts; ++i) {
-                bufCE[3 * i + 0] = derived->curlE[0 * npts + i];
-                bufCE[3 * i + 1] = derived->curlE[1 * npts + i];
-                bufCE[3 * i + 2] = derived->curlE[2 * npts + i];
+            std::vector<double> bufCE(outPts * 3);
+            if (impl_->exportContinuous) {
+                bufCE = cg_curlE;
+            } else {
+                for (int i = 0; i < npts; ++i) {
+                    bufCE[3 * i + 0] = derived->curlE[0 * npts + i];
+                    bufCE[3 * i + 1] = derived->curlE[1 * npts + i];
+                    bufCE[3 * i + 2] = derived->curlE[2 * npts + i];
+                }
             }
             H5Dwrite(dsetCE, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufCE.data());
             H5Dclose(dsetCE);
         }
         if (impl_->saveOptions.saveCurlH && derived->curlH) {
             hid_t dsetCH = H5Dcreate2(stepGroup, "curl_H", H5T_IEEE_F64LE, fieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-            std::vector<double> bufCH(npts * 3);
-            for (int i = 0; i < npts; ++i) {
-                bufCH[3 * i + 0] = derived->curlH[0 * npts + i];
-                bufCH[3 * i + 1] = derived->curlH[1 * npts + i];
-                bufCH[3 * i + 2] = derived->curlH[2 * npts + i];
+            std::vector<double> bufCH(outPts * 3);
+            if (impl_->exportContinuous) {
+                bufCH = cg_curlH;
+            } else {
+                for (int i = 0; i < npts; ++i) {
+                    bufCH[3 * i + 0] = derived->curlH[0 * npts + i];
+                    bufCH[3 * i + 1] = derived->curlH[1 * npts + i];
+                    bufCH[3 * i + 2] = derived->curlH[2 * npts + i];
+                }
             }
             H5Dwrite(dsetCH, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufCH.data());
             H5Dclose(dsetCH);
         }
         if (impl_->saveOptions.saveMagnitudeCurlE && derived->curlE) {
             hid_t dsetMagCE = H5Dcreate2(stepGroup, "magnitude_curl_E", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-            std::vector<double> bufMagCE(npts);
-            for (int i = 0; i < npts; ++i) {
-                double cx = derived->curlE[0 * npts + i], cy = derived->curlE[1 * npts + i], cz = derived->curlE[2 * npts + i];
-                bufMagCE[i] = std::sqrt(cx * cx + cy * cy + cz * cz);
+            std::vector<double> bufMagCE(outPts);
+            if (impl_->exportContinuous) {
+                for (int i = 0; i < outPts; ++i) {
+                    double cx = cg_curlE[3 * i + 0], cy = cg_curlE[3 * i + 1], cz = cg_curlE[3 * i + 2];
+                    bufMagCE[i] = std::sqrt(cx * cx + cy * cy + cz * cz);
+                }
+            } else {
+                for (int i = 0; i < npts; ++i) {
+                    double cx = derived->curlE[0 * npts + i], cy = derived->curlE[1 * npts + i], cz = derived->curlE[2 * npts + i];
+                    bufMagCE[i] = std::sqrt(cx * cx + cy * cy + cz * cz);
+                }
             }
             H5Dwrite(dsetMagCE, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufMagCE.data());
             H5Dclose(dsetMagCE);
         }
         if (impl_->saveOptions.saveMagnitudeCurlH && derived->curlH) {
             hid_t dsetMagCH = H5Dcreate2(stepGroup, "magnitude_curl_H", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-            std::vector<double> bufMagCH(npts);
-            for (int i = 0; i < npts; ++i) {
-                double cx = derived->curlH[0 * npts + i], cy = derived->curlH[1 * npts + i], cz = derived->curlH[2 * npts + i];
-                bufMagCH[i] = std::sqrt(cx * cx + cy * cy + cz * cz);
+            std::vector<double> bufMagCH(outPts);
+            if (impl_->exportContinuous) {
+                for (int i = 0; i < outPts; ++i) {
+                    double cx = cg_curlH[3 * i + 0], cy = cg_curlH[3 * i + 1], cz = cg_curlH[3 * i + 2];
+                    bufMagCH[i] = std::sqrt(cx * cx + cy * cy + cz * cz);
+                }
+            } else {
+                for (int i = 0; i < npts; ++i) {
+                    double cx = derived->curlH[0 * npts + i], cy = derived->curlH[1 * npts + i], cz = derived->curlH[2 * npts + i];
+                    bufMagCH[i] = std::sqrt(cx * cx + cy * cy + cz * cz);
+                }
             }
             H5Dwrite(dsetMagCH, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, bufMagCH.data());
             H5Dclose(dsetMagCH);
         }
         if (impl_->saveOptions.saveDivE && derived->divE) {
             hid_t dsetDivE = H5Dcreate2(stepGroup, "div_E", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-            H5Dwrite(dsetDivE, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, derived->divE);
+            const double* divEPtr = impl_->exportContinuous ? cg_divE.data() : derived->divE;
+            H5Dwrite(dsetDivE, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, divEPtr);
             H5Dclose(dsetDivE);
         }
         if (impl_->saveOptions.saveDivH && derived->divH) {
             hid_t dsetDivH = H5Dcreate2(stepGroup, "div_H", H5T_IEEE_F64LE, scalarFieldSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-            H5Dwrite(dsetDivH, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, derived->divH);
+            const double* divHPtr = impl_->exportContinuous ? cg_divH.data() : derived->divH;
+            H5Dwrite(dsetDivH, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, divHPtr);
             H5Dclose(dsetDivH);
         }
     }
@@ -913,7 +1070,6 @@ bool Hdf5Writer::writeXdmfDescriptor(
     if (!xmf.is_open()) return false;
 
     xmf << "<?xml version=\"1.0\" ?>\n";
-    xmf << "<!DOCTYPE Xdmf SYSTEM \"Xdmf.dtd\" []>\n";
     xmf << "<Xdmf Version=\"3.0\">\n";
     xmf << "  <Domain>\n";
     xmf << "    <Grid Name=\"TimeSeries\" GridType=\"Collection\" CollectionType=\"Temporal\">\n";
@@ -926,104 +1082,91 @@ bool Hdf5Writer::writeXdmfDescriptor(
         xmf << "        <Time Value=\"" << std::scientific << std::setprecision(8) << time << "\"/>\n";
         if (useHexCells && totalCells > 0) {
             xmf << "        <Topology TopologyType=\"Hexahedron\" NumberOfElements=\"" << totalCells << "\">\n";
-            xmf << "          <DataItem Dimensions=\"" << totalCells << " 8\" NumberType=\"Int\" Precision=\"4\" Format=\"HDF\">\n";
-            xmf << "            " << h5BaseName << ":/mesh/connectivity\n";
-            xmf << "          </DataItem>\n";
+            xmf << "          <DataItem Dimensions=\"" << totalCells << " 8\" NumberType=\"Int\" Precision=\"4\" Format=\"HDF\">"
+                << h5BaseName << ":/mesh/connectivity</DataItem>\n";
             xmf << "        </Topology>\n";
         } else {
             xmf << "        <Topology TopologyType=\"Polyvertex\" NumberOfElements=\"" << npts << "\"/>\n";
         }
         xmf << "        <Geometry GeometryType=\"XYZ\">\n";
-        xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-        xmf << "            " << h5BaseName << ":/mesh/coordinates\n";
-        xmf << "          </DataItem>\n";
+        xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+            << h5BaseName << ":/mesh/coordinates</DataItem>\n";
         xmf << "        </Geometry>\n";
 
         if (opts.saveE) {
             xmf << "        <Attribute Name=\"E\" AttributeType=\"Vector\" Center=\"Node\">\n";
-            xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/E\n";
-            xmf << "          </DataItem>\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                << h5BaseName << ":/time_series/step_" << step << "/E</DataItem>\n";
             xmf << "        </Attribute>\n";
         }
 
         if (opts.saveH) {
             xmf << "        <Attribute Name=\"H\" AttributeType=\"Vector\" Center=\"Node\">\n";
-            xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/H\n";
-            xmf << "          </DataItem>\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                << h5BaseName << ":/time_series/step_" << step << "/H</DataItem>\n";
             xmf << "        </Attribute>\n";
         }
 
         if (opts.saveCurlE) {
             xmf << "        <Attribute Name=\"curl_E\" AttributeType=\"Vector\" Center=\"Node\">\n";
-            xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/curl_E\n";
-            xmf << "          </DataItem>\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                << h5BaseName << ":/time_series/step_" << step << "/curl_E</DataItem>\n";
             xmf << "        </Attribute>\n";
         }
 
         if (opts.saveCurlH) {
             xmf << "        <Attribute Name=\"curl_H\" AttributeType=\"Vector\" Center=\"Node\">\n";
-            xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/curl_H\n";
-            xmf << "          </DataItem>\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                << h5BaseName << ":/time_series/step_" << step << "/curl_H</DataItem>\n";
             xmf << "        </Attribute>\n";
         }
 
         if (opts.saveDivE) {
             xmf << "        <Attribute Name=\"div_E\" AttributeType=\"Scalar\" Center=\"Node\">\n";
-            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/div_E\n";
-            xmf << "          </DataItem>\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                << h5BaseName << ":/time_series/step_" << step << "/div_E</DataItem>\n";
             xmf << "        </Attribute>\n";
         }
 
         if (opts.saveDivH) {
             xmf << "        <Attribute Name=\"div_H\" AttributeType=\"Scalar\" Center=\"Node\">\n";
-            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/div_H\n";
-            xmf << "          </DataItem>\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                << h5BaseName << ":/time_series/step_" << step << "/div_H</DataItem>\n";
             xmf << "        </Attribute>\n";
         }
 
         if (opts.saveMagnitudeE) {
             xmf << "        <Attribute Name=\"magnitude_E\" AttributeType=\"Scalar\" Center=\"Node\">\n";
-            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/magnitude_E\n";
-            xmf << "          </DataItem>\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                << h5BaseName << ":/time_series/step_" << step << "/magnitude_E</DataItem>\n";
             xmf << "        </Attribute>\n";
         }
 
         if (opts.saveMagnitudeH) {
             xmf << "        <Attribute Name=\"magnitude_H\" AttributeType=\"Scalar\" Center=\"Node\">\n";
-            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/magnitude_H\n";
-            xmf << "          </DataItem>\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                << h5BaseName << ":/time_series/step_" << step << "/magnitude_H</DataItem>\n";
             xmf << "        </Attribute>\n";
         }
 
         if (opts.saveMagnitudeCurlE) {
             xmf << "        <Attribute Name=\"magnitude_curl_E\" AttributeType=\"Scalar\" Center=\"Node\">\n";
-            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/magnitude_curl_E\n";
-            xmf << "          </DataItem>\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                << h5BaseName << ":/time_series/step_" << step << "/magnitude_curl_E</DataItem>\n";
             xmf << "        </Attribute>\n";
         }
 
         if (opts.saveMagnitudeCurlH) {
             xmf << "        <Attribute Name=\"magnitude_curl_H\" AttributeType=\"Scalar\" Center=\"Node\">\n";
-            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/magnitude_curl_H\n";
-            xmf << "          </DataItem>\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                << h5BaseName << ":/time_series/step_" << step << "/magnitude_curl_H</DataItem>\n";
             xmf << "        </Attribute>\n";
         }
 
         if (opts.saveEnergyDensity) {
             xmf << "        <Attribute Name=\"energy_density\" AttributeType=\"Scalar\" Center=\"Node\">\n";
-            xmf << "          <DataItem Dimensions=\"" << npts << " 1\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">\n";
-            xmf << "            " << h5BaseName << ":/time_series/step_" << step << "/energy_density\n";
-            xmf << "          </DataItem>\n";
+            xmf << "          <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                << h5BaseName << ":/time_series/step_" << step << "/energy_density</DataItem>\n";
             xmf << "        </Attribute>\n";
         }
 
@@ -1035,5 +1178,145 @@ bool Hdf5Writer::writeXdmfDescriptor(
     xmf << "</Xdmf>\n";
 
     xmf.close();
+    return true;
+}
+
+bool Hdf5Writer::writeMasterXdmfDescriptor(
+    const std::string& xmfPath,
+    const std::string& baseStem,
+    int numRanks,
+    const std::vector<int>& allNpts,
+    const std::vector<int>& allTotalCells,
+    const std::vector<std::pair<int, double>>& stepTimes,
+    bool useHexCells,
+    const FieldSaveOptions* options)
+{
+    FieldSaveOptions defaultOpts;
+    const FieldSaveOptions& opts = (options != nullptr) ? *options : defaultOpts;
+
+    std::ofstream xmf(xmfPath);
+    if (!xmf.is_open()) return false;
+
+    xmf << "<?xml version=\"1.0\" ?>\n";
+    xmf << "<Xdmf Version=\"3.0\">\n";
+    xmf << "  <Domain>\n";
+    xmf << "    <Grid Name=\"TimeSeries\" GridType=\"Collection\" CollectionType=\"Temporal\">\n";
+
+    for (const auto& st : stepTimes) {
+        int step = st.first;
+        double time = st.second;
+
+        xmf << "      <Grid Name=\"step_" << step << "\" GridType=\"Collection\" CollectionType=\"Spatial\">\n";
+        xmf << "        <Time Value=\"" << std::scientific << std::setprecision(8) << time << "\"/>\n";
+
+        for (int r = 0; r < numRanks; ++r) {
+            int npts = allNpts[r];
+            int totalCells = allTotalCells[r];
+            std::string h5Name = baseStem + "_rank" + std::to_string(r) + ".h5";
+
+            xmf << "        <Grid Name=\"rank_" << r << "\" GridType=\"Uniform\">\n";
+            if (useHexCells && totalCells > 0) {
+                xmf << "          <Topology TopologyType=\"Hexahedron\" NumberOfElements=\"" << totalCells << "\">\n";
+                xmf << "            <DataItem Dimensions=\"" << totalCells << " 8\" NumberType=\"Int\" Precision=\"4\" Format=\"HDF\">"
+                    << h5Name << ":/mesh/connectivity</DataItem>\n";
+                xmf << "          </Topology>\n";
+            } else {
+                xmf << "          <Topology TopologyType=\"Polyvertex\" NumberOfElements=\"" << npts << "\"/>\n";
+            }
+            xmf << "          <Geometry GeometryType=\"XYZ\">\n";
+            xmf << "            <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                << h5Name << ":/mesh/coordinates</DataItem>\n";
+            xmf << "          </Geometry>\n";
+
+            if (opts.saveE) {
+                xmf << "          <Attribute Name=\"E\" AttributeType=\"Vector\" Center=\"Node\">\n";
+                xmf << "            <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                    << h5Name << ":/time_series/step_" << step << "/E</DataItem>\n";
+                xmf << "          </Attribute>\n";
+            }
+
+            if (opts.saveH) {
+                xmf << "          <Attribute Name=\"H\" AttributeType=\"Vector\" Center=\"Node\">\n";
+                xmf << "            <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                    << h5Name << ":/time_series/step_" << step << "/H</DataItem>\n";
+                xmf << "          </Attribute>\n";
+            }
+
+            if (opts.saveCurlE) {
+                xmf << "          <Attribute Name=\"curl_E\" AttributeType=\"Vector\" Center=\"Node\">\n";
+                xmf << "            <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                    << h5Name << ":/time_series/step_" << step << "/curl_E</DataItem>\n";
+                xmf << "          </Attribute>\n";
+            }
+
+            if (opts.saveCurlH) {
+                xmf << "          <Attribute Name=\"curl_H\" AttributeType=\"Vector\" Center=\"Node\">\n";
+                xmf << "            <DataItem Dimensions=\"" << npts << " 3\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                    << h5Name << ":/time_series/step_" << step << "/curl_H</DataItem>\n";
+                xmf << "          </Attribute>\n";
+            }
+
+            if (opts.saveDivE) {
+                xmf << "          <Attribute Name=\"div_E\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+                xmf << "            <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                    << h5Name << ":/time_series/step_" << step << "/div_E</DataItem>\n";
+                xmf << "          </Attribute>\n";
+            }
+
+            if (opts.saveDivH) {
+                xmf << "          <Attribute Name=\"div_H\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+                xmf << "            <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                    << h5Name << ":/time_series/step_" << step << "/div_H</DataItem>\n";
+                xmf << "          </Attribute>\n";
+            }
+
+            if (opts.saveMagnitudeE) {
+                xmf << "          <Attribute Name=\"magnitude_E\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+                xmf << "            <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                    << h5Name << ":/time_series/step_" << step << "/magnitude_E</DataItem>\n";
+                xmf << "          </Attribute>\n";
+            }
+
+            if (opts.saveMagnitudeH) {
+                xmf << "          <Attribute Name=\"magnitude_H\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+                xmf << "            <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                    << h5Name << ":/time_series/step_" << step << "/magnitude_H</DataItem>\n";
+                xmf << "          </Attribute>\n";
+            }
+
+            if (opts.saveMagnitudeCurlE) {
+                xmf << "          <Attribute Name=\"magnitude_curl_E\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+                xmf << "            <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                    << h5Name << ":/time_series/step_" << step << "/magnitude_curl_E</DataItem>\n";
+                xmf << "          </Attribute>\n";
+            }
+
+            if (opts.saveMagnitudeCurlH) {
+                xmf << "          <Attribute Name=\"magnitude_curl_H\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+                xmf << "            <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                    << h5Name << ":/time_series/step_" << step << "/magnitude_curl_H</DataItem>\n";
+                xmf << "          </Attribute>\n";
+            }
+
+            if (opts.saveEnergyDensity) {
+                xmf << "          <Attribute Name=\"energy_density\" AttributeType=\"Scalar\" Center=\"Node\">\n";
+                xmf << "            <DataItem Dimensions=\"" << npts << "\" NumberType=\"Float\" Precision=\"8\" Format=\"HDF\">"
+                    << h5Name << ":/time_series/step_" << step << "/energy_density</DataItem>\n";
+                xmf << "          </Attribute>\n";
+            }
+
+            xmf << "        </Grid>\n";
+        }
+        xmf << "      </Grid>\n";
+    }
+
+    xmf << "    </Grid>\n";
+    xmf << "  </Domain>\n";
+    xmf << "</Xdmf>\n";
+
+    xmf.close();
+    std::cout << "[HDF5] Generated master XDMF descriptor: " << xmfPath 
+              << " (" << numRanks << " MPI partitions combined across " 
+              << stepTimes.size() << " time steps)" << std::endl;
     return true;
 }
