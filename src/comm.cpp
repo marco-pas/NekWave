@@ -1,5 +1,5 @@
 #include "comm.hpp"
-#include <cuda_runtime.h>
+#include "device/gpu_runtime.hpp"
 #include <iostream>
 
 bool Comm::s_bInitialized = false;

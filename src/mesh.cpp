@@ -1,6 +1,7 @@
 // @@ Note
 // The .rea mesh parsing logic in this file is taken 1-to-1 from the NekCEM / Nek5000
-// In future Neko's .nmsh format or native Gmsh)
+// In future Neko's .nmsh format or native Gmsh
+// this is also where the operator gets built as these olny depend on the mesh topology
 
 #include "mesh.hpp"
 #ifndef USE_HIP
@@ -102,8 +103,13 @@ void Mesh::setupGLL() {
             m_gll_w[i] = 2.0 / (p * (p + 1.0) * L * L);
         }
 
+        // --
+        // IMPORTANT: this is where the stiffness matrix gets built!
+        // This is done just once while building the mesh.
+        // The matrix gets called in "gpu_volume_curl_kernel"
+        // --
         // @@ build 1D derivative matrix D and its transpose Dt (NekCEM DGLL)
-        // D_ij = L_p(x_i) / (L_p(x_j) * (x_i - x_j))
+        // D_ij = L_p(x_i) / ( L_p(x_j) * (x_i - x_j) ) 
         double d0 = p * (p + 1.0) / 4.0;
         for (int i = 0; i < N; ++i) {
             for (int j = 0; j < N; ++j) {

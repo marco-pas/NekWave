@@ -45,3 +45,12 @@ __pycache__/
 
 # System artifacts
 .DS_Store
+
+# Run envs on LUMI
+.venv
+*.slurm
+env_lumi.sh
+build_nekwave.sh
+*.err
+*.out
+.vscode/

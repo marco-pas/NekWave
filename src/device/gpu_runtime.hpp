@@ -81,6 +81,27 @@
 #ifndef cudaMemcpyDeviceToDevice
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #endif
+#ifndef cudaGetLastError
+#define cudaGetLastError         hipGetLastError
+#endif
+#ifndef cudaPeekAtLastError
+#define cudaPeekAtLastError      hipPeekAtLastError
+#endif
+#ifndef cudaDeviceSynchronize
+#define cudaDeviceSynchronize    hipDeviceSynchronize
+#endif
+#ifndef cudaSetDevice
+#define cudaSetDevice            hipSetDevice
+#endif
+#ifndef cudaGetDeviceCount
+#define cudaGetDeviceCount       hipGetDeviceCount
+#endif
+#ifndef cudaGetDevice
+#define cudaGetDevice            hipGetDevice
+#endif
+#ifndef cudaMemset
+#define cudaMemset               hipMemset
+#endif
 
 // Generic NekWave GPU runtime aliases
 using gpuStream_t = hipStream_t;

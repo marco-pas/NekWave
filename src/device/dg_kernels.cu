@@ -53,6 +53,9 @@ __global__ void gpu_volume_curl_kernel(
     const double* __restrict__ rz, const double* __restrict__ sz, const double* __restrict__ tz,
     double sign, int N, int nelt)
 {
+
+    // IMPORTANT: this is the operator inside the element!
+
     extern __shared__ double s_mem[];
     int N2 = N * N;
     int N3 = N * N * N;

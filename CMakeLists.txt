@@ -56,20 +56,27 @@ if(ENABLE_HIP)
         endif()
     endif()
 
+    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+        # Default to gfx90a (AMD Instinct MI210 / MI250 / MI250X, e.g. PDC Dardel / LUMI)
+        set(CMAKE_HIP_ARCHITECTURES gfx90a CACHE STRING "HIP architectures")
+    endif()
+    if(NOT DEFINED AMDGPU_TARGETS)
+        set(AMDGPU_TARGETS "${CMAKE_HIP_ARCHITECTURES}" CACHE STRING "AMD GPU targets to compile for")
+    endif()
+    if(NOT DEFINED GPU_TARGETS)
+        set(GPU_TARGETS "${CMAKE_HIP_ARCHITECTURES}" CACHE STRING "GPU targets to compile for")
+    endif()
+    set(ENV{AMDGPU_TARGETS} "${CMAKE_HIP_ARCHITECTURES}")
+
     list(APPEND CMAKE_PREFIX_PATH ${ROCM_PATH} ${ROCM_PATH}/hip ${ROCM_PATH}/llvm)
     find_package(hip QUIET)
 
     if(hip_FOUND)
         message(STATUS "[NekWave] Found HIP: ${HIP_VERSION} (include: ${HIP_INCLUDE_DIRS})")
-        set(DEVICE_INCLUDE_DIRS ${HIP_INCLUDE_DIRS})
+        set(DEVICE_INCLUDE_DIRS ${HIP_INCLUDE_DIRS} "${ROCM_PATH}/include")
     else()
         find_program(HIPCC_EXECUTABLE NAMES hipcc PATHS ${ROCM_PATH}/bin /opt/rocm/bin)
         set(DEVICE_INCLUDE_DIRS "${ROCM_PATH}/include")
-    endif()
-
-    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
-        # Default to gfx90a (AMD Instinct MI210 / MI250 / MI250X, e.g. PDC Dardel)
-        set(CMAKE_HIP_ARCHITECTURES gfx90a)
     endif()
 
     if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.21")
@@ -104,6 +111,8 @@ if(ENABLE_HIP)
     endif()
 
     set(CUDA_INCLUDE_DIR "")
+    set(CMAKE_BUILD_RPATH "${CMAKE_BUILD_RPATH};${ROCM_PATH}/lib;${ROCM_PATH}/lib/llvm/lib;${ROCM_PATH}/llvm/lib")
+    set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${ROCM_PATH}/lib;${ROCM_PATH}/lib/llvm/lib;${ROCM_PATH}/llvm/lib")
 else()
     # ------------------------------------------------------------------------------
     # CUDA Support (Mandatory GPU Backend when not using HIP)
@@ -178,13 +187,75 @@ endif()
 # ------------------------------------------------------------------------------
 # HDF5 Support (Native High-Performance Archive Output)
 # ------------------------------------------------------------------------------
+if(NOT DEFINED ENV{HDF5_DIR})
+    file(GLOB CRAY_HDF5_DIRS
+        "/opt/cray/pe/hdf5-parallel/*/*/*"
+        "/opt/cray/pe/hdf5/*/*/*"
+    )
+    foreach(cand ${CRAY_HDF5_DIRS})
+        if(EXISTS "${cand}/include/hdf5.h")
+            set(ENV{HDF5_DIR} "${cand}")
+            break()
+        endif()
+    endforeach()
+endif()
+
+if(DEFINED ENV{HDF5_DIR})
+    set(HDF5_ROOT "$ENV{HDF5_DIR}")
+    unset(HDF5_DIR CACHE)
+    unset(HDF5_DIR)
+endif()
+set(HDF5_PREFER_PARALLEL TRUE)
+set(HDF5_NO_FIND_PACKAGE_CONFIG_FILE TRUE)
 find_package(HDF5 COMPONENTS C QUIET)
-if(HDF5_FOUND)
+
+# Fallback detection for Cray PE HDF5 or environment
+if(NOT HDF5_FOUND AND DEFINED ENV{HDF5_DIR} AND EXISTS "$ENV{HDF5_DIR}/include/hdf5.h")
+    message(STATUS "[NekWave] Using HDF5 from HDF5_DIR environment: $ENV{HDF5_DIR}")
+    set(HDF5_FOUND TRUE)
+    set(HDF5_INCLUDE_DIRS "$ENV{HDF5_DIR}/include")
+    find_library(HDF5_C_LIB NAMES hdf5_parallel hdf5 PATHS "$ENV{HDF5_DIR}/lib" NO_DEFAULT_PATH)
+    if(HDF5_C_LIB)
+        set(NEKWAVE_HDF5_LIBS "${HDF5_C_LIB}")
+    endif()
+elseif(HDF5_FOUND)
+    if(DEFINED ENV{HDF5_DIR} AND NOT HDF5_INCLUDE_DIRS)
+        set(HDF5_INCLUDE_DIRS "$ENV{HDF5_DIR}/include")
+    endif()
     message(STATUS "[NekWave] Found HDF5: ${HDF5_LIBRARIES} (include: ${HDF5_INCLUDE_DIRS})")
     set(NEKWAVE_HDF5_LIBS ${HDF5_LIBRARIES})
 else()
-    message(STATUS "[NekWave] Native HDF5 C library not found; binary pipeline will be used.")
+    message(WARNING "[NekWave] Native HDF5 C library not found; binary pipeline will be used. On LUMI, please run: 'module load cray-hdf5-parallel'")
     set(NEKWAVE_HDF5_LIBS "")
+endif()
+
+if(HDF5_FOUND AND NOT NEKWAVE_HDF5_LIBS)
+    find_library(HDF5_C_LIB NAMES hdf5_parallel hdf5
+        PATHS
+            "$ENV{HDF5_DIR}/lib"
+            "$ENV{HDF5_ROOT}/lib"
+            "$ENV{CRAY_HDF5_PARALLEL_DIR}/lib"
+            /opt/cray/pe/hdf5-parallel/1.12.2.11/crayclang/17.0/lib
+            /opt/cray/pe/hdf5-parallel/1.14.3.3/crayclang/17.0/lib
+        NO_DEFAULT_PATH
+    )
+    if(NOT HDF5_C_LIB)
+        find_library(HDF5_C_LIB NAMES hdf5_parallel hdf5)
+    endif()
+    if(HDF5_C_LIB)
+        set(NEKWAVE_HDF5_LIBS "${HDF5_C_LIB}")
+        message(STATUS "[NekWave] Explicitly linked HDF5 library: ${HDF5_C_LIB}")
+    endif()
+endif()
+
+if(NEKWAVE_HDF5_LIBS)
+    foreach(_lib ${NEKWAVE_HDF5_LIBS})
+        if(EXISTS "${_lib}")
+            get_filename_component(_lib_dir "${_lib}" DIRECTORY)
+            set(CMAKE_BUILD_RPATH "${CMAKE_BUILD_RPATH};${_lib_dir}")
+            set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${_lib_dir}")
+        endif()
+    endforeach()
 endif()
 
 # ------------------------------------------------------------------------------
@@ -206,6 +277,7 @@ add_library(nekwave_core STATIC
 target_include_directories(nekwave_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     $<BUILD_INTERFACE:${CUDA_INCLUDE_DIR}>
+    $<BUILD_INTERFACE:${DEVICE_INCLUDE_DIRS}>
     $<INSTALL_INTERFACE:include>
 )
 
@@ -231,6 +303,25 @@ if(MPI_FOUND AND ENABLE_MPI)
         link_directories(${MPI_LIB_DIR})
         set(CMAKE_INSTALL_RPATH "${MPI_LIB_DIR}")
         set(CMAKE_BUILD_RPATH "${MPI_LIB_DIR}")
+    endif()
+
+    if(ENABLE_HIP)
+        # On Cray EX systems with ROCm, GPU-aware MPI requires the GTL (GPU Transport Layer) library: libmpi_gtl_hsa
+        find_library(CRAY_MPI_GTL_HSA_LIB
+            NAMES mpi_gtl_hsa
+            PATHS
+                /opt/cray/pe/lib64
+                /opt/cray/pe/mpich/8.1.32/gtl/lib
+                "$ENV{CRAY_MPICH_DIR}/../gtl/lib"
+                "$ENV{MPICH_DIR}/../gtl/lib"
+        )
+        if(CRAY_MPI_GTL_HSA_LIB)
+            message(STATUS "[NekWave] Linking Cray MPICH GPU Transport Layer (GTL): ${CRAY_MPI_GTL_HSA_LIB}")
+            target_link_libraries(nekwave_core PUBLIC ${CRAY_MPI_GTL_HSA_LIB})
+            get_filename_component(GTL_LIB_DIR "${CRAY_MPI_GTL_HSA_LIB}" DIRECTORY)
+            set(CMAKE_BUILD_RPATH "${CMAKE_BUILD_RPATH};${GTL_LIB_DIR}")
+            set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${GTL_LIB_DIR}")
+        endif()
     endif()
 endif()
 

@@ -172,10 +172,9 @@ void Case::preprocess(const Config& cfg) {
 #endif
     }
 
-    // Allocate the state vector with 6 variables (local points + halo ghost nodes)
+    // Allocate the state vector with 6 variables for local collocation points
     const int npts = mesh_->getTotalPoints();
-    const int totalAlloc = npts + mesh_->getNumHaloPoints();
-    state_.assign(6 * totalAlloc, 0.0); // Everything set to 0
+    state_.assign(6 * npts, 0.0); // Everything set to 0
 
     // Calculate stable time-stepping metrics (synchronized across all ranks)
     const double dxminLocal = mesh_->computeMinNodeDistance();
