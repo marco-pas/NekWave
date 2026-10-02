@@ -12,13 +12,14 @@ int main(int argc, char* argv[]) {
     std::cout << "    NekWave Test: NekCEM 3D Box Periodic Cavity Case      " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
-    std::string parFile = "tests/3dboxper_test/3dboxper_test.par";
+    std::string configFile = "tests/3dboxper_test/3dboxper_test.json";
     if (argc > 1) {
-        parFile = argv[1];
+        configFile = argv[1];
     }
 
     Case simulationCase;
-    simulationCase.loadConfig(parFile);
+    simulationCase.loadConfig(configFile);
+    simulationCase.setWaveType("3dboxper");
 
     // 1. Explicit initial condition hook
     simulationCase.setInitialConditionHook([](double x, double y, double z,

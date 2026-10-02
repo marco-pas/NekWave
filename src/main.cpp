@@ -14,10 +14,10 @@ int main(int argc, char* argv[]) {
 
     if (argc < 2) {
         if (Comm::isRoot()) {
-            std::cerr << "Usage: " << argv[0] << " <path-to-case.par>\n\n"
+            std::cerr << "Usage: " << argv[0] << " <path-to-case.json>\n\n"
                       << "Available example cases:\n"
-                      << "  " << argv[0] << " examples/3dboxpec/3dboxpec.par\n"
-                      << "  " << argv[0] << " examples/3dboxper/3dboxper.par\n" << std::endl;
+                      << "  " << argv[0] << " examples/3dboxpec/3dboxpec.json\n"
+                      << "  " << argv[0] << " examples/3dboxper/3dboxper.json\n" << std::endl;
         }
         Comm::finalize();
         return 1;

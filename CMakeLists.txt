@@ -385,7 +385,7 @@ if(ENABLE_PROFILING)
         )
 
         add_custom_target(profile
-            COMMAND ${CMAKE_COMMAND} -E env CPUPROFILE=nekwave.prof $<TARGET_FILE:nekwave_prof> "${CMAKE_CURRENT_SOURCE_DIR}/examples/3dboxpec/3dboxpec.par"
+            COMMAND ${CMAKE_COMMAND} -E env CPUPROFILE=nekwave.prof $<TARGET_FILE:nekwave_prof> "${CMAKE_CURRENT_SOURCE_DIR}/examples/3dboxpec/3dboxpec.json"
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
             DEPENDS nekwave_prof
             COMMENT "Executing simulation with CPU profiling (output: nekwave.prof)..."
@@ -399,10 +399,10 @@ endif()
 # Custom Utility Targets: run and plot
 # ------------------------------------------------------------------------------
 add_custom_target(run
-    COMMAND $<TARGET_FILE:nekwave> "${CMAKE_CURRENT_SOURCE_DIR}/examples/3dboxpec/3dboxpec.par"
+    COMMAND $<TARGET_FILE:nekwave> "${CMAKE_CURRENT_SOURCE_DIR}/examples/3dboxpec/3dboxpec.json"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     DEPENDS nekwave
-    COMMENT "Running NekWave simulation with 3dboxpec.par..."
+    COMMENT "Running NekWave simulation with 3dboxpec.json..."
 )
 
 # Detect Python interpreter for postprocessing

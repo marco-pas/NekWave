@@ -1,0 +1,37 @@
+{
+  "_comment": "NekWave Example: NekCEM Canonical 3D Box PEC Benchmark Case",
+
+  "mesh": {
+    "type": "box",
+    "nelx": 10,
+    "nely": 10,
+    "nelz": 10,
+    "xmin": -1.0,
+    "xmax":  1.0,
+    "ymin": -1.0,
+    "ymax":  1.0,
+    "zmin": -1.0,
+    "zmax":  1.0
+  },
+
+  "numerics": {
+    "order": 5,
+    "cfl": "auto",
+    "dt": "auto",
+    "c0": 0.0
+  },
+
+  "time": {
+    "final_time": 50000,
+    "max_steps": 300
+  },
+
+  "output": {
+    "output_frequency": 100,
+    "save_frequency": 10,
+    "output_dir": "output",
+    "export_fields": true,
+    "export_format": "hdf5",
+    "export_continuous_vtk": false
+  }
+}

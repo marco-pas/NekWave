@@ -39,13 +39,13 @@ int main(int argc, char* argv[]) {
         std::cout << "==========================================================" << std::endl;
     }
 
-    std::string parFile = "tests/data_saving_test/data_saving_test.par";
+    std::string configFile = "tests/data_saving_test/data_saving_test.json";
     if (argc > 1) {
-        parFile = argv[1];
+        configFile = argv[1];
     }
 
     Case simulationCase;
-    simulationCase.loadConfig(parFile);
+    simulationCase.loadConfig(configFile);
 
     // Explicitly configure data saving options (standard + all extras)
     Case::SaveOptions saveOptions;

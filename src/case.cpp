@@ -49,11 +49,27 @@ Case::~Case() {
 void Case::loadConfig(const std::string& configFile) {
     if (!configFile.empty()) {
         config_.loadFromFile(configFile);
+        // If waveType_ was already specified programmatically in C++, ensure it takes precedence
+        if (!waveType_.empty()) {
+            config_.set("wave_type", waveType_);
+        }
     }
+}
+
+void Case::setWaveType(const std::string& waveType) {
+    waveType_ = waveType;
+    config_.set("wave_type", waveType);
+}
+
+const std::string& Case::waveType() const {
+    return waveType_;
 }
 
 void Case::setConfig(const Config& config) {
     config_ = config;
+    if (!waveType_.empty()) {
+        config_.set("wave_type", waveType_);
+    }
 }
 
 void Case::setInitialCondition(InitialConditionFn fn) {
@@ -145,7 +161,8 @@ void Case::preprocess(const Config& cfg) {
         mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
     }
 
-    if (config_.has("wave_type") && config_.getString("wave_type") == "3dboxper") {
+    std::string currentWave = !waveType_.empty() ? waveType_ : config_.getString("wave_type");
+    if (currentWave == "3dboxper") {
         const auto& cx = mesh_->getCoordX();
         double minX = 1e30, maxX = -1e30;
         for (size_t k = 0; k < cx.size(); ++k) {
@@ -227,7 +244,7 @@ void Case::preprocess(const Config& cfg) {
             Hy[k] = hy;
             Hz[k] = hz;
         }
-    } else if (config_.has("wave_type") && (config_.getString("wave_type") == "bloch" || config_.getString("wave_type") == "periodic")) {
+    } else if (currentWave == "bloch" || currentWave == "periodic") {
         std::cout << "[PREPROCESS] Evaluating periodic Bloch electromagnetic plane wave in (Ez, Hx, Hy)..." << std::endl;
         double* Ez = &state_[2 * npts];
         double* Hx = &state_[3 * npts];
@@ -310,7 +327,7 @@ void Case::preprocess(const Config& cfg) {
             Hx[k] =  sinA * sumE;
             Hy[k] = -cosA * sumE;
         }
-    } else if (config_.has("wave_type") && config_.getString("wave_type") == "multimode") {
+    } else if (currentWave == "multimode") {
         std::cout << "[PREPROCESS] Evaluating multi-harmonic sinusoidal standing wave packet in Ez..." << std::endl;
         double* Ez = &state_[2 * npts];
         const double Lx = config_.Lx;
@@ -328,7 +345,7 @@ void Case::preprocess(const Config& cfg) {
             }
             Ez[k] = sumE * transY;
         }
-    } else if (config_.has("wave_type") && config_.getString("wave_type") == "packet") {
+    } else if (currentWave == "packet") {
         std::cout << "[PREPROCESS] Evaluating modulated Gaussian wavepacket in Ez..." << std::endl;
         const double carrierK = config_.getDouble("carrier_k", 4.0 * M_PI);
         const double sigma    = config_.getDouble("packet_sigma", 0.30);
@@ -345,7 +362,7 @@ void Case::preprocess(const Config& cfg) {
             double carrier  = std::sin(carrierK * (x[k] - xmin));
             Ez[k] = envelope * carrier * transY;
         }
-    } else if (config_.has("wave_type") && config_.getString("wave_type") == "gaussian") {
+    } else if (currentWave == "gaussian") {
         std::cout << "[PREPROCESS] Evaluating Gaussian pulse in Ez..." << std::endl;
         const double sigma = config_.pulseSigma;
         double* Ez = &state_[2 * npts];

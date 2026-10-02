@@ -302,18 +302,18 @@ void CaseInputLoadingTest() {
     std::cout << "[RUN] CaseInputLoadingTest..." << std::endl;
 
 #ifdef NEKWAVE_SOURCE_DIR
-    std::string parFile = std::string(NEKWAVE_SOURCE_DIR) + "/tests/3dboxpec_test/3dboxpec_test.par";
+    std::string configFile = std::string(NEKWAVE_SOURCE_DIR) + "/tests/3dboxpec_test/3dboxpec_test.json";
 #else
-    std::string parFile = "tests/3dboxpec_test/3dboxpec_test.par";
+    std::string configFile = "tests/3dboxpec_test/3dboxpec_test.json";
 #endif
 
     // Verify input file exists
-    std::ifstream f(parFile.c_str());
+    std::ifstream f(configFile.c_str());
     EXPECT_TRUE(f.good());
     f.close();
 
     Case testCase;
-    testCase.loadConfig(parFile);
+    testCase.loadConfig(configFile);
 
     // Override to a fast 2-step run for unit testing
     testCase.config().numSteps = 2;
@@ -414,6 +414,112 @@ void PeriodicBCTest() {
 }
 
 /*
+ * Test 6: JSON Parameter File Loading (Box & NekCEM Mesh, Ignored wave_type)
+ */
+void JsonConfigLoadingTest() {
+    std::cout << "[RUN] JsonConfigLoadingTest..." << std::endl;
+
+    // Test 1: Box mesh in JSON format
+    std::string boxJson = R"({
+        "_comment": "Box mesh test",
+        "mesh": {
+            "type": "box",
+            "nelx": 4,
+            "nely": 5,
+            "nelz": 6,
+            "xmin": -2.0,
+            "xmax": 2.0,
+            "ymin": -1.0,
+            "ymax": 1.0,
+            "zmin": 0.0,
+            "zmax": 3.0,
+            "periodic_x": true
+        },
+        "numerics": {
+            "order": 5,
+            "cfl": "auto",
+            "dt": 0.001,
+            "c0": 0.5
+        },
+        "time": {
+            "final_time": 12.5,
+            "max_steps": 1000
+        },
+        "output": {
+            "output_frequency": 25,
+            "save_frequency": 100,
+            "output_dir": "test_output",
+            "export_fields": true,
+            "export_format": "hdf5"
+        },
+        "probes": [
+            [0.1, 0.2, 0.3],
+            [1.0, 1.5, 2.0]
+        ],
+        "wave_type": "should_be_ignored"
+    })";
+
+    nekwave::JsonValue root = nekwave::JsonValue::parse(boxJson);
+    EXPECT_TRUE(root.isObject());
+
+    Config cfg;
+    cfg.loadFromJson(root);
+
+    EXPECT_TRUE(cfg.meshFile == "box");
+    EXPECT_TRUE(cfg.nelx == 4);
+    EXPECT_TRUE(cfg.nely == 5);
+    EXPECT_TRUE(cfg.nelz == 6);
+    EXPECT_NEAR(cfg.xmin, -2.0, 1e-12);
+    EXPECT_NEAR(cfg.xmax,  2.0, 1e-12);
+    EXPECT_NEAR(cfg.ymin, -1.0, 1e-12);
+    EXPECT_NEAR(cfg.ymax,  1.0, 1e-12);
+    EXPECT_NEAR(cfg.zmin,  0.0, 1e-12);
+    EXPECT_NEAR(cfg.zmax,  3.0, 1e-12);
+    EXPECT_TRUE(cfg.periodicX);
+    EXPECT_TRUE(cfg.order == 5);
+    EXPECT_NEAR(cfg.dt, 0.001, 1e-12);
+    EXPECT_NEAR(cfg.c0, 0.5, 1e-12);
+    EXPECT_NEAR(cfg.finalTime, 12.5, 1e-12);
+    EXPECT_TRUE(cfg.maxSteps == 1000);
+    EXPECT_TRUE(cfg.outputFreq == 25);
+    EXPECT_TRUE(cfg.saveFreq == 100);
+    EXPECT_TRUE(cfg.outputDir == "test_output");
+    EXPECT_TRUE(cfg.exportFields);
+    EXPECT_TRUE(cfg.exportFormat == "hdf5");
+    EXPECT_TRUE(cfg.probes.size() == 2);
+    EXPECT_NEAR(cfg.probes[0][0], 0.1, 1e-12);
+    EXPECT_NEAR(cfg.probes[1][1], 1.5, 1e-12);
+
+    // Verify wave_type was ignored and not stored
+    EXPECT_TRUE(!cfg.has("wave_type"));
+
+    // Test 2: NekCEM .rea mesh in JSON format
+    std::string nekcemJson = R"({
+        "mesh": {
+            "type": "nekcem",
+            "file": "contrib/NekCEM/tests/3dboxpec/3dboxpec.rea"
+        },
+        "numerics": {
+            "order": 4,
+            "c0": 0.0
+        }
+    })";
+    Config cfgNek;
+    nekwave::JsonValue rootNek = nekwave::JsonValue::parse(nekcemJson);
+    cfgNek.loadFromJson(rootNek);
+    EXPECT_TRUE(cfgNek.meshFile == "contrib/NekCEM/tests/3dboxpec/3dboxpec.rea");
+    EXPECT_TRUE(cfgNek.order == 4);
+
+    // Test 3: Programmatic wave_type in C++ Case
+    Case c;
+    c.setWaveType("3dboxpec");
+    EXPECT_TRUE(c.waveType() == "3dboxpec");
+
+    g_testsPassed++;
+    std::cout << "  PASSED" << std::endl;
+}
+
+/*
  * Main entry point for the NekWave test harness.
  *
  * Runs all or specifically selected unit test routines, tracks aggregate
@@ -451,6 +557,9 @@ int main(int argc, char* argv[]) {
     }
     if (filter.empty() || filter == "PeriodicBCTest") {
         PeriodicBCTest();
+    }
+    if (filter.empty() || filter == "JsonConfigLoadingTest") {
+        JsonConfigLoadingTest();
     }
 
 

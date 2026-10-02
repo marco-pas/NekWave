@@ -57,6 +57,10 @@ public:
     const Config& config() const { return config_; }
     Config& config() { return config_; }
 
+    // Wave type (must be specified programmatically in C++ code)
+    void setWaveType(const std::string& waveType);
+    const std::string& waveType() const;
+
     // User customization hooks
     void setInitialCondition(InitialConditionFn fn);
     void setInitialConditionHook(InitialConditionFn fn) { setInitialCondition(fn); }
@@ -136,6 +140,7 @@ private:
 
     std::ofstream energyFile_;
 
+    std::string waveType_;
     InitialConditionFn initialConditionHook_;
     PostprocessingFn postprocessingHook_;
     std::vector<std::array<double, 3>> customProbes_;

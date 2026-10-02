@@ -16,13 +16,14 @@ int main(int argc, char* argv[]) {
         std::cout << "==========================================================" << std::endl;
     }
 
-    std::string parFile = "tests/3dboxpec_test/3dboxpec_test.par";
+    std::string configFile = "tests/3dboxpec_test/3dboxpec_test.json";
     if (argc > 1) {
-        parFile = argv[1];
+        configFile = argv[1];
     }
 
     Case simulationCase;
-    simulationCase.loadConfig(parFile);
+    simulationCase.loadConfig(configFile);
+    simulationCase.setWaveType("3dboxpec");
 
     // 1. Explicit initial condition hook
     simulationCase.setInitialConditionHook([](double x, double y, double z,

@@ -15,13 +15,14 @@ int main(int argc, char* argv[]) {
         std::cout << "==========================================================" << std::endl;
     }
 
-    std::string parFile = "examples/3dboxpec/3dboxpec.par";
+    std::string configFile = "examples/3dboxpec/3dboxpec.json";
     if (argc > 1) {
-        parFile = argv[1];
+        configFile = argv[1];
     }
 
     Case simulationCase;
-    simulationCase.loadConfig(parFile);
+    simulationCase.loadConfig(configFile);
+    simulationCase.setWaveType("3dboxpec");
 
     // Explicit field initialization hook defined directly in example driver
     simulationCase.setInitialConditionHook([](double x, double y, double z,

@@ -38,6 +38,7 @@ if(BUILD_TESTING)
     add_test(NAME ProbeScalingTests COMMAND nekwave-test ProbeScalingTest)
     add_test(NAME MaxwellStabilityTests COMMAND nekwave-test MaxwellStabilityTest)
     add_test(NAME CaseInputLoadingTests COMMAND nekwave-test CaseInputLoadingTest)
+    add_test(NAME JsonConfigLoadingTests COMMAND nekwave-test JsonConfigLoadingTest)
     add_test(NAME NekWaveUnitTests COMMAND nekwave-test)
 
     set_tests_properties(
@@ -45,6 +46,7 @@ if(BUILD_TESTING)
         ProbeScalingTests
         MaxwellStabilityTests
         CaseInputLoadingTests
+        JsonConfigLoadingTests
         NekWaveUnitTests
         PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
@@ -53,7 +55,7 @@ if(BUILD_TESTING)
     # Benchmark verification tests
     if(EXISTS "${CMAKE_SOURCE_DIR}/contrib/NekCEM/tests/3dboxpec/3dboxpec.rea")
         add_test(NAME BoxPecTests
-            COMMAND 3dboxpec_test "${CMAKE_CURRENT_SOURCE_DIR}/3dboxpec_test/3dboxpec_test.par"
+            COMMAND 3dboxpec_test "${CMAKE_CURRENT_SOURCE_DIR}/3dboxpec_test/3dboxpec_test.json"
         )
         set_tests_properties(BoxPecTests PROPERTIES
             WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -62,7 +64,7 @@ if(BUILD_TESTING)
 
     if(EXISTS "${CMAKE_SOURCE_DIR}/contrib/NekCEM/tests/3dboxper/3dboxper.rea")
         add_test(NAME BoxPerTests
-            COMMAND 3dboxper_test "${CMAKE_CURRENT_SOURCE_DIR}/3dboxper_test/3dboxper_test.par"
+            COMMAND 3dboxper_test "${CMAKE_CURRENT_SOURCE_DIR}/3dboxper_test/3dboxper_test.json"
         )
         set_tests_properties(BoxPerTests PROPERTIES
             WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -71,7 +73,7 @@ if(BUILD_TESTING)
 
     # Data saving test
     add_test(NAME DataSavingTests
-        COMMAND data_saving_test "${CMAKE_CURRENT_SOURCE_DIR}/data_saving_test/data_saving_test.par"
+        COMMAND data_saving_test "${CMAKE_CURRENT_SOURCE_DIR}/data_saving_test/data_saving_test.json"
     )
     set_tests_properties(DataSavingTests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"

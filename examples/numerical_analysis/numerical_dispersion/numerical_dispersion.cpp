@@ -2,14 +2,15 @@
 #include <iostream>
 
 int main(int argc, char* argv[]) {
-    std::string parFile = (argc > 1) ? argv[1] : "numerical_dispersion.par";
+    std::string configFile = (argc > 1) ? argv[1] : "numerical_dispersion.json";
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "      NekWave Example: Numerical Dispersion Benchmark     " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
     Case dispersionCase;
-    dispersionCase.loadConfig(parFile);
+    dispersionCase.loadConfig(configFile);
+    dispersionCase.setWaveType("bloch");
 
     dispersionCase.preprocess();
     dispersionCase.simulate();
