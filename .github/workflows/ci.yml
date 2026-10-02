@@ -1,0 +1,34 @@
+name: NekWave GPU CI
+
+on:
+  push:
+    branches: [ main, gpu_dev ]
+  pull_request:
+    branches: [ main, gpu_dev ]
+  workflow_dispatch:
+
+jobs:
+  test-on-gpu:
+    # Security guard: only run automatically for repository owner or invited collaborators
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
+
+    runs-on: [ self-hosted, gpu ]
+
+    steps:
+      - name: Checkout NekWave repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build NekWave (NVIDIA A100 + MPI + HDF5)
+        run: |
+          ./build_nekwave.sh Release
+
+      - name: Run CTest Suite (All Unit & Regression Tests)
+        run: |
+          if [ -f ./config.sh ]; then source ./config.sh; fi
+          ctest --test-dir build --output-on-failure
+

@@ -1,0 +1,36 @@
+{
+  "_comment": "NekWave CTest: Configurable Data Saving Regression Test",
+
+  "mesh": {
+    "type": "box",
+    "nelx": 3,
+    "nely": 3,
+    "nelz": 3,
+    "xmin": -1.0,
+    "xmax":  1.0,
+    "ymin": -1.0,
+    "ymax":  1.0,
+    "zmin": -1.0,
+    "zmax":  1.0
+  },
+
+  "numerics": {
+    "order": 3,
+    "cfl": "auto",
+    "dt": "auto",
+    "c0": 0.0
+  },
+
+  "time": {
+    "num_steps": 2
+  },
+
+  "output": {
+    "output_frequency": 1,
+    "save_frequency": 1,
+    "output_dir": "output_data_saving_test",
+    "export_fields": true,
+    "export_format": "hdf5",
+    "export_continuous_vtk": false
+  }
+}

@@ -23,6 +23,10 @@ struct ProbePoint {
     double actualY = 0.0;
     double actualZ = 0.0;
     double dist = 0.0;
+
+    // Spectral element Lagrange polynomial interpolation
+    int elemOffset = 0;
+    std::vector<double> interpWeights;
 };
 
 // @@ ProbeManager class to orchestrate multi-point field observation and logging
@@ -32,10 +36,13 @@ public:
     ProbeManager() = default;
     ~ProbeManager();
 
-    // Initialize probes by searching for nearest collocation nodes in the mesh
     void init(const Mesh& mesh, 
               const std::vector<std::array<double, 3>>& targetCoords, 
-              const std::string& outputDir = "output");
+              const std::string& outputDir = "output",
+              int numModes = 1,
+              double domainLx = 1.0,
+              int elementsX = 1,
+              const std::vector<double>& modeK = {});
 
     // Record electromagnetic field values at all probe nodes for the current time step
     void record(int step, double time, const std::vector<double>& state, int npts);

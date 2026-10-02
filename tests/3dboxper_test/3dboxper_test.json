@@ -1,0 +1,26 @@
+{
+  "_comment": "NekWave CTest: NekCEM Canonical 3D Box Periodic Verification Test",
+
+  "mesh": {
+    "type": "nekcem",
+    "file": "contrib/NekCEM/tests/3dboxper/3dboxper.rea"
+  },
+
+  "numerics": {
+    "order": 4,
+    "cfl": "auto",
+    "dt": "auto",
+    "c0": 0.0
+  },
+
+  "time": {
+    "num_steps": 50
+  },
+
+  "output": {
+    "output_frequency": 0,
+    "output_dir": "none",
+    "export_fields": false
+  }
+}
+

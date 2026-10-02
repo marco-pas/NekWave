@@ -1,16 +1,18 @@
 // Verification and Unit Tests
 
 #include "mesh.hpp"
-#include "physics.hpp"
-#include "timestepperrk45.hpp"
+#include "dg_solver.hpp"
 #include "config.hpp"
 #include "probe.hpp"
+#include "case.hpp"
 
 #include <iostream>
+#include <fstream>
 #include <cassert>
 #include <cmath>
 #include <vector>
 #include <string>
+#include <sys/stat.h>
 
 // Global test execution counters
 static int g_testsPassed = 0;
@@ -207,17 +209,17 @@ void ProbeScalingTest() {
  *      U(t_{n+1}) <= U(t_n) + tol
  *    and that field values remain strictly finite (no NaN or Inf).
  */
-void MaxwellPhysicsStabilityTest() {
-    std::cout << "[RUN] MaxwellPhysicsStabilityTest..." << std::endl;
+void MaxwellStabilityTest() {
+    std::cout << "[RUN] MaxwellStabilityTest (GPU DgSolver)..." << std::endl;
 
     // Polynomial order N = 4 (P = 3) on a 2x2x2 mesh of elements
     const int N = 4;
     Mesh mesh(N, 1);
     mesh.createBoxMesh(2, 2, 2, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5);
 
-    // Configure Maxwell physics with upwind numerical flux (C0 = 1.0, strictly dissipative)
-    Physics physics;
-    physics.setC0(1.0);
+    // Initialize GPU DgSolver with upwind numerical flux (C0 = 1.0, strictly dissipative)
+    DgSolver solver;
+    solver.initialize(mesh, 1.0);
 
     const int npts = mesh.getTotalPoints();
 
@@ -264,13 +266,16 @@ void MaxwellPhysicsStabilityTest() {
     double initialEnergy = computeEnergy(state);
     EXPECT_TRUE(initialEnergy > 0.0);
 
-    // Advance 5 time steps using the 5-stage Low-Storage Runge-Kutta integrator
-    TimeStepperRK45 stepper;
+    // Upload initial state to GPU
+    solver.uploadState(state.data(), state.size());
+
+    // Advance 5 time steps using the GPU DgSolver (5-stage LSRK45)
     const double dt = 0.005;
     double t = 0.0;
     for (int s = 0; s < 5; ++s) {
-        stepper.step(mesh, physics, state, dt, t);
+        solver.step(dt, t);
         t += dt;
+        solver.downloadState(state.data(), state.size());
         double currentEnergy = computeEnergy(state);
 
         // Discrete energy must be non-increasing for upwind flux formulation (dU/dt <= 0)
@@ -280,6 +285,235 @@ void MaxwellPhysicsStabilityTest() {
         EXPECT_TRUE(!std::isnan(currentEnergy));
         EXPECT_TRUE(!std::isinf(currentEnergy));
     }
+
+    solver.finalize();
+
+    g_testsPassed++;
+    std::cout << "  PASSED" << std::endl;
+}
+
+/*
+ * Test 4: Case Input Loading and Zero Disk Artifacts Verification
+ *
+ * Verifies that loading a test input fixture from tests/input/ with output_dir = none
+ * runs correctly and produces zero output files on disk (no test pollution).
+ */
+void CaseInputLoadingTest() {
+    std::cout << "[RUN] CaseInputLoadingTest..." << std::endl;
+
+#ifdef NEKWAVE_SOURCE_DIR
+    std::string configFile = std::string(NEKWAVE_SOURCE_DIR) + "/tests/3dboxpec_test/3dboxpec_test.json";
+#else
+    std::string configFile = "tests/3dboxpec_test/3dboxpec_test.json";
+#endif
+
+    // Verify input file exists
+    std::ifstream f(configFile.c_str());
+    EXPECT_TRUE(f.good());
+    f.close();
+
+    Case testCase;
+    testCase.loadConfig(configFile);
+
+    // Override to a fast 2-step run for unit testing
+    testCase.config().numSteps = 2;
+    testCase.config().outputFreq = 1;
+
+    EXPECT_TRUE(testCase.config().outputDir == "none");
+    EXPECT_TRUE(!testCase.config().exportFields);
+
+    // Run the full 3-phase lifecycle
+    testCase.run();
+
+    // Verify that output_dir was "none" and no files/directories were created
+    struct stat st;
+    int res = stat("none", &st);
+    EXPECT_TRUE(res != 0); // Directory 'none' must NOT exist
+
+#ifdef NEKWAVE_BUILD_DIR
+    std::string buildNone = std::string(NEKWAVE_BUILD_DIR) + "/none";
+    res = stat(buildNone.c_str(), &st);
+    EXPECT_TRUE(res != 0); // Directory '${BUILD}/none' must NOT exist
+#endif
+
+    g_testsPassed++;
+    std::cout << "  PASSED" << std::endl;
+}
+
+/*
+ * Test 5: Periodic Boundary Condition Mesh Connectivity
+ *
+ * Verifies that structured Cartesian box meshes with periodic boundary conditions:
+ * 1. Tag boundary faces as "PERIODIC" rather than "PEC".
+ * 2. Assign valid exterior neighbor element IDs across the periodic wrap.
+ * 3. Correctly connect opposite face collocation nodes such that transverse
+ *    coordinates match exactly and longitudinal coordinates differ by domain length L.
+ * 4. Maintain non-periodic directions (e.g. Z) as PEC mirror conditions.
+ */
+void PeriodicBCTest() {
+    std::cout << "[RUN] PeriodicBCTest..." << std::endl;
+
+    const int N = 4;
+    Mesh mesh(N, 1);
+
+    // 2x2x2 mesh with periodic in X and Y, PEC in Z
+    const double xmin = -2.0, xmax = 2.0;
+    const double ymin = -1.0, ymax = 1.0;
+    const double zmin = -0.5, zmax = 0.5;
+    mesh.createBoxMesh(2, 2, 2, xmin, xmax, ymin, ymax, zmin, zmax, true, true, false);
+
+    const auto& faceData = mesh.getFaceData();
+    const auto& x = mesh.getCoordX();
+    const auto& y = mesh.getCoordY();
+    const auto& z = mesh.getCoordZ();
+
+    int periodicFacesCount = 0;
+    int pecFacesCount = 0;
+
+    for (size_t f = 0; f < faceData.size(); ++f) {
+        const auto& fd = faceData[f];
+        if (fd.bcType == "PERIODIC") {
+            periodicFacesCount++;
+            for (const auto& pt : fd.points) {
+                EXPECT_TRUE(pt.volIdxPlus >= 0);
+                int vM = pt.volIdxMinus;
+                int vP = pt.volIdxPlus;
+
+                // For X-periodic faces (face 1 and 3): Y and Z coordinates must match exactly
+                if (fd.faceId == 1 || fd.faceId == 3) {
+                    EXPECT_NEAR(y[vM], y[vP], 1e-12);
+                    EXPECT_NEAR(z[vM], z[vP], 1e-12);
+                    EXPECT_NEAR(std::abs(x[vM] - x[vP]), (xmax - xmin), 1e-12);
+                }
+                // For Y-periodic faces (face 0 and 2): X and Z coordinates must match exactly
+                if (fd.faceId == 0 || fd.faceId == 2) {
+                    EXPECT_NEAR(x[vM], x[vP], 1e-12);
+                    EXPECT_NEAR(z[vM], z[vP], 1e-12);
+                    EXPECT_NEAR(std::abs(y[vM] - y[vP]), (ymax - ymin), 1e-12);
+                }
+            }
+        } else if (fd.bcType == "PEC") {
+            pecFacesCount++;
+            // Must be Z boundary faces (face 4 or 5)
+            EXPECT_TRUE(fd.faceId == 4 || fd.faceId == 5);
+            for (const auto& pt : fd.points) {
+                EXPECT_TRUE(pt.volIdxPlus == -1);
+            }
+        }
+    }
+
+    // With 2x2x2 elements (8 elements, 48 faces total):
+    // Internal faces: 12 internal interfaces * 2 = 24 "E" faces
+    // Periodic faces: 4 in Xmin + 4 in Xmax + 4 in Ymin + 4 in Ymax = 16 "PERIODIC" faces
+    // PEC faces: 4 in Zmin + 4 in Zmax = 8 "PEC" faces
+    EXPECT_TRUE(periodicFacesCount == 16);
+    EXPECT_TRUE(pecFacesCount == 8);
+
+    g_testsPassed++;
+    std::cout << "  PASSED" << std::endl;
+}
+
+/*
+ * Test 6: JSON Parameter File Loading (Box & NekCEM Mesh, Ignored wave_type)
+ */
+void JsonConfigLoadingTest() {
+    std::cout << "[RUN] JsonConfigLoadingTest..." << std::endl;
+
+    // Test 1: Box mesh in JSON format
+    std::string boxJson = R"({
+        "_comment": "Box mesh test",
+        "mesh": {
+            "type": "box",
+            "nelx": 4,
+            "nely": 5,
+            "nelz": 6,
+            "xmin": -2.0,
+            "xmax": 2.0,
+            "ymin": -1.0,
+            "ymax": 1.0,
+            "zmin": 0.0,
+            "zmax": 3.0,
+            "periodic_x": true
+        },
+        "numerics": {
+            "order": 5,
+            "cfl": "auto",
+            "dt": 0.001,
+            "c0": 0.5
+        },
+        "time": {
+            "final_time": 12.5,
+            "max_steps": 1000
+        },
+        "output": {
+            "output_frequency": 25,
+            "save_frequency": 100,
+            "output_dir": "test_output",
+            "export_fields": true,
+            "export_format": "hdf5"
+        },
+        "probes": [
+            [0.1, 0.2, 0.3],
+            [1.0, 1.5, 2.0]
+        ],
+        "wave_type": "should_be_ignored"
+    })";
+
+    nekwave::JsonValue root = nekwave::JsonValue::parse(boxJson);
+    EXPECT_TRUE(root.isObject());
+
+    Config cfg;
+    cfg.loadFromJson(root);
+
+    EXPECT_TRUE(cfg.meshFile == "box");
+    EXPECT_TRUE(cfg.nelx == 4);
+    EXPECT_TRUE(cfg.nely == 5);
+    EXPECT_TRUE(cfg.nelz == 6);
+    EXPECT_NEAR(cfg.xmin, -2.0, 1e-12);
+    EXPECT_NEAR(cfg.xmax,  2.0, 1e-12);
+    EXPECT_NEAR(cfg.ymin, -1.0, 1e-12);
+    EXPECT_NEAR(cfg.ymax,  1.0, 1e-12);
+    EXPECT_NEAR(cfg.zmin,  0.0, 1e-12);
+    EXPECT_NEAR(cfg.zmax,  3.0, 1e-12);
+    EXPECT_TRUE(cfg.periodicX);
+    EXPECT_TRUE(cfg.order == 5);
+    EXPECT_NEAR(cfg.dt, 0.001, 1e-12);
+    EXPECT_NEAR(cfg.c0, 0.5, 1e-12);
+    EXPECT_NEAR(cfg.finalTime, 12.5, 1e-12);
+    EXPECT_TRUE(cfg.maxSteps == 1000);
+    EXPECT_TRUE(cfg.outputFreq == 25);
+    EXPECT_TRUE(cfg.saveFreq == 100);
+    EXPECT_TRUE(cfg.outputDir == "test_output");
+    EXPECT_TRUE(cfg.exportFields);
+    EXPECT_TRUE(cfg.exportFormat == "hdf5");
+    EXPECT_TRUE(cfg.probes.size() == 2);
+    EXPECT_NEAR(cfg.probes[0][0], 0.1, 1e-12);
+    EXPECT_NEAR(cfg.probes[1][1], 1.5, 1e-12);
+
+    // Verify wave_type was ignored and not stored
+    EXPECT_TRUE(!cfg.has("wave_type"));
+
+    // Test 2: NekCEM .rea mesh in JSON format
+    std::string nekcemJson = R"({
+        "mesh": {
+            "type": "nekcem",
+            "file": "contrib/NekCEM/tests/3dboxpec/3dboxpec.rea"
+        },
+        "numerics": {
+            "order": 4,
+            "c0": 0.0
+        }
+    })";
+    Config cfgNek;
+    nekwave::JsonValue rootNek = nekwave::JsonValue::parse(nekcemJson);
+    cfgNek.loadFromJson(rootNek);
+    EXPECT_TRUE(cfgNek.meshFile == "contrib/NekCEM/tests/3dboxpec/3dboxpec.rea");
+    EXPECT_TRUE(cfgNek.order == 4);
+
+    // Test 3: Programmatic wave_type in C++ Case
+    Case c;
+    c.setWaveType("3dboxpec");
+    EXPECT_TRUE(c.waveType() == "3dboxpec");
 
     g_testsPassed++;
     std::cout << "  PASSED" << std::endl;
@@ -295,7 +529,9 @@ void MaxwellPhysicsStabilityTest() {
  *   ./nekwave-test                           (runs all tests)
  *   ./nekwave-test MeshQuadratureTest        (runs only MeshQuadratureTest)
  *   ./nekwave-test ProbeScalingTest         (runs only ProbeScalingTest)
- *   ./nekwave-test MaxwellPhysicsStabilityTest (runs only MaxwellPhysicsStabilityTest)
+ *   ./nekwave-test MaxwellStabilityTest     (runs only MaxwellStabilityTest)
+ *   ./nekwave-test CaseInputLoadingTest     (runs only CaseInputLoadingTest)
+ *   ./nekwave-test PeriodicBCTest           (runs only PeriodicBCTest)
  */
 int main(int argc, char* argv[]) {
     std::string filter = (argc > 1) ? argv[1] : "";
@@ -313,9 +549,19 @@ int main(int argc, char* argv[]) {
     if (filter.empty() || filter == "ProbeScalingTest") {
         ProbeScalingTest();
     }
-    if (filter.empty() || filter == "MaxwellPhysicsStabilityTest") {
-        MaxwellPhysicsStabilityTest();
+    if (filter.empty() || filter == "MaxwellStabilityTest" || filter == "MaxwellPhysicsStabilityTest") {
+        MaxwellStabilityTest();
     }
+    if (filter.empty() || filter == "CaseInputLoadingTest") {
+        CaseInputLoadingTest();
+    }
+    if (filter.empty() || filter == "PeriodicBCTest") {
+        PeriodicBCTest();
+    }
+    if (filter.empty() || filter == "JsonConfigLoadingTest") {
+        JsonConfigLoadingTest();
+    }
+
 
     std::cout << "----------------------------------------------------------" << std::endl;
     std::cout << "Test Summary: " << g_testsPassed << " passed, " 

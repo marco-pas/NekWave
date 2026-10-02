@@ -1,0 +1,45 @@
+{
+  "_comment": "NekWave Example: Two-Probe Periodic Numerical Dispersion Benchmark",
+
+  "mesh": {
+    "type": "box",
+    "elements_x": 64,
+    "elements_y": 1,
+    "elements_z": 1,
+    "xmin": 0.0,
+    "xmax": 50.26548245743669,
+    "ymin": 0.0,
+    "ymax": 1.0,
+    "zmin": 0.0,
+    "zmax": 1.0,
+    "periodic_x": true,
+    "periodic_y": true,
+    "periodic_z": true
+  },
+
+  "numerics": {
+    "order": 10,
+    "cfl": "auto",
+    "dt": "auto",
+    "c0": 1.0,
+    "k_start": 0.25,
+    "k_end": 3.75,
+    "num_modes": 4,
+    "angle_deg": 0.0
+  },
+
+  "time": {
+    "num_steps": 10000
+  },
+
+  "output": {
+    "output_frequency": 1,
+    "output_dir": "output",
+    "export_fields": false
+  },
+
+  "probes": [
+    [24.5, 0.5, 0.5],
+    [25.5, 0.5, 0.5]
+  ]
+}

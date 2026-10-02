@@ -1,0 +1,29 @@
+{
+  "_comment": "NekWave Example: NekCEM Canonical 3D Box Periodic Benchmark Case",
+
+  "mesh": {
+    "type": "nekcem",
+    "file": "contrib/NekCEM/tests/3dboxper/3dboxper.rea"
+  },
+
+  "numerics": {
+    "order": 7,
+    "cfl": "auto",
+    "dt": "auto",
+    "c0": 0.0
+  },
+
+  "time": {
+    "final_time": 20.0,
+    "max_steps": 10000
+  },
+
+  "output": {
+    "output_frequency": 50,
+    "save_frequency": 10,
+    "output_dir": "output_3dboxper",
+    "export_fields": true,
+    "export_format": "hdf5",
+    "export_continuous_vtk": true
+  }
+}
