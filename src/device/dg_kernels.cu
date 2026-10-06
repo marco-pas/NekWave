@@ -1,5 +1,6 @@
 #include "dg_kernels.hpp"
 #include "gpu_runtime.hpp"
+#include "boundary_conditions.hpp"
 #include <cstdio>
 
 // ==============================================================================
@@ -190,6 +191,53 @@ __global__ void gpu_restrict_faces_kernel(
 }
 
 /**
+ * @brief Evaluates field jumps [[E]] = E^+ - E^- and [[H]] = H^+ - H^- across a face point
+ *        according to its BcType (INTERIOR, PERIODIC, MPI_CUT, PEC, PMC, PML).
+ */
+__device__ __forceinline__ void apply_boundary_condition_jump(
+    int bcCode, int vP,
+    const double* __restrict__ state, int stateStride,
+    double Ex_m, double Ey_m, double Ez_m,
+    double Hx_m, double Hy_m, double Hz_m,
+    double& dEx, double& dEy, double& dEz,
+    double& dHx, double& dHy, double& dHz)
+{
+    const BcType bc = static_cast<BcType>(bcCode);
+
+    if (bc == BcType::PMC) {
+        // Perfect Magnetic Conductor (PMC / Symmetry):
+        //   n x E^+ = +n x E^- => [[E]] = 0
+        //   n x H^+ = -n x H^- => [[H]] = -2 H^-
+        dEx = 0.0;
+        dEy = 0.0;
+        dEz = 0.0;
+        dHx = -2.0 * Hx_m;
+        dHy = -2.0 * Hy_m;
+        dHz = -2.0 * Hz_m;
+    } else if (bc == BcType::PEC || bc == BcType::PML || vP < 0) {
+        // Perfect Electric Conductor (PEC) and PML outer backing wall
+        // (matching cem_maxwell_pec_init & cem_maxwell_flux_pec in cem_maxwell.F):
+        //   n x E^+ = -n x E^- => [[E]] = -2 E^-
+        //   n x H^+ = +n x H^- => [[H]] = 0
+        dEx = -2.0 * Ex_m;
+        dEy = -2.0 * Ey_m;
+        dEz = -2.0 * Ez_m;
+        dHx = 0.0;
+        dHy = 0.0;
+        dHz = 0.0;
+    } else {
+        // Internal conforming face (INTERIOR), Periodic wrap-around (PERIODIC), or MPI halo (MPI_CUT):
+        // evaluate difference with neighbor trace (plus side) at vP
+        dEx = state[0 * stateStride + vP] - Ex_m;
+        dEy = state[1 * stateStride + vP] - Ey_m;
+        dEz = state[2 * stateStride + vP] - Ez_m;
+        dHx = state[3 * stateStride + vP] - Hx_m;
+        dHy = state[4 * stateStride + vP] - Hy_m;
+        dHz = state[5 * stateStride + vP] - Hz_m;
+    }
+}
+
+/**
  * @brief Computes upwind / central numerical flux on element interface quadrature nodes.
  *
  * Evaluates field jumps across element interfaces:
@@ -211,10 +259,8 @@ __global__ void gpu_restrict_faces_kernel(
  *   - C0 = 1.0: Strictly dissipative upwind flux (suppresses high-frequency spurious modes)
  *
  * ------------------------------------------------------------------------------
- * PERFECT ELECTRIC CONDUCTOR (PEC) MIRROR BOUNDARY CONDITIONS:
- *   At domain boundaries with PEC conditions, mirror symmetry requires:
- *      n x E^+ = -n x E^- => [[E]] = -2 E^-
- *      n x H^+ = +n x H^- => [[H]] = 0
+ * BOUNDARY CONDITIONS (PEC / PMC / PML / Periodic):
+ *   Dispatched via apply_boundary_condition_jump based on bcType[p].
  * Matches cem_maxwell_flux3d and cem_maxwell_flux_pec in cem_maxwell.F.
  */
 __global__ void gpu_compute_flux_kernel(
@@ -222,7 +268,7 @@ __global__ void gpu_compute_flux_kernel(
     const double* __restrict__ fEN,
     const double* __restrict__ fHN,
     const int* __restrict__ volIdxPlus,
-    const int* __restrict__ isPEC,
+    const int* __restrict__ bcType,
     const double* __restrict__ nx,
     const double* __restrict__ ny,
     const double* __restrict__ nz,
@@ -241,24 +287,11 @@ __global__ void gpu_compute_flux_kernel(
         double Hz_m = fHN[2 * totalFacePoints + p];
 
         double dEx, dEy, dEz, dHx, dHy, dHz;
-        if (isPEC[p] || volIdxPlus[p] < 0) {
-            // PEC mirror conditions: [[E]] = -2 E^-, [[H]] = 0
-            dEx = -2.0 * Ex_m;
-            dEy = -2.0 * Ey_m;
-            dEz = -2.0 * Ez_m;
-            dHx = 0.0;
-            dHy = 0.0;
-            dHz = 0.0;
-        } else {
-            // Internal connection face: evaluate difference with neighbor trace (plus side)
-            int vP = volIdxPlus[p];
-            dEx = state[0 * stateStride + vP] - Ex_m;
-            dEy = state[1 * stateStride + vP] - Ey_m;
-            dEz = state[2 * stateStride + vP] - Ez_m;
-            dHx = state[3 * stateStride + vP] - Hx_m;
-            dHy = state[4 * stateStride + vP] - Hy_m;
-            dHz = state[5 * stateStride + vP] - Hz_m;
-        }
+        apply_boundary_condition_jump(
+            bcType[p], volIdxPlus[p], state, stateStride,
+            Ex_m, Ey_m, Ez_m, Hx_m, Hy_m, Hz_m,
+            dEx, dEy, dEz, dHx, dHy, dHz
+        );
 
         double n_x = nx[p], n_y = ny[p], n_z = nz[p];
 
@@ -378,6 +411,119 @@ __global__ void gpu_inv_mass_kernel(
         rhs[3 * npts + k] *= invMass_H;
         rhs[4 * npts + k] *= invMass_H;
         rhs[5 * npts + k] *= invMass_H;
+    }
+}
+
+/**
+ * @brief Evaluates NekCEM UPML Auxiliary Differential Equations (ADE) in PML elements.
+ *
+ * Corresponds to pml_step in contrib/NekCEM/src/cem_maxwell_pml.F (lines 483-539)
+ * combined with the auxiliary inverse mass scaling in cem_maxwell_invqmass.
+ *
+ * Executed after surface flux lifting (gpu_add_flux_kernel) and before volume
+ * inverse mass scaling (gpu_inv_mass_kernel). At entry, rhs holds the unscaled
+ * spatial curl + surface flux residual (resPr for E, resQr for H).
+ *
+ * Cyclic UPML conductivity coupling across (x, y, z):
+ *   resDN_x = resPr_x - bm1 * sy * DN_x
+ *   resDN_y = resPr_y - bm1 * sz * DN_y
+ *   resDN_z = resPr_z - bm1 * sx * DN_z
+ *   resBN_x = resQr_x - bm1 * sy * BN_x
+ *   resBN_y = resQr_y - bm1 * sz * BN_y
+ *   resBN_z = resQr_z - bm1 * sx * BN_z
+ *
+ *   resEN_x = resDN_x + bm1 * (sx - sz) * (1/eps) * DN_x - bm1 * sz * EN_x
+ *   resEN_y = resDN_y + bm1 * (sy - sx) * (1/eps) * DN_y - bm1 * sx * EN_y
+ *   resEN_z = resDN_z + bm1 * (sz - sy) * (1/eps) * DN_z - bm1 * sy * EN_z
+ *   resHN_x = resBN_x + bm1 * (sx - sz) * (1/mu)  * BN_x - bm1 * sz * HN_x
+ *   resHN_y = resBN_y + bm1 * (sy - sx) * (1/mu)  * BN_y - bm1 * sx * HN_y
+ *   resHN_z = resBN_z + bm1 * (sz - sy) * (1/mu)  * BN_z - bm1 * sy * HN_z
+ *
+ * Finally, resDN and resBN are scaled by 1/bm1 into resPmlAux, while resEN and resHN
+ * in rhs are subsequently scaled by 1/(eps*bm1) and 1/(mu*bm1) in gpu_inv_mass_kernel.
+ */
+__global__ void gpu_pml_step_kernel(
+    const double* __restrict__ state,
+    double* __restrict__ rhs,
+    const double* __restrict__ pmlAux,
+    double* __restrict__ resPmlAux,
+    const int* __restrict__ pmlPtr,
+    const double* __restrict__ pmlSigma,
+    const double* __restrict__ jac,
+    const double* __restrict__ w3,
+    int maxPml, int nxyz, int npts, int stateStride)
+{
+    int pmlIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int nptsPml = maxPml * nxyz;
+    if (pmlIdx < nptsPml) {
+        int ie = pmlIdx / nxyz;
+        int i  = pmlIdx % nxyz;
+        int e  = pmlPtr[ie];
+        int k  = e * nxyz + i;
+
+        double bm1    = jac[k] * w3[i];
+        double invBm1 = 1.0 / bm1;
+
+        double sx = pmlSigma[0 * npts + k];
+        double sy = pmlSigma[1 * npts + k];
+        double sz = pmlSigma[2 * npts + k];
+
+        // Normalized vacuum permittivity and permeability (eps = 1.0, mu = 1.0)
+        const double inv_eps = 1.0;
+        const double inv_mu  = 1.0;
+
+        // Read unscaled spatial curl + flux residuals (resPr1..3, resQr1..3)
+        double resPr1 = rhs[0 * npts + k];
+        double resPr2 = rhs[1 * npts + k];
+        double resPr3 = rhs[2 * npts + k];
+        double resQr1 = rhs[3 * npts + k];
+        double resQr2 = rhs[4 * npts + k];
+        double resQr3 = rhs[5 * npts + k];
+
+        // Read auxiliary fields DN_x, DN_y, DN_z, BN_x, BN_y, BN_z
+        double Dn1 = pmlAux[0 * nptsPml + pmlIdx];
+        double Dn2 = pmlAux[1 * nptsPml + pmlIdx];
+        double Dn3 = pmlAux[2 * nptsPml + pmlIdx];
+        double Bn1 = pmlAux[3 * nptsPml + pmlIdx];
+        double Bn2 = pmlAux[4 * nptsPml + pmlIdx];
+        double Bn3 = pmlAux[5 * nptsPml + pmlIdx];
+
+        // Read primary electromagnetic fields EN_x..z, HN_x..z
+        double Ex = state[0 * stateStride + k];
+        double Ey = state[1 * stateStride + k];
+        double Ez = state[2 * stateStride + k];
+        double Hx = state[3 * stateStride + k];
+        double Hy = state[4 * stateStride + k];
+        double Hz = state[5 * stateStride + k];
+
+        // Compute unscaled auxiliary residuals (matching cem_maxwell_pml.F lines 549-554)
+        double resDn1 = resPr1 - bm1 * sy * inv_eps * Dn1;
+        double resDn2 = resPr2 - bm1 * sz * inv_eps * Dn2;
+        double resDn3 = resPr3 - bm1 * sx * inv_eps * Dn3;
+
+        double resBn1 = resQr1 - bm1 * sy * inv_eps * Bn1;
+        double resBn2 = resQr2 - bm1 * sz * inv_eps * Bn2;
+        double resBn3 = resQr3 - bm1 * sx * inv_eps * Bn3;
+
+        // Update primary E and H unscaled residuals (matching cem_maxwell_pml.F lines 556-585):
+        //   resE_x = resPr1 + bm1 * ((sx - sy) * Dn1 - sz * Ex) = resDn1 + bm1 * sx * Dn1 - bm1 * sz * Ex
+        //   resE_y = resPr2 + bm1 * ((sy - sz) * Dn2 - sx * Ey) = resDn2 + bm1 * sy * Dn2 - bm1 * sx * Ey
+        //   resE_z = resPr3 + bm1 * ((sz - sx) * Dn3 - sy * Ez) = resDn3 + bm1 * sz * Dn3 - bm1 * sy * Ez
+        rhs[0 * npts + k] = resDn1 + bm1 * sx * inv_eps * Dn1 - bm1 * sz * Ex;
+        rhs[1 * npts + k] = resDn2 + bm1 * sy * inv_eps * Dn2 - bm1 * sx * Ey;
+        rhs[2 * npts + k] = resDn3 + bm1 * sz * inv_eps * Dn3 - bm1 * sy * Ez;
+
+        rhs[3 * npts + k] = resBn1 + bm1 * sx * inv_mu  * Bn1 - bm1 * sz * Hx;
+        rhs[4 * npts + k] = resBn2 + bm1 * sy * inv_mu  * Bn2 - bm1 * sx * Hy;
+        rhs[5 * npts + k] = resBn3 + bm1 * sz * inv_mu  * Bn3 - bm1 * sy * Hz;
+
+        // Store mass-inverted auxiliary residuals (1/bm1 * resDN, 1/bm1 * resBN)
+        resPmlAux[0 * nptsPml + pmlIdx] = resDn1 * invBm1;
+        resPmlAux[1 * nptsPml + pmlIdx] = resDn2 * invBm1;
+        resPmlAux[2 * nptsPml + pmlIdx] = resDn3 * invBm1;
+        resPmlAux[3 * nptsPml + pmlIdx] = resBn1 * invBm1;
+        resPmlAux[4 * nptsPml + pmlIdx] = resBn2 * invBm1;
+        resPmlAux[5 * nptsPml + pmlIdx] = resBn3 * invBm1;
     }
 }
 
@@ -508,11 +654,11 @@ void launch_restrict_faces(
 }
 
 /**
- * @brief Dispatches numerical surface flux kernel (Central or Upwind + PEC mirror).
+ * @brief Dispatches numerical surface flux kernel (Central or Upwind + PEC/PMC/PML/Periodic).
  */
 void launch_compute_flux(
     const double* d_state, const double* d_fEN, const double* d_fHN,
-    const int* d_volIdxPlus, const int* d_isPEC,
+    const int* d_volIdxPlus, const int* d_bcType,
     const double* d_nx, const double* d_ny, const double* d_nz,
     double* d_flux, double c0, int totalFacePoints, int stateStride,
     cudaStream_t stream)
@@ -521,7 +667,7 @@ void launch_compute_flux(
     int numBlocks = (totalFacePoints + blockSize - 1) / blockSize;
 
     gpu_compute_flux_kernel<<<numBlocks, blockSize, 0, stream>>>(
-        d_state, d_fEN, d_fHN, d_volIdxPlus, d_isPEC,
+        d_state, d_fEN, d_fHN, d_volIdxPlus, d_bcType,
         d_nx, d_ny, d_nz, d_flux, c0, totalFacePoints, stateStride
     );
     NW_GPU_CHECK(cudaGetLastError());
@@ -540,6 +686,30 @@ void launch_add_flux(
 
     gpu_add_flux_kernel<<<numBlocks, blockSize, 0, stream>>>(
         d_flux, d_volIdxMinus, d_dA, d_rhs, totalFacePoints, npts
+    );
+    NW_GPU_CHECK(cudaGetLastError());
+}
+
+/**
+ * @brief Dispatches UPML Auxiliary Differential Equation (ADE) coupling kernel.
+ */
+void launch_pml_step(
+    const double* d_state, double* d_rhs,
+    const double* d_pmlAux, double* d_resPmlAux,
+    const int* d_pmlPtr, const double* d_pmlSigma,
+    const double* d_jac, const double* d_w3,
+    int maxPml, int nxyz, int npts, int stateStride,
+    cudaStream_t stream)
+{
+    if (maxPml <= 0) return;
+    int nptsPml = maxPml * nxyz;
+    int blockSize = 256;
+    int numBlocks = (nptsPml + blockSize - 1) / blockSize;
+
+    gpu_pml_step_kernel<<<numBlocks, blockSize, 0, stream>>>(
+        d_state, d_rhs, d_pmlAux, d_resPmlAux,
+        d_pmlPtr, d_pmlSigma, d_jac, d_w3,
+        maxPml, nxyz, npts, stateStride
     );
     NW_GPU_CHECK(cudaGetLastError());
 }

@@ -331,8 +331,15 @@ bool Mesh::loadFromRea(const std::string& filename) {
     bool foundMesh = false;
     int nel = 0, ndim = 3;
 
-    // @@ scanning the file for the **MESH DATA** section
+    // @@ scanning the file for the **MESH DATA** section (and optional PMLTHICK param 77)
     while (std::getline(file, line)) {
+        if (line.find("PMLTHICK") != std::string::npos) {
+            std::stringstream pss(line);
+            double pmlThickVal = 0.0;
+            if (pss >> pmlThickVal && pmlThickVal >= 1.0) {
+                m_pmlConfig.thickness = static_cast<int>(std::round(pmlThickVal));
+            }
+        }
         if (line.find("**MESH DATA**") != std::string::npos) {
             foundMesh = true;
             break;
@@ -428,9 +435,11 @@ bool Mesh::loadFromRea(const std::string& filename) {
             FaceInfo info;
             info.elementId = elemId - 1; // Convert 1-based to 0-based
             info.faceId = faceId - 1;    // Convert 1-based to 0-based
-            info.bcType = bcType;
             info.neighborElementId = (nbrElem > 0.0) ? static_cast<int>(nbrElem) - 1 : -1;
             info.neighborFaceId = (nbrFace > 0.0) ? static_cast<int>(nbrFace) - 1 : -1;
+            info.bcType = BoundaryConditions::toString(
+                BoundaryConditions::parseBcTag(bcType, info.neighborElementId)
+            );
 
             m_faces.push_back(info);
         }
@@ -440,6 +449,7 @@ bool Mesh::loadFromRea(const std::string& filename) {
     setupGLL();
     computeMetricsFromCorners();
     setupFaceData();
+    setupPml();
 
     return true;
 }
@@ -537,16 +547,12 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
         int nbrF = (nbrFaceD > 0.0) ? (static_cast<int>(nbrFaceD) - 1) : -1;
 
         std::string rawTag(tagStr);
-        std::string bcType = "PEC";
-        if (rawTag.find('P') != std::string::npos) {
-            bcType = "PERIODIC";
-        } else if (rawTag.find('E') != std::string::npos) {
-            bcType = "E";
-        } else if (rawTag.find('W') != std::string::npos || rawTag.find("PEC") != std::string::npos) {
-            bcType = "PEC";
-        } else if (nbrE >= 0) {
-            bcType = "PERIODIC";
+        BcType parsedBc = BoundaryConditions::parseBcTag(rawTag, nbrE);
+        if (parsedBc == BcType::INTERIOR && nbrE >= 0 && rawTag.find('E') == std::string::npos) {
+            // In .re2 BC records, only boundary/periodic faces are listed; a connected record without 'E' is periodic
+            parsedBc = BcType::PERIODIC;
         }
+        std::string bcType = BoundaryConditions::toString(parsedBc);
 
         FaceInfo info;
         info.elementId = e;
@@ -623,6 +629,13 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
                     infoOther.neighborFaceId = f;
                     m_faces[otherIdx] = infoOther;
                 } else {
+                    FaceInfo infoFirst;
+                    infoFirst.elementId = e;
+                    infoFirst.faceId = f;
+                    infoFirst.bcType = "PEC";
+                    infoFirst.neighborElementId = -1;
+                    infoFirst.neighborFaceId = -1;
+                    m_faces[idx] = infoFirst;
                     interiorCenters[key] = {e, f};
                 }
             }
@@ -632,6 +645,7 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
     setupGLL();
     computeMetricsFromCorners();
     setupFaceData();
+    setupPml();
     return true;
 }
 
@@ -676,6 +690,7 @@ void Mesh::rescale(double xmin, double xmax, double ymin, double ymax, double zm
 
     computeMetricsFromCorners();
     setupFaceData();
+    setupPml();
 }
 
 // @@ generate structured Cartesian box mesh with nelx * nely * nelz hexahedral elements
@@ -684,7 +699,8 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                          double xmin, double xmax,
                          double ymin, double ymax,
                          double zmin, double zmax,
-                         bool periodicX, bool periodicY, bool periodicZ) {
+                         bool periodicX, bool periodicY, bool periodicZ,
+                         const std::string& outerBc) {
     if (nelx < 1 || nely < 1 || nelz < 1) return false;
 
 #ifndef USE_HIP
@@ -693,6 +709,11 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
     m_numElements = nelx * nely * nelz;
     m_totalPoints = m_numElements * m_numPointsPerElement;
     setupGLL();
+
+    std::string extBc = BoundaryConditions::toString(BoundaryConditions::parseBcTag(outerBc, -1));
+    if (extBc == "E" || extBc == "PERIODIC" || extBc == "MPI") {
+        extBc = "PEC";
+    }
 
     double dx = (xmax - xmin) / nelx;
     double dy = (ymax - ymin) / nely;
@@ -739,7 +760,7 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f0.neighborElementId = elemIdx(ex, nely - 1, ez);
                     f0.neighborFaceId = 2;
                 } else {
-                    f0.bcType = "PEC";
+                    f0.bcType = extBc;
                     f0.neighborElementId = -1; f0.neighborFaceId = -1;
                 }
                 m_faces.push_back(f0);
@@ -756,7 +777,7 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f1.neighborElementId = elemIdx(0, ey, ez);
                     f1.neighborFaceId = 3;
                 } else {
-                    f1.bcType = "PEC";
+                    f1.bcType = extBc;
                     f1.neighborElementId = -1; f1.neighborFaceId = -1;
                 }
                 m_faces.push_back(f1);
@@ -773,7 +794,7 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f2.neighborElementId = elemIdx(ex, 0, ez);
                     f2.neighborFaceId = 0;
                 } else {
-                    f2.bcType = "PEC";
+                    f2.bcType = extBc;
                     f2.neighborElementId = -1; f2.neighborFaceId = -1;
                 }
                 m_faces.push_back(f2);
@@ -790,7 +811,7 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f3.neighborElementId = elemIdx(nelx - 1, ey, ez);
                     f3.neighborFaceId = 1;
                 } else {
-                    f3.bcType = "PEC";
+                    f3.bcType = extBc;
                     f3.neighborElementId = -1; f3.neighborFaceId = -1;
                 }
                 m_faces.push_back(f3);
@@ -807,7 +828,7 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f4.neighborElementId = elemIdx(ex, ey, nelz - 1);
                     f4.neighborFaceId = 5;
                 } else {
-                    f4.bcType = "PEC";
+                    f4.bcType = extBc;
                     f4.neighborElementId = -1; f4.neighborFaceId = -1;
                 }
                 m_faces.push_back(f4);
@@ -824,7 +845,7 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f5.neighborElementId = elemIdx(ex, ey, 0);
                     f5.neighborFaceId = 4;
                 } else {
-                    f5.bcType = "PEC";
+                    f5.bcType = extBc;
                     f5.neighborElementId = -1; f5.neighborFaceId = -1;
                 }
                 m_faces.push_back(f5);
@@ -835,6 +856,7 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
     // Evaluate metric factor tensors and face trace connections
     computeMetricsFromCorners();
     setupFaceData();
+    setupPml();
 
 #ifndef USE_HIP
     nvtxRangePop();
@@ -883,6 +905,8 @@ void Mesh::initialize() {
 double Mesh::computeMinNodeDistance() const {
     double minD2 = 1.0e20;
     int N = m_N;
+    double dxiMin = (N > 1) ? (m_gll_z[1] - m_gll_z[0]) : 2.0;
+    double dxiMin2 = dxiMin * dxiMin;
 
     for (int e = 0; e < m_numElements; ++e) {
         int offset = e * m_numPointsPerElement;
@@ -920,6 +944,14 @@ double Mesh::computeMinNodeDistance() const {
                         double dy = m_coord_y[idx_t] - y0;
                         double dz = m_coord_z[idx_t] - z0;
                         minD2 = std::min(minD2, dx * dx + dy * dy + dz * dz);
+                    }
+
+                    // Account for perpendicular face-to-face spacing on skewed/curvilinear elements:
+                    double g2 = (m_rx[idx] * m_rx[idx] + m_ry[idx] * m_ry[idx] + m_rz[idx] * m_rz[idx])
+                              + (m_sx[idx] * m_sx[idx] + m_sy[idx] * m_sy[idx] + m_sz[idx] * m_sz[idx])
+                              + (m_tx[idx] * m_tx[idx] + m_ty[idx] * m_ty[idx] + m_tz[idx] * m_tz[idx]);
+                    if (g2 > 1.0e-20) {
+                        minD2 = std::min(minD2, (3.0 * dxiMin2) / g2);
                     }
                 }
             }
@@ -1037,10 +1069,11 @@ void Mesh::setupFaceData() {
                 pt.nz = (L > 1e-14) ? (Nz / L) : 0.0;
                 pt.dA = L * w2;
 
-                // Determine exterior neighbor node index
-                if (face.bcType == "PEC" || face.neighborElementId < 0) {
+                // Determine exterior neighbor node index via canonical BcType
+                BcType bc = BoundaryConditions::parseBcTag(face.bcType, face.neighborElementId);
+                if (bc == BcType::PEC || bc == BcType::PMC || bc == BcType::PML || face.neighborElementId < 0) {
                     pt.volIdxPlus = -1;
-                } else if (face.bcType == "PERIODIC") {
+                } else if (bc == BcType::PERIODIC) {
                     // Periodic boundary: aligned opposite Cartesian faces map directly by (pA, qA)
                     int eB = face.neighborElementId;
                     int fB = face.neighborFaceId;
@@ -1053,18 +1086,19 @@ void Mesh::setupFaceData() {
                     double zA = m_coord_z[vM];
 
                     int matchedVolB = -1;
+                    double bestDist2 = 1.0e30;
                     for (int qB = 0; qB < N; ++qB) {
                         for (int pB = 0; pB < N; ++pB) {
                             int vB = getFaceNodeVolIndex(eB, fB, pB, qB);
                             double dx = xA - m_coord_x[vB];
                             double dy = yA - m_coord_y[vB];
                             double dz = zA - m_coord_z[vB];
-                            if (dx * dx + dy * dy + dz * dz < 1e-10) {
+                            double d2 = dx * dx + dy * dy + dz * dz;
+                            if (d2 < bestDist2) {
+                                bestDist2 = d2;
                                 matchedVolB = vB;
-                                break;
                             }
                         }
-                        if (matchedVolB >= 0) break;
                     }
                     pt.volIdxPlus = matchedVolB;
                 }
@@ -1077,6 +1111,11 @@ void Mesh::setupFaceData() {
 #ifndef USE_HIP
     nvtxRangePop();
 #endif
+}
+
+// @@ initialize UPML topology and conductivity profiles if PML boundary faces exist
+void Mesh::setupPml() {
+    m_pmlData = BoundaryConditions::initializePml(*this, m_pmlConfig);
 }
 
 // @@ multi-GPU MPI domain decomposition (Recursive Coordinate Bisection)
@@ -1210,7 +1249,6 @@ bool Mesh::partition(int rank, int numRanks) {
         int nbrGlobE;
         int nbrFaceId;
         int nbrRank;
-        std::tuple<long long, long long, long long> centroidKey;
         size_t faceDataIdx;
     };
 
@@ -1224,39 +1262,25 @@ bool Mesh::partition(int rank, int numRanks) {
             int ownerA = elemOwner[globE];
             int ownerB = elemOwner[nbrGlobE];
 
-            if (ownerA == rank || ownerB == rank) {
-                int otherRank = (ownerA == rank) ? ownerB : ownerA;
-
-                double fcx = 0.0, fcy = 0.0, fcz = 0.0;
-                const auto& pts = m_faceData[fIdx].points;
-                for (const auto& pt : pts) {
-                    fcx += m_coord_x[pt.volIdxMinus];
-                    fcy += m_coord_y[pt.volIdxMinus];
-                    fcz += m_coord_z[pt.volIdxMinus];
-                }
-                if (!pts.empty()) {
-                    fcx /= pts.size(); fcy /= pts.size(); fcz /= pts.size();
-                }
-                auto key = std::make_tuple(
-                    static_cast<long long>(std::round(fcx * 100000.0)),
-                    static_cast<long long>(std::round(fcy * 100000.0)),
-                    static_cast<long long>(std::round(fcz * 100000.0))
-                );
-
-                if (ownerA == rank) {
-                    rankCutFaces[otherRank].push_back({globE, f.faceId, nbrGlobE, f.neighborFaceId, otherRank, key, fIdx});
-                }
+            if (ownerA == rank) {
+                int otherRank = ownerB;
+                rankCutFaces[otherRank].push_back({globE, f.faceId, nbrGlobE, f.neighborFaceId, otherRank, fIdx});
             }
         }
     }
 
-    // Sort cut faces for each neighbor rank canonically
+    // Sort cut faces for each neighbor rank canonically using exact integer element & face IDs
     for (auto& kv : rankCutFaces) {
         std::sort(kv.second.begin(), kv.second.end(), [](const CutFaceRef& a, const CutFaceRef& b) {
-            if (a.centroidKey != b.centroidKey) return a.centroidKey < b.centroidKey;
-            if (std::min(a.globE, a.nbrGlobE) != std::min(b.globE, b.nbrGlobE))
-                return std::min(a.globE, a.nbrGlobE) < std::min(b.globE, b.nbrGlobE);
-            return std::max(a.globE, a.nbrGlobE) < std::max(b.globE, b.nbrGlobE);
+            int minEA = std::min(a.globE, a.nbrGlobE);
+            int minEB = std::min(b.globE, b.nbrGlobE);
+            if (minEA != minEB) return minEA < minEB;
+            int maxEA = std::max(a.globE, a.nbrGlobE);
+            int maxEB = std::max(b.globE, b.nbrGlobE);
+            if (maxEA != maxEB) return maxEA < maxEB;
+            int canonFA = (a.globE < a.nbrGlobE) ? a.faceId : a.nbrFaceId;
+            int canonFB = (b.globE < b.nbrGlobE) ? b.faceId : b.nbrFaceId;
+            return canonFA < canonFB;
         });
     }
 
@@ -1280,24 +1304,19 @@ bool Mesh::partition(int rank, int numRanks) {
             struct PtSort {
                 size_t ptIdx;
                 int locVolMinus;
-                std::tuple<long long, long long, long long> ptKey;
+                int canonicalVolKey;
             };
             std::vector<PtSort> sortedPts(origPts.size());
             for (size_t p = 0; p < origPts.size(); ++p) {
                 int globVM = origPts[p].volIdxMinus;
-                double px = m_coord_x[globVM];
-                double py = m_coord_y[globVM];
-                double pz = m_coord_z[globVM];
-                auto pkey = std::make_tuple(
-                    static_cast<long long>(std::round(px * 1000000.0)),
-                    static_cast<long long>(std::round(py * 1000000.0)),
-                    static_cast<long long>(std::round(pz * 1000000.0))
-                );
+                int globVP = origPts[p].volIdxPlus;
+                int canonKey = (cut.globE < cut.nbrGlobE) ? globVM : globVP;
                 int locVM = locE * nxyz + (globVM % nxyz);
-                sortedPts[p] = {p, locVM, pkey};
+                sortedPts[p] = {p, locVM, canonKey};
             }
             std::sort(sortedPts.begin(), sortedPts.end(), [](const PtSort& a, const PtSort& b) {
-                return a.ptKey < b.ptKey;
+                if (a.canonicalVolKey != b.canonicalVolKey) return a.canonicalVolKey < b.canonicalVolKey;
+                return a.ptIdx < b.ptIdx;
             });
 
             for (size_t sp = 0; sp < sortedPts.size(); ++sp) {
@@ -1369,6 +1388,35 @@ bool Mesh::partition(int rank, int numRanks) {
 
         new_faces.push_back(newF);
         new_faceData.push_back(newEfd);
+    }
+
+    // 6b. Partition UPML data if enabled
+    if (m_pmlData.enabled) {
+        int globalTotalPoints = m_totalPoints;
+        std::vector<int> new_pmlTag(localNumElems, 0);
+        std::vector<int> new_pmlPtr;
+        std::vector<double> new_pmlSigma(static_cast<size_t>(3) * localTotalPoints, 0.0);
+
+        for (int locE = 0; locE < localNumElems; ++locE) {
+            int globE = localElemIds[locE];
+            int tag = (globE < static_cast<int>(m_pmlData.pmlTag.size())) ? m_pmlData.pmlTag[globE] : 0;
+            new_pmlTag[locE] = tag;
+            if (tag != 0) {
+                new_pmlPtr.push_back(locE);
+            }
+            int globOffset = globE * nxyz;
+            int locOffset = locE * nxyz;
+            for (int axis = 0; axis < 3; ++axis) {
+                for (int p = 0; p < nxyz; ++p) {
+                    new_pmlSigma[axis * localTotalPoints + locOffset + p] =
+                        m_pmlData.pmlSigma[axis * globalTotalPoints + globOffset + p];
+                }
+            }
+        }
+        m_pmlData.pmlTag = std::move(new_pmlTag);
+        m_pmlData.pmlPtr = std::move(new_pmlPtr);
+        m_pmlData.pmlSigma = std::move(new_pmlSigma);
+        m_pmlData.maxPml = static_cast<int>(m_pmlData.pmlPtr.size());
     }
 
     // 7. Commit partitioned mesh state

@@ -1,5 +1,6 @@
 #include "dg_solver.hpp"
 #include "mesh.hpp"
+#include "boundary_conditions.hpp"
 #include "comm.hpp"
 #include "device/dg_kernels.hpp"
 #include "device/gpu_runtime.hpp"
@@ -81,7 +82,8 @@ public:
 
         std::vector<int> h_volIdxMinus(totalFacePoints_);
         std::vector<int> h_volIdxPlus(totalFacePoints_);
-        std::vector<int> h_bcType(totalFacePoints_);
+        std::vector<int> h_bcType;
+        BoundaryConditions::buildFacePointBcTypes(mesh, h_bcType);
         std::vector<double> h_nx(totalFacePoints_);
         std::vector<double> h_ny(totalFacePoints_);
         std::vector<double> h_nz(totalFacePoints_);
@@ -89,20 +91,9 @@ public:
 
         size_t ptIdx = 0;
         for (const auto& fd : faceData) {
-            int bcCode = 0;
-            if (fd.bcType == "PEC" || fd.bcType == "W" || fd.bcType == "V" || fd.bcType == "v") {
-                bcCode = 1;
-            } else if (fd.bcType == "PMC" || fd.bcType == "SYM" || fd.bcType == "S" || fd.bcType == "s") {
-                bcCode = 2;
-            }
             for (const auto& pt : fd.points) {
                 h_volIdxMinus[ptIdx] = pt.volIdxMinus;
                 h_volIdxPlus[ptIdx]  = pt.volIdxPlus;
-                int ptBc = bcCode;
-                if (pt.volIdxPlus < 0 && ptBc == 0) {
-                    ptBc = 1; // Default boundary to PEC if no neighbor
-                }
-                h_bcType[ptIdx]      = ptBc;
                 h_nx[ptIdx]          = pt.nx;
                 h_ny[ptIdx]          = pt.ny;
                 h_nz[ptIdx]          = pt.nz;
@@ -235,6 +226,33 @@ public:
         NW_GPU_CHECK(cudaMalloc(&d_fHN_, 3 * totalFacePoints_ * sizeof(double)));
         NW_GPU_CHECK(cudaMalloc(&d_flux_, 6 * totalFacePoints_ * sizeof(double)));
 
+        // ----------------------------------------------------------------------
+        // 6. Allocate & Upload UPML Auxiliary Fields and Conductivity Buffers
+        // ----------------------------------------------------------------------
+        PmlData localPml = mesh.getPmlData();
+        if (!localPml.enabled && BoundaryConditions::hasPmlFaces(mesh)) {
+            localPml = BoundaryConditions::initializePml(mesh, mesh.getPmlConfig());
+        }
+
+        maxPml_ = localPml.maxPml;
+        nptsPml_ = maxPml_ * nxyz_;
+        if (maxPml_ > 0) {
+            NW_GPU_CHECK(cudaMalloc(&d_pmlPtr_, maxPml_ * sizeof(int)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_pmlPtr_, localPml.pmlPtr.data(), maxPml_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_pmlSigma_, 3 * npts_ * sizeof(double)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_pmlSigma_, localPml.pmlSigma.data(), 3 * npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_pmlAux_, 6 * nptsPml_ * sizeof(double)));
+            NW_GPU_CHECK(cudaMemsetAsync(d_pmlAux_, 0, 6 * nptsPml_ * sizeof(double), stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_kPmlAux_, 6 * nptsPml_ * sizeof(double)));
+            NW_GPU_CHECK(cudaMemsetAsync(d_kPmlAux_, 0, 6 * nptsPml_ * sizeof(double), stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_resPmlAux_, 6 * nptsPml_ * sizeof(double)));
+            NW_GPU_CHECK(cudaMemsetAsync(d_resPmlAux_, 0, 6 * nptsPml_ * sizeof(double), stream_));
+        }
+
         NW_GPU_CHECK(cudaStreamSynchronize(stream_));
         bInitialized_ = true;
         return true;
@@ -294,8 +312,9 @@ public:
      *   2) Volume curl evaluated directly in shared-memory on chip (+curl(H), -curl(E))
      *   3) MPI_Waitall + unpack received ghost traces into d_state_
      *   4) Interior fields restricted to element face quadrature nodes (fEN, fHN)
-     *   5) Numerical surface Riemann fluxes computed (Central vs Upwind + PEC)
+     *   5) Numerical surface Riemann fluxes computed (Central vs Upwind + PEC/PMC/PML/Periodic)
      *   6) Numerical surface fluxes lifted into volume residuals (atomic additions)
+     *   6b) If UPML active: evaluate ADE auxiliary equations (pml_step) for DN, BN, EN, HN
      *   7) Scaled by exact diagonal inverse mass matrix: 1 / (J * w_i * w_j * w_k)
      *   8) LSRK45 state & auxiliary vector update:
      *          k = a_s * k + dt * rhs
@@ -453,13 +472,11 @@ public:
             );
 
             // ------------------------------------------------------------------
-            // Step 4: Compute numerical surface fluxes (Central or Upwind + PEC)
+            // Step 4: Compute numerical surface fluxes (Central or Upwind + PEC/PMC/PML/Periodic)
             // Evaluates jumps [[E]] = E^+ - E^-, [[H]] = H^+ - H^-
             // Upwind/Central numerical flux matching NekCEM lines 991-996:
             //   F^*_H = -0.5 * (n x [[E]]) - 0.5 * C0 * (n x (n x [[H]]))
             //   F^*_E = +0.5 * (n x [[H]]) - 0.5 * C0 * (n x (n x [[E]]))
-            // PEC mirror boundary conditions:
-            //   n x E^+ = -n x E^- => [[E]] = -2 E^-,  [[H]] = 0
             // ------------------------------------------------------------------
             nekwave::device::launch_compute_flux(
                 d_state_, d_fEN_, d_fHN_, d_volIdxPlus_, d_bcType_,
@@ -476,6 +493,19 @@ public:
                 d_flux_, d_volIdxMinus_, d_dA_, d_rhs_,
                 totalFacePoints_, npts_, stream_
             );
+
+            // ------------------------------------------------------------------
+            // Step 5b: Evaluate UPML Auxiliary Differential Equations (pml_step)
+            // Couples unscaled spatial residuals with auxiliary fields DN and BN
+            // Corresponds to pml_step in contrib/NekCEM/src/cem_maxwell_pml.F
+            // ------------------------------------------------------------------
+            if (maxPml_ > 0) {
+                nekwave::device::launch_pml_step(
+                    d_state_, d_rhs_, d_pmlAux_, d_resPmlAux_,
+                    d_pmlPtr_, d_pmlSigma_, d_jac_, d_w3_,
+                    maxPml_, nxyz_, npts_, stateStride_, stream_
+                );
+            }
 
             // ------------------------------------------------------------------
             // Step 6: Multiply residual by diagonal inverse mass matrix M^{-1}
@@ -503,6 +533,13 @@ public:
             nekwave::device::launch_lsrk45_update(
                 d_state_, d_k_, d_rhs_, rk4a_[stage], rk4b_[stage], dt, npts_, stateStride_, stream_
             );
+
+            if (maxPml_ > 0) {
+                nekwave::device::launch_lsrk45_update(
+                    d_pmlAux_, d_kPmlAux_, d_resPmlAux_,
+                    rk4a_[stage], rk4b_[stage], dt, nptsPml_, nptsPml_, stream_
+                );
+            }
 #ifndef USE_HIP
             nvtxRangePop();
 #endif
@@ -561,6 +598,12 @@ public:
         cudaFree(d_fHN_); d_fHN_ = nullptr;
         cudaFree(d_flux_); d_flux_ = nullptr;
 
+        if (d_pmlPtr_) { cudaFree(d_pmlPtr_); d_pmlPtr_ = nullptr; }
+        if (d_pmlSigma_) { cudaFree(d_pmlSigma_); d_pmlSigma_ = nullptr; }
+        if (d_pmlAux_) { cudaFree(d_pmlAux_); d_pmlAux_ = nullptr; }
+        if (d_kPmlAux_) { cudaFree(d_kPmlAux_); d_kPmlAux_ = nullptr; }
+        if (d_resPmlAux_) { cudaFree(d_resPmlAux_); d_resPmlAux_ = nullptr; }
+
         if (d_sendVolIndices_) { cudaFree(d_sendVolIndices_); d_sendVolIndices_ = nullptr; }
         if (d_sendBufOffsets_) { cudaFree(d_sendBufOffsets_); d_sendBufOffsets_ = nullptr; }
         if (d_recvBufOffsets_) { cudaFree(d_recvBufOffsets_); d_recvBufOffsets_ = nullptr; }
@@ -570,6 +613,8 @@ public:
 
         numHaloPoints_ = 0;
         stateStride_ = 0;
+        maxPml_ = 0;
+        nptsPml_ = 0;
         haloExchanges_.clear();
         exchangeBufOffsets_.clear();
 
@@ -593,6 +638,8 @@ private:
     int stateStride_;
     int totalEntries_;
     int totalFacePoints_;
+    int maxPml_ = 0;
+    int nptsPml_ = 0;
     double c0_;
 
     std::vector<double> rk4a_;
@@ -625,6 +672,13 @@ private:
     double* d_fEN_ = nullptr;
     double* d_fHN_ = nullptr;
     double* d_flux_ = nullptr;
+
+    // UPML device buffers (only allocated when maxPml_ > 0)
+    int* d_pmlPtr_ = nullptr;
+    double* d_pmlSigma_ = nullptr;
+    double* d_pmlAux_ = nullptr;
+    double* d_kPmlAux_ = nullptr;
+    double* d_resPmlAux_ = nullptr;
 
     // MPI Halo exchange device buffers
     int* d_sendVolIndices_ = nullptr;

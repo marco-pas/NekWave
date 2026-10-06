@@ -49,6 +49,7 @@ __pycache__/
 .venv
 *.slurm
 env_lumi.sh
+build_nekwave_lumi.sh
 *.err
 *.out
 .vscode/

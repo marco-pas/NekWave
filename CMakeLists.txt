@@ -263,6 +263,7 @@ endif()
 # ------------------------------------------------------------------------------
 set(NEKWAVE_CORE_SRCS
     src/comm.cpp
+    src/boundary_conditions.cpp
     src/mesh.cpp
     src/dg_solver.cpp
     src/probe.cpp

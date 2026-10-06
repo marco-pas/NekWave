@@ -117,6 +117,7 @@ void Case::preprocess(const Config& cfg) {
     }
 
     mesh_->setN(config_.order);
+    mesh_->setPmlConfig(PmlConfig(config_.pmlThickness, config_.pmlOrder, config_.pmlReflectErr));
 
 #ifndef USE_HIP
     nvtxRangePushA("Case::loadMesh");
@@ -136,12 +137,15 @@ void Case::preprocess(const Config& cfg) {
                       << (config_.periodicY ? "Y " : "")
                       << (config_.periodicZ ? "Z " : "")
                       << "]" << std::endl;
+        } else {
+            std::cout << "             Boundary Conditions: " << config_.defaultBc << std::endl;
         }
         mesh_->createBoxMesh(config_.nelx, config_.nely, config_.nelz,
                              config_.xmin, config_.xmax,
                              config_.ymin, config_.ymax,
                              config_.zmin, config_.zmax,
-                             config_.periodicX, config_.periodicY, config_.periodicZ);
+                             config_.periodicX, config_.periodicY, config_.periodicZ,
+                             config_.defaultBc);
     } else if (!config_.meshFile.empty() && config_.meshFile != "box") {
         std::cout << "[PREPROCESS] Loading mesh file: " << config_.meshFile 
                   << " (Order N = " << config_.order << ")" << std::endl;
@@ -153,25 +157,42 @@ void Case::preprocess(const Config& cfg) {
         }
         if (!bOk) {
             std::cerr << "Warning: Could not load mesh. Falling back to default 3x3x3 mesh." << std::endl;
-            mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
+            mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0,
+                                 config_.periodicX, config_.periodicY, config_.periodicZ,
+                                 config_.defaultBc);
         }
     } else {
         std::cout << "[PREPROCESS] Using default 3x3x3 Cartesian box mesh (27 elements, Order N = " 
                   << config_.order << ")" << std::endl;
-        mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
+        mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0,
+                             config_.periodicX, config_.periodicY, config_.periodicZ,
+                             config_.defaultBc);
     }
 
     std::string currentWave = !waveType_.empty() ? waveType_ : config_.getString("wave_type");
-    if (currentWave == "3dboxper") {
+    {
         const auto& cx = mesh_->getCoordX();
+        const auto& cy = mesh_->getCoordY();
+        const auto& cz = mesh_->getCoordZ();
         double minX = 1e30, maxX = -1e30;
+        double minY = 1e30, maxY = -1e30;
+        double minZ = 1e30, maxZ = -1e30;
         for (size_t k = 0; k < cx.size(); ++k) {
-            minX = std::min(minX, cx[k]);
-            maxX = std::max(maxX, cx[k]);
+            minX = std::min(minX, cx[k]); maxX = std::max(maxX, cx[k]);
+            minY = std::min(minY, cy[k]); maxY = std::max(maxY, cy[k]);
+            minZ = std::min(minZ, cz[k]); maxZ = std::max(maxZ, cz[k]);
         }
-        if (std::abs(minX - (-1.0)) < 1e-3 && std::abs(maxX - 1.0) < 1e-3) {
+        if (currentWave == "3dboxper" && std::abs(minX - (-1.0)) < 1e-3 && std::abs(maxX - 1.0) < 1e-3) {
             std::cout << "[PREPROCESS] Rescaling mesh domain from [-1, 1]^3 to [0, 2*pi]^3 matching NekCEM usrdat2..." << std::endl;
             mesh_->rescale(0.0, 2.0 * M_PI, 0.0, 2.0 * M_PI, 0.0, 2.0 * M_PI);
+            minX = 0.0; maxX = 2.0 * M_PI;
+            minY = 0.0; maxY = 2.0 * M_PI;
+            minZ = 0.0; maxZ = 2.0 * M_PI;
+        }
+        if (minX < maxX) {
+            config_.xmin = minX; config_.xmax = maxX; config_.Lx = maxX - minX;
+            config_.ymin = minY; config_.ymax = maxY; config_.Ly = maxY - minY;
+            config_.zmin = minZ; config_.zmax = maxZ; config_.Lz = maxZ - minZ;
         }
     }
 #ifndef USE_HIP
@@ -205,8 +226,8 @@ void Case::preprocess(const Config& cfg) {
         cfl_ = config_.cfl;
         dt_ = (cfl_ * dxmin) / waveSpeed;
     } else {
-        cfl_ = mesh_->computeAutomaticCFL(0.4);
-        dt_ = mesh_->computeAutomaticDt(waveSpeed, 0.4);
+        cfl_ = mesh_->computeAutomaticCFL(0.3);
+        dt_ = (cfl_ * dxmin) / waveSpeed;
     }
 
     currentTime_ = 0.0;
@@ -558,6 +579,8 @@ void Case::simulate() {
         std::cout << "------------------------------------------------------------------" << std::endl;
     }
 
+    const double initEnergy = computeTotalEnergy();
+
     int step = 0;
     while (true) {
         // Termination condition: either step count reached or final time reached
@@ -625,6 +648,7 @@ void Case::simulate() {
         }
 
         // Output diagnostics according to outFreq or on final step
+        bool stopSimulation = false;
         if (step % outFreq == 0 || isFinal) {
 #ifndef USE_HIP
             nvtxRangePushA("Case::computeDiagnostics");
@@ -648,10 +672,54 @@ void Case::simulate() {
                           << std::setw(14) << std::fixed << std::setprecision(5) << maxH 
                           << std::setw(16) << std::scientific << std::setprecision(6) << energy << std::endl;
             }
+
+            // Automatic energy-based stopping criteria:
+            //  1) Stop if energy exceeds +5% of initial energy (numerical instability guard)
+            //  2) Stop if energy drops to <= 50% of initial energy (wave energy absorbed / exited domain)
+            if (initEnergy > 0.0) {
+                if (std::isnan(energy) || std::isinf(energy) || energy > 1.05 * initEnergy) {
+                    if (Comm::isRoot()) {
+                        std::cout << "\n[STOP] Simulation terminated at step " << step
+                                  << " (t = " << std::fixed << std::setprecision(5) << currentTime_ << "): "
+                                  << "Total energy (" << std::scientific << std::setprecision(6) << energy
+                                  << ") exceeded +5% of initial energy (" << initEnergy
+                                  << "). Stopping to prevent numerical instability." << std::endl;
+                    }
+                    stopSimulation = true;
+                } else if (energy <= 0.50 * initEnergy) {
+                    if (Comm::isRoot()) {
+                        std::cout << "\n[STOP] Simulation completed at step " << step
+                                  << " (t = " << std::fixed << std::setprecision(5) << currentTime_ << "): "
+                                  << "Total energy (" << std::scientific << std::setprecision(6) << energy
+                                  << ") dropped to <= 50% of initial energy (" << initEnergy
+                                  << ") as wave energy exited the domain." << std::endl;
+                    }
+                    if (hdf5Writer_ && !(step % saveFreq == 0 || isFinal)) {
+                        bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
+                                               saveOptions_.saveDivE || saveOptions_.saveDivH ||
+                                               saveOptions_.saveMagnitudeCurlE || saveOptions_.saveMagnitudeCurlH;
+                        std::vector<double> divE, divH, curlE, curlH;
+                        if (needDerivatives) {
+                            computeFieldDerivatives(state_.data(), divE, divH, curlE, curlH);
+                        }
+                        Hdf5Writer::DerivedFields derived{
+                            divE.empty() ? nullptr : divE.data(),
+                            divH.empty() ? nullptr : divH.data(),
+                            curlE.empty() ? nullptr : curlE.data(),
+                            curlH.empty() ? nullptr : curlH.data()
+                        };
+                        hdf5Writer_->writeStep(step, currentTime_, state_.data(), npts, &derived);
+                    }
+                    stopSimulation = true;
+                }
+            }
         }
 #ifndef USE_HIP
         nvtxRangePop();
 #endif
+        if (stopSimulation) {
+            break;
+        }
     }
 
     dgSolver_->downloadState(state_.data(), state_.size());

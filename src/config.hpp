@@ -47,10 +47,16 @@ struct Config {
     bool exportFields = false;            // Whether to export 3D volume nodal fields (field_initial.csv, field_final.csv)
     bool exportContinuousVtk = false;    // Whether to average DG interface nodes into a continuous CG mesh for ParaView
 
-    // Periodic boundary conditions (default: false -> PEC mirror)
+    // Boundary condition settings (default outer BC: "PEC"; options: "PEC", "PMC", "PML", "PERIODIC")
+    std::string defaultBc = "PEC";
     bool periodicX = false;
     bool periodicY = false;
     bool periodicZ = false;
+
+    // UPML (Perfectly Matched Layer) parameters matching NekCEM's /pmlparam/
+    int pmlThickness = 2;                 // Number of element layers in the PML (pmlthick)
+    double pmlOrder = 3.0;                // Degree of polynomial conductivity grading (pmlorder)
+    double pmlReflectErr = 1.0e-6;        // Desired normal reflection error R(0) (pmlreferr)
 
     // Observation probe coordinates
     std::vector<std::array<double, 3>> probe_rel; // Relative coordinates in [-0.5, 0.5]^3
@@ -235,11 +241,27 @@ struct Config {
             std::string lv = toLower(trimVal);
             periodicZ = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
         }
-        else if (lkey == "periodic" || lkey == "bc" || lkey == "bc_type") {
+        else if (lkey == "periodic" || lkey == "bc" || lkey == "bc_type" || lkey == "boundary_condition") {
             std::string lv = toLower(trimVal);
-            if (lv == "periodic" || lv == "true" || lv == "1" || lv == "yes" || lv == "all") {
+            if (lv == "periodic" || lv == "true" || lv == "1" || lv == "yes" || lv == "all" || lv == "p") {
                 periodicX = periodicY = periodicZ = true;
+                defaultBc = "PERIODIC";
+            } else if (lv == "pmc" || lv == "sym" || lv == "s") {
+                defaultBc = "PMC";
+            } else if (lv == "pml") {
+                defaultBc = "PML";
+            } else if (lv == "pec" || lv == "w" || lv == "v") {
+                defaultBc = "PEC";
             }
+        }
+        else if (lkey == "pml_thickness" || lkey == "pmlthick" || lkey == "pml_layers") {
+            pmlThickness = std::stoi(trimVal);
+        }
+        else if (lkey == "pml_order" || lkey == "pmlorder") {
+            pmlOrder = std::stod(trimVal);
+        }
+        else if (lkey == "pml_reflect_err" || lkey == "pmlreferr" || lkey == "pml_r0") {
+            pmlReflectErr = std::stod(trimVal);
         }
         // Indexed relative probe specifications
         else if (lkey == "probe1_rx" || lkey == "probe1_rel_x") ensureProbeRel(0, 0, std::stod(trimVal));

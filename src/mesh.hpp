@@ -10,6 +10,7 @@
 #include <vector>
 #include <string>
 #include <array>
+#include "boundary_conditions.hpp"
 
 // @@ FaceInfo struct to hold boundary and neighbor connectivity
 struct FaceInfo {
@@ -76,7 +77,8 @@ public:
                        double xmin = -1.0, double xmax = 1.0,
                        double ymin = -1.0, double ymax = 1.0,
                        double zmin = -1.0, double zmax = 1.0,
-                       bool periodicX = false, bool periodicY = false, bool periodicZ = false);
+                       bool periodicX = false, bool periodicY = false, bool periodicZ = false,
+                       const std::string& outerBc = "PEC");
 
     // @@ config an element with an affine bounding box transformation
     // Computes constant Jacobian J and metric factors J^{-T}
@@ -157,6 +159,12 @@ public:
     int getNumHaloPoints() const { return m_numHaloPoints; }
     const std::vector<MpiHaloExchangeInfo>& getMpiHalos() const { return m_mpiHalos; }
 
+    // @@ UPML (Perfectly Matched Layer) configuration and precomputed data
+    void setPmlConfig(const PmlConfig& cfg) { m_pmlConfig = cfg; }
+    const PmlConfig& getPmlConfig() const { return m_pmlConfig; }
+    const PmlData& getPmlData() const { return m_pmlData; }
+    void setupPml();
+
 private:
     // @@ store polynomial degree parameters
     int m_N;
@@ -215,6 +223,10 @@ private:
     bool m_bIsPartitioned;
     int m_numHaloPoints;
     std::vector<MpiHaloExchangeInfo> m_mpiHalos;
+
+    // @@ UPML state
+    PmlConfig m_pmlConfig;
+    PmlData m_pmlData;
 };
 
 #endif // NW_SRC_MESH_HPP
