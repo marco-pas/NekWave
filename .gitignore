@@ -53,3 +53,8 @@ build_nekwave_lumi.sh
 *.err
 *.out
 .vscode/
+
+# Meshes
+meshing/*rea
+meshing/*msh
+meshing/*re2
