@@ -46,6 +46,7 @@ struct Config {
     std::string outputDir = "output";     // Output directory for CSVs and plots
     bool exportFields = false;            // Whether to export 3D volume nodal fields (field_initial.csv, field_final.csv)
     bool exportContinuousVtk = false;    // Whether to average DG interface nodes into a continuous CG mesh for ParaView
+    bool scatteredFieldMode = false;      // True to solve in Scattered-Field formulation (analytical incident wave on PEC, reconstruct total field on save)
 
     // Boundary condition settings (default outer BC: "PEC"; options: "PEC", "PMC", "PML", "PERIODIC")
     std::string defaultBc = "PEC";
@@ -228,6 +229,10 @@ struct Config {
         else if (lkey == "export_continuous_vtk" || lkey == "continuous_vtk" || lkey == "export_continuous") {
             std::string lv = toLower(trimVal);
             exportContinuousVtk = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
+        }
+        else if (lkey == "scattered_field_mode" || lkey == "scatteredfieldmode" || lkey == "scattered_field") {
+            std::string lv = toLower(trimVal);
+            scatteredFieldMode = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
         }
         else if (lkey == "periodic_x") {
             std::string lv = toLower(trimVal);

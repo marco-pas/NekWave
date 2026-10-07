@@ -3,14 +3,15 @@
 
   "mesh": {
     "type": "nekcem",
-    "file": "meshing/sphereRCS/spherePEC.rea"
+    "file": "meshing/sphereRCS_dense/spherePEC.rea"
   },
 
   "numerics": {
-    "order": 5,
+    "order": 7,
     "cfl": "auto",
     "dt": "auto",
     "c0": 1.0,
+    "scatteredFieldMode": true,
     "pml_thickness": 3,
     "pml_order": 3.0,
     "pml_reflect_err": 1.0e-6
@@ -18,12 +19,12 @@
 
   "time": {
     "final_time": 10.0,
-    "max_steps": 50000
+    "max_steps": 500000
   },
 
   "output": {
-    "output_frequency": 20,
-    "save_frequency": 150,
+    "output_frequency": 300,
+    "save_frequency": 300,
     "output_dir": "output_sphereRCS",
     "export_fields": true,
     "export_format": "hdf5",

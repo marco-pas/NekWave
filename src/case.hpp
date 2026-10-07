@@ -5,6 +5,7 @@
 #include "dg_solver.hpp"
 #include "config.hpp"
 #include "probe.hpp"
+#include "rcs.hpp"
 
 #include <memory>
 #include <string>
@@ -74,6 +75,13 @@ public:
     const SaveOptions& saveOptions() const { return saveOptions_; }
     SaveOptions& saveOptions() { return saveOptions_; }
 
+    // Near-to-Far-Field (NTFF) / Radar Cross Section (RCS) monitor configuration
+    void setRcsConfig(const RcsConfig& cfg) { rcsMonitor_.setConfig(cfg); }
+    const RcsConfig& rcsConfig() const { return rcsMonitor_.config(); }
+    RcsConfig& rcsConfig() { return rcsMonitor_.config(); }
+    const RcsMonitor& rcsMonitor() const { return rcsMonitor_; }
+    RcsMonitor& rcsMonitor() { return rcsMonitor_; }
+
     // 3-Phase Simulation Lifecycle
     void preprocess();
     void preprocess(const Config& cfg);
@@ -88,6 +96,7 @@ public:
     double getMaxE() const;
     double getMaxH() const;
     void saveFields(const std::string& filename, double time) const;
+    void reconstructTotalField(double time, StateVector& outTotalState) const;
 
     // Component accessors
     const Mesh& mesh() const { return *mesh_; }
@@ -131,6 +140,7 @@ private:
     std::unique_ptr<DgSolver> dgSolver_;
     std::unique_ptr<Hdf5Writer> hdf5Writer_;
     ProbeManager probes_;
+    RcsMonitor rcsMonitor_;
     StateVector state_;
 
     double dt_;

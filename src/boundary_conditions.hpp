@@ -2,6 +2,7 @@
 #define NW_SRC_BOUNDARY_CONDITIONS_HPP
 
 #include <array>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,56 @@ enum class BcType : int {
     PML      = 3, ///< Perfectly Matched Layer outer wall (PEC mirror termination + volume UPML)
     PERIODIC = 4, ///< Periodic domain wrap-around interface ("P", "PERIODIC")
     MPI_CUT  = 5  ///< Inter-rank MPI halo partition boundary ("MPI")
+};
+
+/**
+ * @brief Analytical incident plane-wave descriptor for Scattered-Field formulation (RCS).
+ *
+ * Represents a broadband Gaussian-modulated plane wave propagating in direction kHat
+ * with electric polarization eHat and magnetic polarization hHat = kHat x eHat:
+ *   s(r, t) = kHat . r - x0 - c * t   (with c = 1)
+ *   A(r, t) = E0 * cos(k0 * s) * exp(-s^2 / (2 * sigmaX^2))
+ *   E_inc(r, t) = A(r, t) * eHat
+ *   H_inc(r, t) = A(r, t) * hHat
+ */
+struct IncidentPlaneWaveConfig {
+    bool enabled = false;
+    double E0 = 1.0;            ///< Peak electric field amplitude
+    double k0 = 20.9439510239;  ///< Carrier wavenumber 2*pi / lambda0 (rad/m)
+    double x0 = -0.90;          ///< Initial pulse center along kHat (m)
+    double sigmaX = 0.14;       ///< Longitudinal Gaussian pulse width (m)
+    double sphereRadius = 0.30; ///< Scatterer PEC sphere radius for interior null-field masking (m)
+
+    double kx = 1.0, ky = 0.0, kz = 0.0;  ///< Unit propagation vector kHat
+    double ex = 0.0, ey = 0.0, ez = 1.0;  ///< Unit electric polarization vector eHat
+    double hx = 0.0, hy = -1.0, hz = 0.0; ///< Unit magnetic polarization vector hHat = kHat x eHat
+
+    void updateMagneticPolarization() {
+        hx = ky * ez - kz * ey;
+        hy = kz * ex - kx * ez;
+        hz = kx * ey - ky * ex;
+    }
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+    __host__ __device__
+#endif
+    void evaluate(double x, double y, double z, double t,
+                  double& Ex_inc, double& Ey_inc, double& Ez_inc,
+                  double& Hx_inc, double& Hy_inc, double& Hz_inc) const {
+        if (!enabled) {
+            Ex_inc = 0.0; Ey_inc = 0.0; Ez_inc = 0.0;
+            Hx_inc = 0.0; Hy_inc = 0.0; Hz_inc = 0.0;
+            return;
+        }
+        double s = (kx * x + ky * y + kz * z) - x0 - t;
+        double amp = E0 * std::cos(k0 * s) * std::exp(-(s * s) / (2.0 * sigmaX * sigmaX));
+        Ex_inc = amp * ex;
+        Ey_inc = amp * ey;
+        Ez_inc = amp * ez;
+        Hx_inc = amp * hx;
+        Hy_inc = amp * hy;
+        Hz_inc = amp * hz;
+    }
 };
 
 /**

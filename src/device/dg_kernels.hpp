@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include "gpu_runtime.hpp"
+#include "boundary_conditions.hpp"
 
 namespace nekwave {
 namespace device {
@@ -37,7 +38,9 @@ void launch_compute_flux(
     const int* d_volIdxPlus, const int* d_bcType,
     const double* d_nx, const double* d_ny, const double* d_nz,
     double* d_flux, double c0, int totalFacePoints, int stateStride,
-    cudaStream_t stream = nullptr
+    cudaStream_t stream = nullptr,
+    const double* d_fx = nullptr, const double* d_fy = nullptr, const double* d_fz = nullptr,
+    IncidentPlaneWaveConfig incWave = IncidentPlaneWaveConfig(), double stageTime = 0.0
 );
 
 /**

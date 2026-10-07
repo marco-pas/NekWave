@@ -244,7 +244,14 @@ if(HDF5_FOUND AND NOT NEKWAVE_HDF5_LIBS)
     endif()
     if(HDF5_C_LIB)
         set(NEKWAVE_HDF5_LIBS "${HDF5_C_LIB}")
-        message(STATUS "[NekWave] Explicitly linked HDF5 library: ${HDF5_C_LIB}")
+        if(NOT HDF5_INCLUDE_DIRS)
+            get_filename_component(_hdf5_lib_dir "${HDF5_C_LIB}" DIRECTORY)
+            get_filename_component(_hdf5_prefix "${_hdf5_lib_dir}" DIRECTORY)
+            if(EXISTS "${_hdf5_prefix}/include/hdf5.h")
+                set(HDF5_INCLUDE_DIRS "${_hdf5_prefix}/include")
+            endif()
+        endif()
+        message(STATUS "[NekWave] Explicitly linked HDF5 library: ${HDF5_C_LIB} (include: ${HDF5_INCLUDE_DIRS})")
     endif()
 endif()
 
@@ -267,6 +274,7 @@ set(NEKWAVE_CORE_SRCS
     src/mesh.cpp
     src/dg_solver.cpp
     src/probe.cpp
+    src/rcs.cpp
     src/case.cpp
     src/hdf5_writer.cpp
 )
@@ -296,7 +304,7 @@ if(HDF5_FOUND)
 endif()
 
 if(MPI_FOUND AND ENABLE_MPI)
-    target_include_directories(nekwave_core PUBLIC ${MPI_CXX_INCLUDE_PATH})
+    target_include_directories(nekwave_core PUBLIC ${MPI_CXX_INCLUDE_PATH} ${MPI_CXX_COMPILER_INCLUDE_DIRS})
     target_compile_definitions(nekwave_core PUBLIC NEKWAVE_ENABLE_MPI=1)
     target_link_libraries(nekwave_core PUBLIC ${NEKWAVE_MPI_LIBS})
     get_filename_component(MPI_LIB_DIR "${MPI_CXX_LIBRARIES}" DIRECTORY)

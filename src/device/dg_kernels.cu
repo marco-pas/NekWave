@@ -195,10 +195,15 @@ __global__ void gpu_restrict_faces_kernel(
  *        according to its BcType (INTERIOR, PERIODIC, MPI_CUT, PEC, PMC, PML).
  */
 __device__ __forceinline__ void apply_boundary_condition_jump(
-    int bcCode, int vP,
+    int p, int bcCode, int vP,
     const double* __restrict__ state, int stateStride,
     double Ex_m, double Ey_m, double Ez_m,
     double Hx_m, double Hy_m, double Hz_m,
+    const double* __restrict__ fx,
+    const double* __restrict__ fy,
+    const double* __restrict__ fz,
+    const IncidentPlaneWaveConfig& incWave,
+    double stageTime,
     double& dEx, double& dEy, double& dEz,
     double& dHx, double& dHy, double& dHz)
 {
@@ -214,11 +219,30 @@ __device__ __forceinline__ void apply_boundary_condition_jump(
         dHx = -2.0 * Hx_m;
         dHy = -2.0 * Hy_m;
         dHz = -2.0 * Hz_m;
-    } else if (bc == BcType::PEC || bc == BcType::PML || vP < 0) {
-        // Perfect Electric Conductor (PEC) and PML outer backing wall
-        // (matching cem_maxwell_pec_init & cem_maxwell_flux_pec in cem_maxwell.F):
-        //   n x E^+ = -n x E^- => [[E]] = -2 E^-
-        //   n x H^+ = +n x H^- => [[H]] = 0
+    } else if (bc == BcType::PEC) {
+        // Perfect Electric Conductor (PEC) scatterer boundary:
+        //   Total-field PEC:     n x E^+ = -n x E^-                 => [[E]] = -2 E^-
+        //   Scattered-field PEC: n x (E_scat + E_inc) = 0 on wall   => [[E_scat]] = -2 (E_scat^- + E_inc)
+        //   and [[H]] = 0 in both formulations.
+        if (incWave.enabled && fx != nullptr && fy != nullptr && fz != nullptr) {
+            double Ex_inc = 0.0, Ey_inc = 0.0, Ez_inc = 0.0;
+            double Hx_inc = 0.0, Hy_inc = 0.0, Hz_inc = 0.0;
+            incWave.evaluate(fx[p], fy[p], fz[p], stageTime,
+                             Ex_inc, Ey_inc, Ez_inc,
+                             Hx_inc, Hy_inc, Hz_inc);
+            dEx = -2.0 * (Ex_m + Ex_inc);
+            dEy = -2.0 * (Ey_m + Ey_inc);
+            dEz = -2.0 * (Ez_m + Ez_inc);
+        } else {
+            dEx = -2.0 * Ex_m;
+            dEy = -2.0 * Ey_m;
+            dEz = -2.0 * Ez_m;
+        }
+        dHx = 0.0;
+        dHy = 0.0;
+        dHz = 0.0;
+    } else if (bc == BcType::PML || vP < 0) {
+        // PML outer backing wall (PEC mirror termination for absorbed scattered/total wave):
         dEx = -2.0 * Ex_m;
         dEy = -2.0 * Ey_m;
         dEz = -2.0 * Ez_m;
@@ -273,7 +297,12 @@ __global__ void gpu_compute_flux_kernel(
     const double* __restrict__ ny,
     const double* __restrict__ nz,
     double* __restrict__ flux,
-    double c0, int totalFacePoints, int stateStride)
+    double c0, int totalFacePoints, int stateStride,
+    const double* __restrict__ fx,
+    const double* __restrict__ fy,
+    const double* __restrict__ fz,
+    IncidentPlaneWaveConfig incWave,
+    double stageTime)
 {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p < totalFacePoints) {
@@ -288,8 +317,9 @@ __global__ void gpu_compute_flux_kernel(
 
         double dEx, dEy, dEz, dHx, dHy, dHz;
         apply_boundary_condition_jump(
-            bcType[p], volIdxPlus[p], state, stateStride,
+            p, bcType[p], volIdxPlus[p], state, stateStride,
             Ex_m, Ey_m, Ez_m, Hx_m, Hy_m, Hz_m,
+            fx, fy, fz, incWave, stageTime,
             dEx, dEy, dEz, dHx, dHy, dHz
         );
 
@@ -661,14 +691,17 @@ void launch_compute_flux(
     const int* d_volIdxPlus, const int* d_bcType,
     const double* d_nx, const double* d_ny, const double* d_nz,
     double* d_flux, double c0, int totalFacePoints, int stateStride,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const double* d_fx, const double* d_fy, const double* d_fz,
+    IncidentPlaneWaveConfig incWave, double stageTime)
 {
     int blockSize = 256;
     int numBlocks = (totalFacePoints + blockSize - 1) / blockSize;
 
     gpu_compute_flux_kernel<<<numBlocks, blockSize, 0, stream>>>(
         d_state, d_fEN, d_fHN, d_volIdxPlus, d_bcType,
-        d_nx, d_ny, d_nz, d_flux, c0, totalFacePoints, stateStride
+        d_nx, d_ny, d_nz, d_flux, c0, totalFacePoints, stateStride,
+        d_fx, d_fy, d_fz, incWave, stageTime
     );
     NW_GPU_CHECK(cudaGetLastError());
 }

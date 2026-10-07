@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 #include <cstddef>
+#include "boundary_conditions.hpp"
 
 /**
  * @brief State vector type alias representing 6 electromagnetic field components:
@@ -56,6 +57,11 @@ public:
      * @return true on success, false otherwise.
      */
     bool initialize(const Mesh& mesh, double c0);
+
+    /**
+     * @brief Configures the analytical incident plane wave for Scattered-Field PEC boundary excitation.
+     */
+    void setIncidentWave(const IncidentPlaneWaveConfig& incWave);
 
     /**
      * @brief Copies initial condition state vector from host RAM to GPU VRAM.

@@ -69,12 +69,22 @@ public:
                  3134564353537.0 / 4481467310338.0,
                  2277821191437.0 / 14882151754819.0};
 
+        // 5-stage Carpenter-Kennedy (1994) stage time increments c_s (t_s = t_n + c_s * dt)
+        rk4c_ = {0.0,
+                 1432997174477.0 / 9575080441755.0,
+                 2526269341429.0 / 6820363962896.0,
+                 2006345519317.0 / 3224310063776.0,
+                 2802321613138.0 / 2924317926251.0};
+
         // ----------------------------------------------------------------------
         // Flatten 2D Face Quadrature Geometry for Coalesced GPU Streaming
         // ----------------------------------------------------------------------
         // Nanson's relation transforms reference normals to physical normals:
         //      n * dA = J * J^{-T} * n_ref * dA_ref
         const auto& faceData = mesh.getFaceData();
+        const auto& coordX = mesh.getCoordX();
+        const auto& coordY = mesh.getCoordY();
+        const auto& coordZ = mesh.getCoordZ();
         totalFacePoints_ = 0;
         for (const auto& fd : faceData) {
             totalFacePoints_ += fd.points.size();
@@ -88,6 +98,9 @@ public:
         std::vector<double> h_ny(totalFacePoints_);
         std::vector<double> h_nz(totalFacePoints_);
         std::vector<double> h_dA(totalFacePoints_);
+        std::vector<double> h_fx(totalFacePoints_);
+        std::vector<double> h_fy(totalFacePoints_);
+        std::vector<double> h_fz(totalFacePoints_);
 
         size_t ptIdx = 0;
         for (const auto& fd : faceData) {
@@ -98,6 +111,9 @@ public:
                 h_ny[ptIdx]          = pt.ny;
                 h_nz[ptIdx]          = pt.nz;
                 h_dA[ptIdx]          = pt.dA;
+                h_fx[ptIdx]          = coordX[pt.volIdxMinus];
+                h_fy[ptIdx]          = coordY[pt.volIdxMinus];
+                h_fz[ptIdx]          = coordZ[pt.volIdxMinus];
                 ptIdx++;
             }
         }
@@ -218,6 +234,12 @@ public:
         NW_GPU_CHECK(cudaMemcpyAsync(d_nz_, h_nz.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
         NW_GPU_CHECK(cudaMalloc(&d_dA_, totalFacePoints_ * sizeof(double)));
         NW_GPU_CHECK(cudaMemcpyAsync(d_dA_, h_dA.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_fx_, totalFacePoints_ * sizeof(double)));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_fx_, h_fx.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_fy_, totalFacePoints_ * sizeof(double)));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_fy_, h_fy.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_fz_, totalFacePoints_ * sizeof(double)));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_fz_, h_fz.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
 
         // ----------------------------------------------------------------------
         // 5. Allocate Scratch Face Trace and Numerical Flux Buffers
@@ -256,6 +278,11 @@ public:
         NW_GPU_CHECK(cudaStreamSynchronize(stream_));
         bInitialized_ = true;
         return true;
+    }
+
+    void setIncidentWave(const IncidentPlaneWaveConfig& incWave) {
+        incWave_ = incWave;
+        incWave_.updateMagneticPolarization();
     }
 
     void uploadState(const double* hostState, size_t size) {
@@ -323,7 +350,6 @@ public:
      * Zero host-device transfers occur during this method.
      */
     void step(double dt, double time) {
-        (void)time;
         assert(bInitialized_);
 #ifndef USE_HIP
         nvtxRangePushA("DgSolver::step");
@@ -347,6 +373,7 @@ public:
 
         // Advance through the 5 stages of Low-Storage Runge-Kutta (LSRK45)
         for (int stage = 0; stage < 5; ++stage) {
+            const double stageTime = time + rk4c_[stage] * dt;
 #ifndef USE_HIP
             nvtxRangePushA("LSRK45_Stage");
 #endif
@@ -480,7 +507,8 @@ public:
             // ------------------------------------------------------------------
             nekwave::device::launch_compute_flux(
                 d_state_, d_fEN_, d_fHN_, d_volIdxPlus_, d_bcType_,
-                d_nx_, d_ny_, d_nz_, d_flux_, c0_, totalFacePoints_, stateStride_, stream_
+                d_nx_, d_ny_, d_nz_, d_flux_, c0_, totalFacePoints_, stateStride_, stream_,
+                d_fx_, d_fy_, d_fz_, incWave_, stageTime
             );
 
             // ------------------------------------------------------------------
@@ -593,6 +621,9 @@ public:
         cudaFree(d_ny_); d_ny_ = nullptr;
         cudaFree(d_nz_); d_nz_ = nullptr;
         cudaFree(d_dA_); d_dA_ = nullptr;
+        if (d_fx_) { cudaFree(d_fx_); d_fx_ = nullptr; }
+        if (d_fy_) { cudaFree(d_fy_); d_fy_ = nullptr; }
+        if (d_fz_) { cudaFree(d_fz_); d_fz_ = nullptr; }
 
         cudaFree(d_fEN_); d_fEN_ = nullptr;
         cudaFree(d_fHN_); d_fHN_ = nullptr;
@@ -641,9 +672,11 @@ private:
     int maxPml_ = 0;
     int nptsPml_ = 0;
     double c0_;
+    IncidentPlaneWaveConfig incWave_;
 
     std::vector<double> rk4a_;
     std::vector<double> rk4b_;
+    std::vector<double> rk4c_;
 
     std::vector<MpiHaloExchangeInfo> haloExchanges_;
     std::vector<int> exchangeBufOffsets_;
@@ -668,6 +701,9 @@ private:
     double* d_ny_ = nullptr;
     double* d_nz_ = nullptr;
     double* d_dA_ = nullptr;
+    double* d_fx_ = nullptr;
+    double* d_fy_ = nullptr;
+    double* d_fz_ = nullptr;
 
     double* d_fEN_ = nullptr;
     double* d_fHN_ = nullptr;
@@ -699,6 +735,10 @@ DgSolver::~DgSolver() = default;
 
 bool DgSolver::initialize(const Mesh& mesh, double c0) {
     return impl_->initialize(mesh, c0);
+}
+
+void DgSolver::setIncidentWave(const IncidentPlaneWaveConfig& incWave) {
+    impl_->setIncidentWave(incWave);
 }
 
 void DgSolver::uploadState(const double* hostState, size_t size) {

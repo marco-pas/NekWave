@@ -46,43 +46,91 @@ int main(int argc, char* argv[]) {
     simulationCase.setWaveType("sphereRCS");
 
     // --------------------------------------------------------------------------
-    // Traveling Planar Wave Packet Initial Condition (+x propagation)
+    // Traveling Planar Wave Packet Parameters (+x propagation, +z polarization)
     // --------------------------------------------------------------------------
-    simulationCase.setInitialConditionHook([](double x, double y, double z,
-                                              double& ex, double& ey, double& ez,
-                                              double& hx, double& hy, double& hz) {
-        // Wave packet parameters (upstream of the r = 0.3 m PEC sphere, inside [-1.5, 1.5]^3 vacuum)
-        const double E0      = 1.0;                 // Peak electric field amplitude
-        const double x0      = -0.90;               // Initial pulse center along x (m)
-        const double sigmaX  = 0.14;                // Longitudinal Gaussian pulse width (m)
-        const double lambda0 = 0.30;                // Carrier wavelength (m) -> k0 * r_sphere = 2*pi
-        const double k0      = 2.0 * M_PI / lambda0;
-        const double wPerp   = 1.05;                // Flat-top transverse window half-width (m)
+    const double rSphere = 0.30;                // PEC sphere radius (m)
+    const double E0      = 1.0;                 // Peak electric field amplitude
+    const double x0      = -0.90;               // Initial pulse center along x (m)
+    const double sigmaX  = 0.14;                // Longitudinal Gaussian pulse width (m)
+    const double lambda0 = 0.30;                // Carrier wavelength (m) -> k0 * r_sphere = 2*pi
+    const double k0      = 2.0 * M_PI / lambda0;
+    const double wPerp   = 1.05;                // Flat-top transverse window half-width (m)
 
-        // Longitudinal Gaussian-modulated carrier wave along x
-        double dx = x - x0;
-        double envX = std::exp(-(dx * dx) / (2.0 * sigmaX * sigmaX));
-        double carrier = std::cos(k0 * dx);
+    const bool scatteredMode = simulationCase.config().scatteredFieldMode;
 
-        // Flat-top super-Gaussian transverse window W(y, z):
-        // W(y, z) ~ 1.0 across the sphere (|y|, |z| <= 0.3) and vanishes inside lateral PMLs
-        double ry2 = (y / wPerp) * (y / wPerp);
-        double rz2 = (z / wPerp) * (z / wPerp);
-        double ry8 = ry2 * ry2 * ry2 * ry2;
-        double rz8 = rz2 * rz2 * rz2 * rz2;
-        double windowYZ = std::exp(-(ry8 + rz8));
+    if (!scatteredMode) {
+        // Total-Field Mode: Initialize windowed traveling wave packet in volume at t = 0
+        simulationCase.setInitialConditionHook([=](double x, double y, double z,
+                                                   double& ex, double& ey, double& ez,
+                                                   double& hx, double& hy, double& hz) {
+            // Longitudinal Gaussian-modulated carrier wave along x
+            double dx = x - x0;
+            double envX = std::exp(-(dx * dx) / (2.0 * sigmaX * sigmaX));
+            double carrier = std::cos(k0 * dx);
 
-        double pulse = E0 * carrier * envX * windowYZ;
+            // Flat-top super-Gaussian transverse window W(y, z):
+            // W(y, z) ~ 1.0 across the sphere (|y|, |z| <= 0.3) and vanishes inside lateral PMLs
+            double ry2 = (y / wPerp) * (y / wPerp);
+            double rz2 = (z / wPerp) * (z / wPerp);
+            double ry8 = ry2 * ry2 * ry2 * ry2;
+            double rz8 = rz2 * rz2 * rz2 * rz2;
+            double windowYZ = std::exp(-(ry8 + rz8));
 
-        // TEM_x polarization: E = (0, 0, Ez), H = (0, Hy, 0) with Hy = -Ez for +x propagation
-        ex = 0.0;
-        ey = 0.0;
-        ez = pulse;
+            double pulse = E0 * carrier * envX * windowYZ;
 
-        hx = 0.0;
-        hy = -pulse;
-        hz = 0.0;
-    });
+            // TEM_x polarization: E = (0, 0, Ez), H = (0, Hy, 0) with Hy = -Ez for +x propagation
+            ex = 0.0;
+            ey = 0.0;
+            ez = pulse;
+
+            hx = 0.0;
+            hy = -pulse;
+            hz = 0.0;
+        });
+    } else if (Comm::isRoot()) {
+        std::cout << "[SETUP] Scattered-Field Mode active: volume initialized to E_scat = H_scat = 0;\n"
+                  << "        analytical 1D plane wave applied on PEC sphere and summed back on export." << std::endl;
+    }
+
+    // --------------------------------------------------------------------------
+    // Configure Near-to-Far-Field (NTFF) & Bistatic RCS Monitor on PEC Surface
+    // --------------------------------------------------------------------------
+    RcsConfig rcsCfg;
+    rcsCfg.enabled = true;
+    rcsCfg.sphereRadius = rSphere;
+    rcsCfg.numTheta = 361; // 0.5-degree angular resolution from 0 to 180 deg
+    rcsCfg.kHatInc = {{1.0, 0.0, 0.0}}; // +x incident wave propagation
+    rcsCfg.eHatInc = {{0.0, 0.0, 1.0}}; // +z electric field polarization
+
+    // Configure analytical incident plane wave for Scattered-Field PEC excitation & total-field save
+    rcsCfg.incidentPlaneWave.enabled      = scatteredMode;
+    rcsCfg.incidentPlaneWave.E0           = E0;
+    rcsCfg.incidentPlaneWave.k0           = k0;
+    rcsCfg.incidentPlaneWave.x0           = x0;
+    rcsCfg.incidentPlaneWave.sigmaX       = sigmaX;
+    rcsCfg.incidentPlaneWave.sphereRadius = rSphere;
+    rcsCfg.incidentPlaneWave.kx           = 1.0;
+    rcsCfg.incidentPlaneWave.ky           = 0.0;
+    rcsCfg.incidentPlaneWave.kz           = 0.0;
+    rcsCfg.incidentPlaneWave.ex           = 0.0;
+    rcsCfg.incidentPlaneWave.ey           = 0.0;
+    rcsCfg.incidentPlaneWave.ez           = 1.0;
+    rcsCfg.incidentPlaneWave.updateMagneticPolarization();
+
+    // Primary carrier wavenumber k0 first, followed by broadband sweep over ka in [0.5, 9.0]
+    rcsCfg.wavenumbers.push_back(k0);
+    const int numSweepFreqs = 85;
+    for (int m = 0; m <= numSweepFreqs; ++m) {
+        double ka = 0.5 + (8.5 * m) / static_cast<double>(numSweepFreqs);
+        rcsCfg.wavenumbers.push_back(ka / rSphere);
+    }
+
+    // Incident wave time waveform E_z^{inc}(0, t) at the sphere center r = (0, 0, 0)
+    rcsCfg.incidentWaveFn = [=](double t) {
+        double phaseX = -x0 - t; // x - x0 - c*t evaluated at x = 0, c = 1
+        return E0 * std::cos(k0 * phaseX) * std::exp(-(phaseX * phaseX) / (2.0 * sigmaX * sigmaX));
+    };
+    simulationCase.setRcsConfig(rcsCfg);
 
     // --------------------------------------------------------------------------
     // Configure Field Exports (HDF5 + XDMF for ParaView visualization)
