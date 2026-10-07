@@ -1,5 +1,9 @@
 #include "probe.hpp"
 #include "mesh.hpp"
+#include "comm.hpp"
+#ifdef NEKWAVE_ENABLE_MPI
+#include <mpi.h>
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -41,9 +45,10 @@ void ProbeManager::init(const Mesh& mesh,
     m_probes.clear();
 
     bool bSaveToFile = (!m_outputDir.empty() && m_outputDir != "none" && m_outputDir != "None" && m_outputDir != "NONE");
+    m_saveToFile = bSaveToFile;
 
     // Ensure output directory exists (POSIX mkdir) if output is enabled
-    if (bSaveToFile) {
+    if (bSaveToFile && Comm::isRoot()) {
         mkdir(m_outputDir.c_str(), 0755);
     }
 
@@ -61,7 +66,7 @@ void ProbeManager::init(const Mesh& mesh,
         p.targetY = targetCoords[i][1];
         p.targetZ = targetCoords[i][2];
 
-        // Find element containing this target point
+        // Find element containing this target point on the local partition
         int bestElem = 0;
         double refR = 0.0, refS = 0.0, refT = 0.0;
         double bestDistToElem = 1e20;
@@ -90,6 +95,19 @@ void ProbeManager::init(const Mesh& mesh,
             }
         }
 
+        // Determine unique owning MPI rank whose partition contains (or is closest to) the probe
+        p.ownedByLocalRank = true;
+#ifdef NEKWAVE_ENABLE_MPI
+        if (Comm::size() > 1) {
+            struct {
+                double val;
+                int rank;
+            } localMin{bestDistToElem, Comm::rank()}, globalMin{0.0, 0};
+            MPI_Allreduce(&localMin, &globalMin, 1, MPI_DOUBLE_INT, MPI_MINLOC, MPI_COMM_WORLD);
+            p.ownedByLocalRank = (Comm::rank() == globalMin.rank);
+        }
+#endif
+
         p.elemOffset = bestElem * ptsPerElem;
         std::vector<double> Lr = evalLagrange1D(gllZ, refR);
         std::vector<double> Ls = evalLagrange1D(gllZ, refS);
@@ -114,8 +132,8 @@ void ProbeManager::init(const Mesh& mesh,
         m_probes.push_back(p);
     }
 
-    // Open combined multi-probe time history CSV if output is enabled
-    if (bSaveToFile && !m_probes.empty()) {
+    // Open combined multi-probe time history CSV on Root rank if output is enabled
+    if (bSaveToFile && !m_probes.empty() && Comm::isRoot()) {
         std::string filename = m_outputDir + "/probe_history.csv";
         m_combinedFile.open(filename);
         if (!m_combinedFile.is_open()) {
@@ -176,25 +194,31 @@ void ProbeManager::init(const Mesh& mesh,
 
     m_initialized = true;
 
-    // Print probe locations summary
-    std::cout << "\nObservation Probes Configured (" << m_probes.size() << " locations):" << std::endl;
-    for (const auto& pr : m_probes) {
-        std::cout << "  Probe " << pr.id 
-                  << ": Exact Position (" << pr.actualX << ", " << pr.actualY << ", " << pr.actualZ << ")"
-                  << " [Spectral Element GLL Interpolated]" << std::endl;
-    }
-    if (bSaveToFile && !m_probes.empty()) {
-        std::cout << "Streaming probe history to: " << (m_outputDir + "/probe_history.csv") << std::endl;
+    // Print probe locations summary on Root rank only
+    if (Comm::isRoot()) {
+        std::cout << "\nObservation Probes Configured (" << m_probes.size() << " locations):" << std::endl;
+        for (const auto& pr : m_probes) {
+            std::cout << "  Probe " << pr.id 
+                      << ": Exact Position (" << pr.actualX << ", " << pr.actualY << ", " << pr.actualZ << ")"
+                      << " [Spectral Element GLL Interpolated]" << std::endl;
+        }
+        if (bSaveToFile && !m_probes.empty()) {
+            std::cout << "Streaming probe history to: " << (m_outputDir + "/probe_history.csv") << std::endl;
+        }
     }
 }
 
 // @@ recording field values at all observation probes via spectral interpolation
 void ProbeManager::record(int step, double time, const std::vector<double>& state, int npts) {
-    if (!m_combinedFile.is_open()) return;
+    if (!m_initialized || !m_saveToFile || m_probes.empty()) return;
 
-    m_combinedFile << step << "," << time;
+    const size_t numProbes = m_probes.size();
+    std::vector<double> localVals(6 * numProbes, 0.0);
 
-    for (const auto& pr : m_probes) {
+    for (size_t i = 0; i < numProbes; ++i) {
+        const auto& pr = m_probes[i];
+        if (!pr.ownedByLocalRank) continue;
+
         double Ex = 0.0, Ey = 0.0, Ez = 0.0, Hx = 0.0, Hy = 0.0, Hz = 0.0;
         int offset = pr.elemOffset;
         int nWeights = static_cast<int>(pr.interpWeights.size());
@@ -209,17 +233,50 @@ void ProbeManager::record(int step, double time, const std::vector<double>& stat
             Hz += w * state[5 * npts + idx];
         }
 
-        m_combinedFile << "," << Ex << "," << Ey << "," << Ez
-                       << "," << Hx << "," << Hy << "," << Hz;
+        localVals[6 * i + 0] = Ex;
+        localVals[6 * i + 1] = Ey;
+        localVals[6 * i + 2] = Ez;
+        localVals[6 * i + 3] = Hx;
+        localVals[6 * i + 4] = Hy;
+        localVals[6 * i + 5] = Hz;
     }
-    m_combinedFile << "\n";
+
+    std::vector<double> globalVals(6 * numProbes, 0.0);
+#ifdef NEKWAVE_ENABLE_MPI
+    if (Comm::size() > 1) {
+        MPI_Reduce(localVals.data(), globalVals.data(), static_cast<int>(localVals.size()),
+                   MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    } else {
+        globalVals = localVals;
+    }
+#else
+    globalVals = localVals;
+#endif
+
+    if (Comm::isRoot() && m_combinedFile.is_open()) {
+        m_combinedFile << step << "," << time;
+        for (size_t i = 0; i < numProbes; ++i) {
+            m_combinedFile << "," << globalVals[6 * i + 0]
+                           << "," << globalVals[6 * i + 1]
+                           << "," << globalVals[6 * i + 2]
+                           << "," << globalVals[6 * i + 3]
+                           << "," << globalVals[6 * i + 4]
+                           << "," << globalVals[6 * i + 5];
+        }
+        m_combinedFile << "\n";
+        if (step % 20 == 0) {
+            m_combinedFile.flush();
+        }
+    }
 }
 
 // @@ finalizing probe streams and closing file handles
 void ProbeManager::finalize() {
     if (m_combinedFile.is_open()) {
         m_combinedFile.close();
-        std::cout << "Exported multi-probe time history to " << m_outputDir << "/probe_history.csv" << std::endl;
+        if (Comm::isRoot()) {
+            std::cout << "Exported multi-probe time history to " << m_outputDir << "/probe_history.csv" << std::endl;
+        }
     }
     m_initialized = false;
 }

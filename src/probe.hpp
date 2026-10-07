@@ -26,6 +26,7 @@ struct ProbePoint {
 
     // Spectral element Lagrange polynomial interpolation
     int elemOffset = 0;
+    bool ownedByLocalRank = true;
     std::vector<double> interpWeights;
 };
 
@@ -59,6 +60,7 @@ private:
     std::string m_outputDir;
     std::ofstream m_combinedFile;
     bool m_initialized = false;
+    bool m_saveToFile = false;
 };
 
 #endif // NW_SRC_PROBE_HPP

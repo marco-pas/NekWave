@@ -9,6 +9,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 
 #ifdef NEKWAVE_HAVE_HDF5
 #include <hdf5.h>
@@ -41,6 +42,8 @@ struct Hdf5Writer::Impl {
 
     std::vector<std::pair<int, double>> recordedSteps;
     std::vector<double> meshCoords;
+    std::vector<int> allNpts;
+    std::vector<int> allTotalCells;
 
 #ifdef NEKWAVE_HAVE_HDF5
     hid_t fileId = -1;
@@ -51,6 +54,30 @@ struct Hdf5Writer::Impl {
 
     ~Impl() {
         close();
+    }
+
+    void updateXdmfDescriptors(bool logMaster = false) {
+#ifdef NEKWAVE_HAVE_HDF5
+        int outPts = exportContinuous ? numCgPoints : npts;
+        if (enableXdmf && !xmfPath.empty()) {
+            writeXdmfDescriptor(xmfPath, fileStem + ".h5", outPts, recordedSteps, totalCells, useHexCells, &saveOptions);
+        }
+
+#ifdef NEKWAVE_ENABLE_MPI
+        if (Comm::size() > 1 && enableXdmf) {
+            Comm::barrier();
+            if (Comm::isRoot() && !allNpts.empty() && !allTotalCells.empty()) {
+                std::string masterXmfPath = outDir + "/" + baseStem + ".xmf";
+                writeMasterXdmfDescriptor(masterXmfPath, baseStem, Comm::size(), allNpts, allTotalCells, recordedSteps, useHexCells, &saveOptions);
+                if (logMaster) {
+                    std::cout << "[HDF5] Updated master XDMF descriptor: " << masterXmfPath
+                              << " (" << Comm::size() << " MPI partitions across "
+                              << recordedSteps.size() << " time steps)" << std::endl;
+                }
+            }
+        }
+#endif
+#endif
     }
 
     void close() {
@@ -65,26 +92,7 @@ struct Hdf5Writer::Impl {
             H5Fclose(fileId);
             fileId = -1;
         }
-        int outPts = exportContinuous ? numCgPoints : npts;
-        if (enableXdmf && !xmfPath.empty()) {
-            writeXdmfDescriptor(xmfPath, fileStem + ".h5", outPts, recordedSteps, totalCells, useHexCells, &saveOptions);
-        }
-
-#ifdef NEKWAVE_ENABLE_MPI
-        if (Comm::size() > 1 && enableXdmf) {
-            int localTotalCells = totalCells;
-            std::vector<int> allNpts(Comm::size(), 0);
-            std::vector<int> allTotalCells(Comm::size(), 0);
-
-            MPI_Gather(&outPts, 1, MPI_INT, allNpts.data(), 1, MPI_INT, 0, Comm::world());
-            MPI_Gather(&localTotalCells, 1, MPI_INT, allTotalCells.data(), 1, MPI_INT, 0, Comm::world());
-
-            if (Comm::isRoot()) {
-                std::string masterXmfPath = outDir + "/" + baseStem + ".xmf";
-                writeMasterXdmfDescriptor(masterXmfPath, baseStem, Comm::size(), allNpts, allTotalCells, recordedSteps, useHexCells, &saveOptions);
-            }
-        }
-#endif
+        updateXdmfDescriptors(true);
 #else
         if (binFile.is_open()) {
             binFile.close();
@@ -639,6 +647,17 @@ bool Hdf5Writer::initialize(const std::string& h5Path, const Mesh& mesh, bool en
         }
     }
 
+#ifdef NEKWAVE_ENABLE_MPI
+    if (Comm::size() > 1 && impl_->enableXdmf) {
+        int outPtsLocal = impl_->exportContinuous ? impl_->numCgPoints : impl_->npts;
+        int localTotalCells = impl_->totalCells;
+        impl_->allNpts.assign(Comm::size(), 0);
+        impl_->allTotalCells.assign(Comm::size(), 0);
+        MPI_Gather(&outPtsLocal, 1, MPI_INT, impl_->allNpts.data(), 1, MPI_INT, 0, Comm::world());
+        MPI_Gather(&localTotalCells, 1, MPI_INT, impl_->allTotalCells.data(), 1, MPI_INT, 0, Comm::world());
+    }
+#endif
+
 #ifdef NEKWAVE_HAVE_HDF5
     setenv("HDF5_USE_FILE_LOCKING", "FALSE", 1);
     hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
@@ -709,6 +728,10 @@ bool Hdf5Writer::initialize(const std::string& h5Path, const Mesh& mesh, bool en
     H5Gclose(meshGroup);
 
     impl_->timeSeriesGroup = H5Gcreate2(impl_->fileId, "/time_series", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    H5Gclose(impl_->timeSeriesGroup);
+    impl_->timeSeriesGroup = -1;
+    H5Fclose(impl_->fileId);
+    impl_->fileId = -1;
 
     std::cout << "[HDF5] Initialized binary HDF5 archive: " << impl_->h5Path 
               << " (" << outPts << " collocation nodes)" << std::endl;
@@ -743,9 +766,30 @@ bool Hdf5Writer::writeStep(int step, double time, const double* state, int npts,
     impl_->recordedSteps.push_back({step, time});
 
 #ifdef NEKWAVE_HAVE_HDF5
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+#if defined(H5_VERSION_GE) && H5_VERSION_GE(1, 10, 7)
+    H5Pset_file_locking(fapl, false, true);
+#endif
+    impl_->fileId = H5Fopen(impl_->h5Path.c_str(), H5F_ACC_RDWR, fapl);
+    H5Pclose(fapl);
+    if (impl_->fileId < 0) return false;
+
+    impl_->timeSeriesGroup = H5Gopen2(impl_->fileId, "/time_series", H5P_DEFAULT);
+    if (impl_->timeSeriesGroup < 0) {
+        H5Fclose(impl_->fileId);
+        impl_->fileId = -1;
+        return false;
+    }
+
     std::string stepName = "step_" + std::to_string(step);
     hid_t stepGroup = H5Gcreate2(impl_->timeSeriesGroup, stepName.c_str(), H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-    if (stepGroup < 0) return false;
+    if (stepGroup < 0) {
+        H5Gclose(impl_->timeSeriesGroup);
+        impl_->timeSeriesGroup = -1;
+        H5Fclose(impl_->fileId);
+        impl_->fileId = -1;
+        return false;
+    }
 
     hid_t scalarSpace = H5Screate(H5S_SCALAR);
     hid_t attrTime = H5Acreate2(stepGroup, "time", H5T_IEEE_F64LE, scalarSpace, H5P_DEFAULT, H5P_DEFAULT);
@@ -1014,7 +1058,13 @@ bool Hdf5Writer::writeStep(int step, double time, const double* state, int npts,
     H5Sclose(fieldSpace);
     H5Gclose(stepGroup);
 
+    H5Gclose(impl_->timeSeriesGroup);
+    impl_->timeSeriesGroup = -1;
     H5Fflush(impl_->fileId, H5F_SCOPE_LOCAL);
+    H5Fclose(impl_->fileId);
+    impl_->fileId = -1;
+
+    impl_->updateXdmfDescriptors(step == 0);
 #else
     int32_t stepHeader[2] = {step, 0};
     impl_->binFile.write(reinterpret_cast<const char*>(stepHeader), sizeof(stepHeader));
@@ -1066,7 +1116,8 @@ bool Hdf5Writer::writeXdmfDescriptor(
     FieldSaveOptions defaultOpts;
     const FieldSaveOptions& opts = (options != nullptr) ? *options : defaultOpts;
 
-    std::ofstream xmf(xmfPath);
+    std::string tmpPath = xmfPath + ".tmp";
+    std::ofstream xmf(tmpPath);
     if (!xmf.is_open()) return false;
 
     xmf << "<?xml version=\"1.0\" ?>\n";
@@ -1177,7 +1228,9 @@ bool Hdf5Writer::writeXdmfDescriptor(
     xmf << "  </Domain>\n";
     xmf << "</Xdmf>\n";
 
+    xmf.flush();
     xmf.close();
+    std::rename(tmpPath.c_str(), xmfPath.c_str());
     return true;
 }
 
@@ -1194,7 +1247,8 @@ bool Hdf5Writer::writeMasterXdmfDescriptor(
     FieldSaveOptions defaultOpts;
     const FieldSaveOptions& opts = (options != nullptr) ? *options : defaultOpts;
 
-    std::ofstream xmf(xmfPath);
+    std::string tmpPath = xmfPath + ".tmp";
+    std::ofstream xmf(tmpPath);
     if (!xmf.is_open()) return false;
 
     xmf << "<?xml version=\"1.0\" ?>\n";
@@ -1314,9 +1368,8 @@ bool Hdf5Writer::writeMasterXdmfDescriptor(
     xmf << "  </Domain>\n";
     xmf << "</Xdmf>\n";
 
+    xmf.flush();
     xmf.close();
-    std::cout << "[HDF5] Generated master XDMF descriptor: " << xmfPath 
-              << " (" << numRanks << " MPI partitions combined across " 
-              << stepTimes.size() << " time steps)" << std::endl;
+    std::rename(tmpPath.c_str(), xmfPath.c_str());
     return true;
 }
