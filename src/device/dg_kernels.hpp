@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include "gpu_runtime.hpp"
+#include "boundary_conditions.hpp"
 
 namespace nekwave {
 namespace device {
@@ -30,14 +31,16 @@ void launch_restrict_faces(
 );
 
 /**
- * @brief Launches numerical surface flux evaluation kernel (Central flux + PEC).
+ * @brief Launches numerical surface flux evaluation kernel (Central/Upwind flux + PEC/PMC/PML/Periodic BCs).
  */
 void launch_compute_flux(
     const double* d_state, const double* d_fEN, const double* d_fHN,
-    const int* d_volIdxPlus, const int* d_isPEC,
+    const int* d_volIdxPlus, const int* d_bcType,
     const double* d_nx, const double* d_ny, const double* d_nz,
     double* d_flux, double c0, int totalFacePoints, int stateStride,
-    cudaStream_t stream = nullptr
+    cudaStream_t stream = nullptr,
+    const double* d_fx = nullptr, const double* d_fy = nullptr, const double* d_fz = nullptr,
+    IncidentPlaneWaveConfig incWave = IncidentPlaneWaveConfig(), double stageTime = 0.0
 );
 
 /**
@@ -46,6 +49,18 @@ void launch_compute_flux(
 void launch_add_flux(
     const double* d_flux, const int* d_volIdxMinus, const double* d_dA,
     double* d_rhs, int totalFacePoints, int npts,
+    cudaStream_t stream = nullptr
+);
+
+/**
+ * @brief Launches UPML Auxiliary Differential Equations (ADE) volume step kernel (matching NekCEM's pml_step).
+ */
+void launch_pml_step(
+    const double* d_state, double* d_rhs,
+    const double* d_pmlAux, double* d_resPmlAux,
+    const int* d_pmlPtr, const double* d_pmlSigma,
+    const double* d_jac, const double* d_w3,
+    int maxPml, int nxyz, int npts, int stateStride,
     cudaStream_t stream = nullptr
 );
 

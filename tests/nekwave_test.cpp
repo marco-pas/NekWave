@@ -1,6 +1,7 @@
 // Verification and Unit Tests
 
 #include "mesh.hpp"
+#include "boundary_conditions.hpp"
 #include "dg_solver.hpp"
 #include "config.hpp"
 #include "probe.hpp"
@@ -436,7 +437,7 @@ void JsonConfigLoadingTest() {
             "periodic_x": true
         },
         "numerics": {
-            "order": 5,
+            "poly_order": 5,
             "cfl": "auto",
             "dt": 0.001,
             "c0": 0.5
@@ -450,7 +451,11 @@ void JsonConfigLoadingTest() {
             "save_frequency": 100,
             "output_dir": "test_output",
             "export_fields": true,
-            "export_format": "hdf5"
+            "export_format": "hdf5",
+            "export_continuous": true,
+            "export_precision": "float32",
+            "hdf5_compression": 2,
+            "hdf5_shuffle": true
         },
         "probes": [
             [0.1, 0.2, 0.3],
@@ -476,7 +481,8 @@ void JsonConfigLoadingTest() {
     EXPECT_NEAR(cfg.zmin,  0.0, 1e-12);
     EXPECT_NEAR(cfg.zmax,  3.0, 1e-12);
     EXPECT_TRUE(cfg.periodicX);
-    EXPECT_TRUE(cfg.order == 5);
+    EXPECT_TRUE(cfg.polyOrder == 5);
+    EXPECT_TRUE(cfg.order == 6);
     EXPECT_NEAR(cfg.dt, 0.001, 1e-12);
     EXPECT_NEAR(cfg.c0, 0.5, 1e-12);
     EXPECT_NEAR(cfg.finalTime, 12.5, 1e-12);
@@ -486,6 +492,10 @@ void JsonConfigLoadingTest() {
     EXPECT_TRUE(cfg.outputDir == "test_output");
     EXPECT_TRUE(cfg.exportFields);
     EXPECT_TRUE(cfg.exportFormat == "hdf5");
+    EXPECT_TRUE(cfg.exportContinuous);
+    EXPECT_TRUE(cfg.exportPrecision == "float32");
+    EXPECT_TRUE(cfg.hdf5Compression == 2);
+    EXPECT_TRUE(cfg.hdf5Shuffle);
     EXPECT_TRUE(cfg.probes.size() == 2);
     EXPECT_NEAR(cfg.probes[0][0], 0.1, 1e-12);
     EXPECT_NEAR(cfg.probes[1][1], 1.5, 1e-12);
@@ -500,7 +510,7 @@ void JsonConfigLoadingTest() {
             "file": "contrib/NekCEM/tests/3dboxpec/3dboxpec.rea"
         },
         "numerics": {
-            "order": 4,
+            "poly_order": 4,
             "c0": 0.0
         }
     })";
@@ -508,12 +518,84 @@ void JsonConfigLoadingTest() {
     nekwave::JsonValue rootNek = nekwave::JsonValue::parse(nekcemJson);
     cfgNek.loadFromJson(rootNek);
     EXPECT_TRUE(cfgNek.meshFile == "contrib/NekCEM/tests/3dboxpec/3dboxpec.rea");
-    EXPECT_TRUE(cfgNek.order == 4);
+    EXPECT_TRUE(cfgNek.polyOrder == 4);
+    EXPECT_TRUE(cfgNek.order == 5);
 
     // Test 3: Programmatic wave_type in C++ Case
     Case c;
     c.setWaveType("3dboxpec");
     EXPECT_TRUE(c.waveType() == "3dboxpec");
+
+    g_testsPassed++;
+    std::cout << "  PASSED" << std::endl;
+}
+
+/*
+ * Test 7: Boundary Conditions Module (PEC, PMC, PML, Periodic) & NekCEM UPML Setup
+ */
+void BoundaryConditionsAndPmlTest() {
+    std::cout << "[RUN] BoundaryConditionsAndPmlTest..." << std::endl;
+
+    // 1. Verify tag parsing for PEC, PMC, PML, Periodic, Interior, MPI
+    EXPECT_TRUE(BoundaryConditions::parseBcTag("PEC") == BcType::PEC);
+    EXPECT_TRUE(BoundaryConditions::parseBcTag("W")   == BcType::PEC);
+    EXPECT_TRUE(BoundaryConditions::parseBcTag("PMC") == BcType::PMC);
+    EXPECT_TRUE(BoundaryConditions::parseBcTag("SYM") == BcType::PMC);
+    EXPECT_TRUE(BoundaryConditions::parseBcTag("PML") == BcType::PML);
+    EXPECT_TRUE(BoundaryConditions::parseBcTag("P")   == BcType::PERIODIC);
+    EXPECT_TRUE(BoundaryConditions::parseBcTag("PERIODIC") == BcType::PERIODIC);
+    EXPECT_TRUE(BoundaryConditions::parseBcTag("E")   == BcType::INTERIOR);
+    EXPECT_TRUE(BoundaryConditions::parseBcTag("MPI") == BcType::MPI_CUT);
+
+    // 2. Verify NekCEM UPML inward marching and polynomial conductivity on a 6x6x6 box
+    const int N = 4;
+    Mesh pmlMesh(N, 1);
+    PmlConfig pmlCfg;
+    pmlCfg.thickness = 1;
+    pmlCfg.order = 3.0;
+    pmlCfg.reflectErr = 1.0e-6;
+    pmlMesh.setPmlConfig(pmlCfg);
+
+    // 6x6x6 box on [-1, 1]^3 with outer boundary = "PML"
+    pmlMesh.createBoxMesh(6, 6, 6, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0,
+                          false, false, false, "PML");
+
+    const PmlData& pmlData = pmlMesh.getPmlData();
+    EXPECT_TRUE(pmlData.enabled);
+    // 6^3 = 216 total elements, inner 4^3 = 64 non-PML elements => 216 - 64 = 152 PML elements
+    EXPECT_TRUE(pmlData.maxPml == 152);
+
+    // Verify inner and outer PML extents on [-1, 1]^3 with 1-element layer (element width = 2.0 / 6.0 = 1/3)
+    for (int f = 0; f < 6; ++f) {
+        double expectedOuter = (f % 2 == 0) ? -1.0 : 1.0;
+        double expectedInner = (f % 2 == 0) ? (-1.0 + 1.0 / 3.0) : (1.0 - 1.0 / 3.0);
+        EXPECT_NEAR(pmlData.pmlOuter[f], expectedOuter, 1e-12);
+        EXPECT_NEAR(pmlData.pmlInner[f], expectedInner, 1e-12);
+    }
+
+    // 3. Run GPU DgSolver with UPML auxiliary differential equations active
+    DgSolver solver;
+    EXPECT_TRUE(solver.initialize(pmlMesh, 1.0));
+
+    const int npts = pmlMesh.getTotalPoints();
+    StateVector state(6 * npts, 0.0);
+    const auto& x = pmlMesh.getCoordX();
+    const auto& y = pmlMesh.getCoordY();
+    const auto& z = pmlMesh.getCoordZ();
+    for (int i = 0; i < npts; ++i) {
+        double r2 = x[i] * x[i] + y[i] * y[i] + z[i] * z[i];
+        state[2 * npts + i] = std::exp(-25.0 * r2);
+    }
+
+    solver.uploadState(state.data(), state.size());
+    for (int s = 0; s < 5; ++s) {
+        solver.step(0.002, s * 0.002);
+    }
+    solver.downloadState(state.data(), state.size());
+    for (int i = 0; i < 6 * npts; ++i) {
+        EXPECT_TRUE(!std::isnan(state[i]) && !std::isinf(state[i]));
+    }
+    solver.finalize();
 
     g_testsPassed++;
     std::cout << "  PASSED" << std::endl;
@@ -532,6 +614,7 @@ void JsonConfigLoadingTest() {
  *   ./nekwave-test MaxwellStabilityTest     (runs only MaxwellStabilityTest)
  *   ./nekwave-test CaseInputLoadingTest     (runs only CaseInputLoadingTest)
  *   ./nekwave-test PeriodicBCTest           (runs only PeriodicBCTest)
+ *   ./nekwave-test BoundaryConditionsAndPmlTest (runs only BoundaryConditionsAndPmlTest)
  */
 int main(int argc, char* argv[]) {
     std::string filter = (argc > 1) ? argv[1] : "";
@@ -560,6 +643,9 @@ int main(int argc, char* argv[]) {
     }
     if (filter.empty() || filter == "JsonConfigLoadingTest") {
         JsonConfigLoadingTest();
+    }
+    if (filter.empty() || filter == "BoundaryConditionsAndPmlTest") {
+        BoundaryConditionsAndPmlTest();
     }
 
 

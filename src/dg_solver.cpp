@@ -1,5 +1,6 @@
 #include "dg_solver.hpp"
 #include "mesh.hpp"
+#include "boundary_conditions.hpp"
 #include "comm.hpp"
 #include "device/dg_kernels.hpp"
 #include "device/gpu_runtime.hpp"
@@ -68,12 +69,22 @@ public:
                  3134564353537.0 / 4481467310338.0,
                  2277821191437.0 / 14882151754819.0};
 
+        // 5-stage Carpenter-Kennedy (1994) stage time increments c_s (t_s = t_n + c_s * dt)
+        rk4c_ = {0.0,
+                 1432997174477.0 / 9575080441755.0,
+                 2526269341429.0 / 6820363962896.0,
+                 2006345519317.0 / 3224310063776.0,
+                 2802321613138.0 / 2924317926251.0};
+
         // ----------------------------------------------------------------------
         // Flatten 2D Face Quadrature Geometry for Coalesced GPU Streaming
         // ----------------------------------------------------------------------
         // Nanson's relation transforms reference normals to physical normals:
         //      n * dA = J * J^{-T} * n_ref * dA_ref
         const auto& faceData = mesh.getFaceData();
+        const auto& coordX = mesh.getCoordX();
+        const auto& coordY = mesh.getCoordY();
+        const auto& coordZ = mesh.getCoordZ();
         totalFacePoints_ = 0;
         for (const auto& fd : faceData) {
             totalFacePoints_ += fd.points.size();
@@ -81,32 +92,28 @@ public:
 
         std::vector<int> h_volIdxMinus(totalFacePoints_);
         std::vector<int> h_volIdxPlus(totalFacePoints_);
-        std::vector<int> h_bcType(totalFacePoints_);
+        std::vector<int> h_bcType;
+        BoundaryConditions::buildFacePointBcTypes(mesh, h_bcType);
         std::vector<double> h_nx(totalFacePoints_);
         std::vector<double> h_ny(totalFacePoints_);
         std::vector<double> h_nz(totalFacePoints_);
         std::vector<double> h_dA(totalFacePoints_);
+        std::vector<double> h_fx(totalFacePoints_);
+        std::vector<double> h_fy(totalFacePoints_);
+        std::vector<double> h_fz(totalFacePoints_);
 
         size_t ptIdx = 0;
         for (const auto& fd : faceData) {
-            int bcCode = 0;
-            if (fd.bcType == "PEC" || fd.bcType == "W" || fd.bcType == "V" || fd.bcType == "v") {
-                bcCode = 1;
-            } else if (fd.bcType == "PMC" || fd.bcType == "SYM" || fd.bcType == "S" || fd.bcType == "s") {
-                bcCode = 2;
-            }
             for (const auto& pt : fd.points) {
                 h_volIdxMinus[ptIdx] = pt.volIdxMinus;
                 h_volIdxPlus[ptIdx]  = pt.volIdxPlus;
-                int ptBc = bcCode;
-                if (pt.volIdxPlus < 0 && ptBc == 0) {
-                    ptBc = 1; // Default boundary to PEC if no neighbor
-                }
-                h_bcType[ptIdx]      = ptBc;
                 h_nx[ptIdx]          = pt.nx;
                 h_ny[ptIdx]          = pt.ny;
                 h_nz[ptIdx]          = pt.nz;
                 h_dA[ptIdx]          = pt.dA;
+                h_fx[ptIdx]          = coordX[pt.volIdxMinus];
+                h_fy[ptIdx]          = coordY[pt.volIdxMinus];
+                h_fz[ptIdx]          = coordZ[pt.volIdxMinus];
                 ptIdx++;
             }
         }
@@ -227,6 +234,12 @@ public:
         NW_GPU_CHECK(cudaMemcpyAsync(d_nz_, h_nz.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
         NW_GPU_CHECK(cudaMalloc(&d_dA_, totalFacePoints_ * sizeof(double)));
         NW_GPU_CHECK(cudaMemcpyAsync(d_dA_, h_dA.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_fx_, totalFacePoints_ * sizeof(double)));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_fx_, h_fx.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_fy_, totalFacePoints_ * sizeof(double)));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_fy_, h_fy.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_fz_, totalFacePoints_ * sizeof(double)));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_fz_, h_fz.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
 
         // ----------------------------------------------------------------------
         // 5. Allocate Scratch Face Trace and Numerical Flux Buffers
@@ -235,9 +248,41 @@ public:
         NW_GPU_CHECK(cudaMalloc(&d_fHN_, 3 * totalFacePoints_ * sizeof(double)));
         NW_GPU_CHECK(cudaMalloc(&d_flux_, 6 * totalFacePoints_ * sizeof(double)));
 
+        // ----------------------------------------------------------------------
+        // 6. Allocate & Upload UPML Auxiliary Fields and Conductivity Buffers
+        // ----------------------------------------------------------------------
+        PmlData localPml = mesh.getPmlData();
+        if (!localPml.enabled && BoundaryConditions::hasPmlFaces(mesh)) {
+            localPml = BoundaryConditions::initializePml(mesh, mesh.getPmlConfig());
+        }
+
+        maxPml_ = localPml.maxPml;
+        nptsPml_ = maxPml_ * nxyz_;
+        if (maxPml_ > 0) {
+            NW_GPU_CHECK(cudaMalloc(&d_pmlPtr_, maxPml_ * sizeof(int)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_pmlPtr_, localPml.pmlPtr.data(), maxPml_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_pmlSigma_, 3 * npts_ * sizeof(double)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_pmlSigma_, localPml.pmlSigma.data(), 3 * npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_pmlAux_, 6 * nptsPml_ * sizeof(double)));
+            NW_GPU_CHECK(cudaMemsetAsync(d_pmlAux_, 0, 6 * nptsPml_ * sizeof(double), stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_kPmlAux_, 6 * nptsPml_ * sizeof(double)));
+            NW_GPU_CHECK(cudaMemsetAsync(d_kPmlAux_, 0, 6 * nptsPml_ * sizeof(double), stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_resPmlAux_, 6 * nptsPml_ * sizeof(double)));
+            NW_GPU_CHECK(cudaMemsetAsync(d_resPmlAux_, 0, 6 * nptsPml_ * sizeof(double), stream_));
+        }
+
         NW_GPU_CHECK(cudaStreamSynchronize(stream_));
         bInitialized_ = true;
         return true;
+    }
+
+    void setIncidentWave(const IncidentPlaneWaveConfig& incWave) {
+        incWave_ = incWave;
+        incWave_.updateMagneticPolarization();
     }
 
     void uploadState(const double* hostState, size_t size) {
@@ -294,8 +339,9 @@ public:
      *   2) Volume curl evaluated directly in shared-memory on chip (+curl(H), -curl(E))
      *   3) MPI_Waitall + unpack received ghost traces into d_state_
      *   4) Interior fields restricted to element face quadrature nodes (fEN, fHN)
-     *   5) Numerical surface Riemann fluxes computed (Central vs Upwind + PEC)
+     *   5) Numerical surface Riemann fluxes computed (Central vs Upwind + PEC/PMC/PML/Periodic)
      *   6) Numerical surface fluxes lifted into volume residuals (atomic additions)
+     *   6b) If UPML active: evaluate ADE auxiliary equations (pml_step) for DN, BN, EN, HN
      *   7) Scaled by exact diagonal inverse mass matrix: 1 / (J * w_i * w_j * w_k)
      *   8) LSRK45 state & auxiliary vector update:
      *          k = a_s * k + dt * rhs
@@ -304,7 +350,6 @@ public:
      * Zero host-device transfers occur during this method.
      */
     void step(double dt, double time) {
-        (void)time;
         assert(bInitialized_);
 #ifndef USE_HIP
         nvtxRangePushA("DgSolver::step");
@@ -328,6 +373,7 @@ public:
 
         // Advance through the 5 stages of Low-Storage Runge-Kutta (LSRK45)
         for (int stage = 0; stage < 5; ++stage) {
+            const double stageTime = time + rk4c_[stage] * dt;
 #ifndef USE_HIP
             nvtxRangePushA("LSRK45_Stage");
 #endif
@@ -453,17 +499,16 @@ public:
             );
 
             // ------------------------------------------------------------------
-            // Step 4: Compute numerical surface fluxes (Central or Upwind + PEC)
+            // Step 4: Compute numerical surface fluxes (Central or Upwind + PEC/PMC/PML/Periodic)
             // Evaluates jumps [[E]] = E^+ - E^-, [[H]] = H^+ - H^-
             // Upwind/Central numerical flux matching NekCEM lines 991-996:
             //   F^*_H = -0.5 * (n x [[E]]) - 0.5 * C0 * (n x (n x [[H]]))
             //   F^*_E = +0.5 * (n x [[H]]) - 0.5 * C0 * (n x (n x [[E]]))
-            // PEC mirror boundary conditions:
-            //   n x E^+ = -n x E^- => [[E]] = -2 E^-,  [[H]] = 0
             // ------------------------------------------------------------------
             nekwave::device::launch_compute_flux(
                 d_state_, d_fEN_, d_fHN_, d_volIdxPlus_, d_bcType_,
-                d_nx_, d_ny_, d_nz_, d_flux_, c0_, totalFacePoints_, stateStride_, stream_
+                d_nx_, d_ny_, d_nz_, d_flux_, c0_, totalFacePoints_, stateStride_, stream_,
+                d_fx_, d_fy_, d_fz_, incWave_, stageTime
             );
 
             // ------------------------------------------------------------------
@@ -476,6 +521,19 @@ public:
                 d_flux_, d_volIdxMinus_, d_dA_, d_rhs_,
                 totalFacePoints_, npts_, stream_
             );
+
+            // ------------------------------------------------------------------
+            // Step 5b: Evaluate UPML Auxiliary Differential Equations (pml_step)
+            // Couples unscaled spatial residuals with auxiliary fields DN and BN
+            // Corresponds to pml_step in contrib/NekCEM/src/cem_maxwell_pml.F
+            // ------------------------------------------------------------------
+            if (maxPml_ > 0) {
+                nekwave::device::launch_pml_step(
+                    d_state_, d_rhs_, d_pmlAux_, d_resPmlAux_,
+                    d_pmlPtr_, d_pmlSigma_, d_jac_, d_w3_,
+                    maxPml_, nxyz_, npts_, stateStride_, stream_
+                );
+            }
 
             // ------------------------------------------------------------------
             // Step 6: Multiply residual by diagonal inverse mass matrix M^{-1}
@@ -503,6 +561,13 @@ public:
             nekwave::device::launch_lsrk45_update(
                 d_state_, d_k_, d_rhs_, rk4a_[stage], rk4b_[stage], dt, npts_, stateStride_, stream_
             );
+
+            if (maxPml_ > 0) {
+                nekwave::device::launch_lsrk45_update(
+                    d_pmlAux_, d_kPmlAux_, d_resPmlAux_,
+                    rk4a_[stage], rk4b_[stage], dt, nptsPml_, nptsPml_, stream_
+                );
+            }
 #ifndef USE_HIP
             nvtxRangePop();
 #endif
@@ -556,10 +621,19 @@ public:
         cudaFree(d_ny_); d_ny_ = nullptr;
         cudaFree(d_nz_); d_nz_ = nullptr;
         cudaFree(d_dA_); d_dA_ = nullptr;
+        if (d_fx_) { cudaFree(d_fx_); d_fx_ = nullptr; }
+        if (d_fy_) { cudaFree(d_fy_); d_fy_ = nullptr; }
+        if (d_fz_) { cudaFree(d_fz_); d_fz_ = nullptr; }
 
         cudaFree(d_fEN_); d_fEN_ = nullptr;
         cudaFree(d_fHN_); d_fHN_ = nullptr;
         cudaFree(d_flux_); d_flux_ = nullptr;
+
+        if (d_pmlPtr_) { cudaFree(d_pmlPtr_); d_pmlPtr_ = nullptr; }
+        if (d_pmlSigma_) { cudaFree(d_pmlSigma_); d_pmlSigma_ = nullptr; }
+        if (d_pmlAux_) { cudaFree(d_pmlAux_); d_pmlAux_ = nullptr; }
+        if (d_kPmlAux_) { cudaFree(d_kPmlAux_); d_kPmlAux_ = nullptr; }
+        if (d_resPmlAux_) { cudaFree(d_resPmlAux_); d_resPmlAux_ = nullptr; }
 
         if (d_sendVolIndices_) { cudaFree(d_sendVolIndices_); d_sendVolIndices_ = nullptr; }
         if (d_sendBufOffsets_) { cudaFree(d_sendBufOffsets_); d_sendBufOffsets_ = nullptr; }
@@ -570,6 +644,8 @@ public:
 
         numHaloPoints_ = 0;
         stateStride_ = 0;
+        maxPml_ = 0;
+        nptsPml_ = 0;
         haloExchanges_.clear();
         exchangeBufOffsets_.clear();
 
@@ -593,10 +669,14 @@ private:
     int stateStride_;
     int totalEntries_;
     int totalFacePoints_;
+    int maxPml_ = 0;
+    int nptsPml_ = 0;
     double c0_;
+    IncidentPlaneWaveConfig incWave_;
 
     std::vector<double> rk4a_;
     std::vector<double> rk4b_;
+    std::vector<double> rk4c_;
 
     std::vector<MpiHaloExchangeInfo> haloExchanges_;
     std::vector<int> exchangeBufOffsets_;
@@ -621,10 +701,20 @@ private:
     double* d_ny_ = nullptr;
     double* d_nz_ = nullptr;
     double* d_dA_ = nullptr;
+    double* d_fx_ = nullptr;
+    double* d_fy_ = nullptr;
+    double* d_fz_ = nullptr;
 
     double* d_fEN_ = nullptr;
     double* d_fHN_ = nullptr;
     double* d_flux_ = nullptr;
+
+    // UPML device buffers (only allocated when maxPml_ > 0)
+    int* d_pmlPtr_ = nullptr;
+    double* d_pmlSigma_ = nullptr;
+    double* d_pmlAux_ = nullptr;
+    double* d_kPmlAux_ = nullptr;
+    double* d_resPmlAux_ = nullptr;
 
     // MPI Halo exchange device buffers
     int* d_sendVolIndices_ = nullptr;
@@ -645,6 +735,10 @@ DgSolver::~DgSolver() = default;
 
 bool DgSolver::initialize(const Mesh& mesh, double c0) {
     return impl_->initialize(mesh, c0);
+}
+
+void DgSolver::setIncidentWave(const IncidentPlaneWaveConfig& incWave) {
+    impl_->setIncidentWave(incWave);
 }
 
 void DgSolver::uploadState(const double* hostState, size_t size) {

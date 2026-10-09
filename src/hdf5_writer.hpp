@@ -51,7 +51,7 @@ public:
     bool initialize(const std::string& h5Path, const Mesh& mesh, bool enableXdmf = true, bool exportContinuous = false);
 
     /**
-     * @brief Selective field export options.
+     * @brief Selective field export and HDF5 storage compression options.
      */
     struct FieldSaveOptions {
         bool saveE = true;
@@ -65,6 +65,11 @@ public:
         bool saveMagnitudeCurlE = false;
         bool saveMagnitudeCurlH = false;
         bool saveEnergyDensity = false;
+
+        // HDF5 storage precision and lossless compression options
+        bool useFloat32 = false;      // true: IEEE 754 float32 (Precision="4"), false: float64 (Precision="8")
+        int compressionLevel = 0;     // 0: uncompressed, 1..9: zlib/DEFLATE level
+        bool enableShuffle = true;    // true: apply HDF5 byte-shuffle filter prior to DEFLATE
 
         void enableAllExtras() {
             saveCurlE = true;

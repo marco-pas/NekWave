@@ -15,11 +15,19 @@
 #include <iomanip>
 #include <cmath>
 #include <cassert>
+#include <csignal>
 #include <sys/stat.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+namespace {
+volatile sig_atomic_t g_terminationSignalReceived = 0;
+void nekwaveSignalHandler(int /*signum*/) {
+    g_terminationSignalReceived = 1;
+}
+} // namespace
 
 Case::Case()
     : dt_(0.0)
@@ -117,6 +125,7 @@ void Case::preprocess(const Config& cfg) {
     }
 
     mesh_->setN(config_.order);
+    mesh_->setPmlConfig(PmlConfig(config_.pmlThickness, config_.pmlOrder, config_.pmlReflectErr));
 
 #ifndef USE_HIP
     nvtxRangePushA("Case::loadMesh");
@@ -126,7 +135,7 @@ void Case::preprocess(const Config& cfg) {
         std::cout << "[PREPROCESS] Generating Cartesian box mesh: "
                   << config_.nelx << " x " << config_.nely << " x " << config_.nelz
                   << " = " << config_.nelx * config_.nely * config_.nelz 
-                  << " elements (Order N = " << config_.order << ")" << std::endl;
+                  << " elements (poly_order p = " << (config_.order - 1) << ", N = " << config_.order << ")" << std::endl;
         std::cout << "             Domain: [" << config_.xmin << ", " << config_.xmax << "] x ["
                   << config_.ymin << ", " << config_.ymax << "] x ["
                   << config_.zmin << ", " << config_.zmax << "]" << std::endl;
@@ -136,15 +145,18 @@ void Case::preprocess(const Config& cfg) {
                       << (config_.periodicY ? "Y " : "")
                       << (config_.periodicZ ? "Z " : "")
                       << "]" << std::endl;
+        } else {
+            std::cout << "             Boundary Conditions: " << config_.defaultBc << std::endl;
         }
         mesh_->createBoxMesh(config_.nelx, config_.nely, config_.nelz,
                              config_.xmin, config_.xmax,
                              config_.ymin, config_.ymax,
                              config_.zmin, config_.zmax,
-                             config_.periodicX, config_.periodicY, config_.periodicZ);
+                             config_.periodicX, config_.periodicY, config_.periodicZ,
+                             config_.defaultBc);
     } else if (!config_.meshFile.empty() && config_.meshFile != "box") {
         std::cout << "[PREPROCESS] Loading mesh file: " << config_.meshFile 
-                  << " (Order N = " << config_.order << ")" << std::endl;
+                  << " (poly_order p = " << (config_.order - 1) << ", N = " << config_.order << ")" << std::endl;
         bool bOk = false;
         if (config_.meshFile.find(".re2") != std::string::npos) {
             bOk = mesh_->loadFromRe2(config_.meshFile);
@@ -153,25 +165,42 @@ void Case::preprocess(const Config& cfg) {
         }
         if (!bOk) {
             std::cerr << "Warning: Could not load mesh. Falling back to default 3x3x3 mesh." << std::endl;
-            mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
+            mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0,
+                                 config_.periodicX, config_.periodicY, config_.periodicZ,
+                                 config_.defaultBc);
         }
     } else {
         std::cout << "[PREPROCESS] Using default 3x3x3 Cartesian box mesh (27 elements, Order N = " 
                   << config_.order << ")" << std::endl;
-        mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
+        mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0,
+                             config_.periodicX, config_.periodicY, config_.periodicZ,
+                             config_.defaultBc);
     }
 
     std::string currentWave = !waveType_.empty() ? waveType_ : config_.getString("wave_type");
-    if (currentWave == "3dboxper") {
+    {
         const auto& cx = mesh_->getCoordX();
+        const auto& cy = mesh_->getCoordY();
+        const auto& cz = mesh_->getCoordZ();
         double minX = 1e30, maxX = -1e30;
+        double minY = 1e30, maxY = -1e30;
+        double minZ = 1e30, maxZ = -1e30;
         for (size_t k = 0; k < cx.size(); ++k) {
-            minX = std::min(minX, cx[k]);
-            maxX = std::max(maxX, cx[k]);
+            minX = std::min(minX, cx[k]); maxX = std::max(maxX, cx[k]);
+            minY = std::min(minY, cy[k]); maxY = std::max(maxY, cy[k]);
+            minZ = std::min(minZ, cz[k]); maxZ = std::max(maxZ, cz[k]);
         }
-        if (std::abs(minX - (-1.0)) < 1e-3 && std::abs(maxX - 1.0) < 1e-3) {
+        if (currentWave == "3dboxper" && std::abs(minX - (-1.0)) < 1e-3 && std::abs(maxX - 1.0) < 1e-3) {
             std::cout << "[PREPROCESS] Rescaling mesh domain from [-1, 1]^3 to [0, 2*pi]^3 matching NekCEM usrdat2..." << std::endl;
             mesh_->rescale(0.0, 2.0 * M_PI, 0.0, 2.0 * M_PI, 0.0, 2.0 * M_PI);
+            minX = 0.0; maxX = 2.0 * M_PI;
+            minY = 0.0; maxY = 2.0 * M_PI;
+            minZ = 0.0; maxZ = 2.0 * M_PI;
+        }
+        if (minX < maxX) {
+            config_.xmin = minX; config_.xmax = maxX; config_.Lx = maxX - minX;
+            config_.ymin = minY; config_.ymax = maxY; config_.Ly = maxY - minY;
+            config_.zmin = minZ; config_.zmax = maxZ; config_.Lz = maxZ - minZ;
         }
     }
 #ifndef USE_HIP
@@ -205,8 +234,8 @@ void Case::preprocess(const Config& cfg) {
         cfl_ = config_.cfl;
         dt_ = (cfl_ * dxmin) / waveSpeed;
     } else {
-        cfl_ = mesh_->computeAutomaticCFL(0.4);
-        dt_ = mesh_->computeAutomaticDt(waveSpeed, 0.4);
+        cfl_ = mesh_->computeAutomaticCFL(0.3);
+        dt_ = (cfl_ * dxmin) / waveSpeed;
     }
 
     currentTime_ = 0.0;
@@ -422,6 +451,8 @@ void Case::preprocess(const Config& cfg) {
     }
 
     probes_.init(*mesh_, allProbes, outDir, actualNumModes, config_.Lx, config_.nelx, actualModeK);
+    rcsMonitor_.config().c0 = config_.c0;
+    rcsMonitor_.init(*mesh_, outDir);
 #ifndef USE_HIP
     nvtxRangePop();
 #endif
@@ -440,20 +471,31 @@ void Case::preprocess(const Config& cfg) {
     }
 
     // Export initial fields (t = 0) if enabled
+    StateVector exportState;
     if (bSaveOutput && config_.exportFields) {
 #ifndef USE_HIP
         nvtxRangePushA("Case::initialExport");
 #endif
+        reconstructTotalField(0.0, exportState);
         if (config_.exportFormat == "hdf5" || config_.exportFormat == "vtk") {
+            std::string prec = config_.exportPrecision;
+            if (prec == "float32" || prec == "fp32" || prec == "single" || prec == "f32" || prec == "4") {
+                saveOptions_.useFloat32 = true;
+            } else if (prec == "float64" || prec == "fp64" || prec == "double" || prec == "f64" || prec == "8") {
+                saveOptions_.useFloat32 = false;
+            }
+            saveOptions_.compressionLevel = std::max(0, std::min(9, config_.hdf5Compression));
+            saveOptions_.enableShuffle = config_.hdf5Shuffle;
+
             hdf5Writer_.reset(new Hdf5Writer());
             hdf5Writer_->setFieldSaveOptions(saveOptions_);
-            hdf5Writer_->initialize(outDir + "/fields.h5", *mesh_, true, config_.exportContinuousVtk);
+            hdf5Writer_->initialize(outDir + "/fields.h5", *mesh_, true, config_.exportContinuous);
             bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
                                    saveOptions_.saveDivE || saveOptions_.saveDivH ||
                                    saveOptions_.saveMagnitudeCurlE || saveOptions_.saveMagnitudeCurlH;
             std::vector<double> divE, divH, curlE, curlH;
             if (needDerivatives) {
-                computeFieldDerivatives(state_.data(), divE, divH, curlE, curlH);
+                computeFieldDerivatives(exportState.data(), divE, divH, curlE, curlH);
             }
             Hdf5Writer::DerivedFields derived{
                 divE.empty() ? nullptr : divE.data(),
@@ -461,7 +503,7 @@ void Case::preprocess(const Config& cfg) {
                 curlE.empty() ? nullptr : curlE.data(),
                 curlH.empty() ? nullptr : curlH.data()
             };
-            hdf5Writer_->writeStep(0, 0.0, state_.data(), npts, &derived);
+            hdf5Writer_->writeStep(0, 0.0, exportState.data(), npts, &derived);
         } else {
             saveFields(outDir + "/field_initial.csv", 0.0);
         }
@@ -470,8 +512,16 @@ void Case::preprocess(const Config& cfg) {
 #endif
     }
 
-    // Record t = 0 on probes
-    probes_.record(0, 0.0, state_, npts);
+    // Record t = 0 on probes and RCS surface monitor
+    if (rcsMonitor_.config().incidentPlaneWave.enabled) {
+        if (exportState.empty()) {
+            reconstructTotalField(0.0, exportState);
+        }
+        probes_.record(0, 0.0, exportState, npts);
+    } else {
+        probes_.record(0, 0.0, state_, npts);
+    }
+    rcsMonitor_.record(0, 0.0, 0.5 * dt_, state_, npts);
 
     // Evaluate initial diagnostics across all ranks
     double initEnergy = computeTotalEnergy();
@@ -494,7 +544,7 @@ void Case::preprocess(const Config& cfg) {
         std::cout << "               NekWave Solver Setup Summary               " << std::endl;
         std::cout << "----------------------------------------------------------\n" << std::endl;
         std::cout << "  Elements:          " << mesh_->getNumElements() << std::endl;
-        std::cout << "  Polynomial Order:  " << mesh_->getN() << " (Np = " << mesh_->getNumPointsPerElement() << " nodes/elem)" << std::endl;
+        std::cout << "  Polynomial Order:  p = " << (mesh_->getN() - 1) << " (N = " << mesh_->getN() << " GLL pts/dir, Np = " << mesh_->getNumPointsPerElement() << " nodes/elem)" << std::endl;
         std::cout << "  Total Collocation: " << npts << " points" << std::endl;
         std::cout << "  Domain Dimensions: Lx = " << config_.Lx << ", Ly = " << config_.Ly << ", Lz = " << config_.Lz << std::endl;
         std::cout << "  Bounding Box:      [" << config_.xmin << ", " << config_.xmax << "] x [" 
@@ -502,6 +552,7 @@ void Case::preprocess(const Config& cfg) {
                   << config_.zmin << ", " << config_.zmax << "]" << std::endl;
         std::cout << "  Faces Total:       " << mesh_->getFaceData().size() << std::endl;
         std::cout << "  Flux Formulation:  " << ((config_.c0 == 0.0) ? "Central (C0 = 0.0, energy-conserving)" : "Upwind (C0 = 1.0, dissipative)") << std::endl;
+        std::cout << "  Field Formulation: " << (config_.scatteredFieldMode ? "Scattered-Field (analytical E_inc on PEC, total field on save)" : "Total-Field") << std::endl;
         std::cout << "  Probes Active:     " << allProbes.size() << " locations in " << outDir << "/" << std::endl;
         std::cout << "  Minimum Spacing:   dxmin = " << std::scientific << std::setprecision(2) << dxmin << std::endl;
         std::cout << "  CFL Number:        " << std::scientific << std::setprecision(2) << cfl_ << std::endl;
@@ -514,6 +565,13 @@ void Case::preprocess(const Config& cfg) {
         }
         std::cout << "  Output Frequency:  " << config_.outputFreq << " steps" << std::endl;
         std::cout << "  Save Frequency:    " << config_.saveFreq << " steps" << std::endl;
+        if (bSaveOutput && config_.exportFields) {
+            std::cout << "  Export Format:     " << config_.exportFormat
+                      << " (" << (saveOptions_.useFloat32 ? "float32" : "float64")
+                      << ", deflate=" << saveOptions_.compressionLevel
+                      << (saveOptions_.compressionLevel > 0 && saveOptions_.enableShuffle ? "+shuffle" : "")
+                      << ", " << (config_.exportContinuous ? "continuous CG" : "discontinuous DG") << ")" << std::endl;
+        }
         std::cout << "  Initial Energy:    " << std::scientific << std::setprecision(2) << initEnergy << std::endl;
         std::cout << "  Initial max|E|:    " << std::scientific << std::setprecision(2) << initMaxE 
                   << " | max|H|: " << std::scientific << std::setprecision(2) << initMaxH << std::endl;
@@ -543,6 +601,7 @@ void Case::simulate() {
 #endif
     dgSolver_.reset(new DgSolver());
     dgSolver_->initialize(*mesh_, config_.c0);
+    dgSolver_->setIncidentWave(rcsMonitor_.config().incidentPlaneWave);
     dgSolver_->uploadState(state_.data(), state_.size());
 #ifndef USE_HIP
     nvtxRangePop();
@@ -557,6 +616,17 @@ void Case::simulate() {
                   << std::setw(16) << "Total Energy" << std::endl;
         std::cout << "------------------------------------------------------------------" << std::endl;
     }
+
+    const double initEnergy = computeTotalEnergy();
+    double peakScatteredEnergy = 0.0;
+    const bool isScatteredMode = rcsMonitor_.config().incidentPlaneWave.enabled;
+    const auto& incWave = rcsMonitor_.config().incidentPlaneWave;
+    const double tPulsePassedSphere = std::abs(incWave.x0) + incWave.sphereRadius + 4.5 * incWave.sigmaX;
+    StateVector exportState;
+
+    g_terminationSignalReceived = 0;
+    std::signal(SIGTERM, nekwaveSignalHandler);
+    std::signal(SIGINT, nekwaveSignalHandler);
 
     int step = 0;
     while (true) {
@@ -593,45 +663,85 @@ void Case::simulate() {
 #ifndef USE_HIP
         nvtxRangePushA("Case::probesRecord");
 #endif
-        probes_.record(step, currentTime_, state_, npts);
+        if (isScatteredMode) {
+            reconstructTotalField(currentTime_, exportState);
+            probes_.record(step, currentTime_, exportState, npts);
+        } else {
+            probes_.record(step, currentTime_, state_, npts);
+        }
+        rcsMonitor_.record(step, currentTime_, currentDt, state_, npts);
 #ifndef USE_HIP
         nvtxRangePop();
 #endif
 
         bool isFinal = (maxSteps > 0 && step >= maxSteps) || (finalTime > 0.0 && currentTime_ >= finalTime - 1e-13);
 
-        // Save HDF5/VTK snapshots according to saveFreq or on final step
-        if (hdf5Writer_ && (step % saveFreq == 0 || isFinal)) {
+        // Save HDF5/VTK snapshots and checkpoint RCS spectra according to saveFreq or on final step
+        if (step % saveFreq == 0 || isFinal) {
+            if (hdf5Writer_) {
 #ifndef USE_HIP
-            nvtxRangePushA("Case::hdf5WriteStep");
+                nvtxRangePushA("Case::hdf5WriteStep");
 #endif
-            bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
-                                   saveOptions_.saveDivE || saveOptions_.saveDivH ||
-                                   saveOptions_.saveMagnitudeCurlE || saveOptions_.saveMagnitudeCurlH;
-            std::vector<double> divE, divH, curlE, curlH;
-            if (needDerivatives) {
-                computeFieldDerivatives(state_.data(), divE, divH, curlE, curlH);
+                const double* fieldPtr = isScatteredMode ? exportState.data() : state_.data();
+                bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
+                                       saveOptions_.saveDivE || saveOptions_.saveDivH ||
+                                       saveOptions_.saveMagnitudeCurlE || saveOptions_.saveMagnitudeCurlH;
+                std::vector<double> divE, divH, curlE, curlH;
+                if (needDerivatives) {
+                    computeFieldDerivatives(fieldPtr, divE, divH, curlE, curlH);
+                }
+                Hdf5Writer::DerivedFields derived{
+                    divE.empty() ? nullptr : divE.data(),
+                    divH.empty() ? nullptr : divH.data(),
+                    curlE.empty() ? nullptr : curlE.data(),
+                    curlH.empty() ? nullptr : curlH.data()
+                };
+                hdf5Writer_->writeStep(step, currentTime_, fieldPtr, npts, &derived);
+#ifndef USE_HIP
+                nvtxRangePop();
+#endif
             }
-            Hdf5Writer::DerivedFields derived{
-                divE.empty() ? nullptr : divE.data(),
-                divH.empty() ? nullptr : divH.data(),
-                curlE.empty() ? nullptr : curlE.data(),
-                curlH.empty() ? nullptr : curlH.data()
-            };
-            hdf5Writer_->writeStep(step, currentTime_, state_.data(), npts, &derived);
-#ifndef USE_HIP
-            nvtxRangePop();
-#endif
+            rcsMonitor_.writeSpectra(false);
         }
 
         // Output diagnostics according to outFreq or on final step
+        bool stopSimulation = false;
         if (step % outFreq == 0 || isFinal) {
+            double sigFlag = (g_terminationSignalReceived != 0) ? 1.0 : 0.0;
+            if (Comm::allreduceMax(sigFlag) > 0.0) {
+                if (Comm::isRoot()) {
+                    std::cout << "\n[STOP] Termination signal (SIGTERM/SIGINT) received at step " << step
+                              << " (t = " << std::fixed << std::setprecision(5) << currentTime_
+                              << "). Saving state and finalizing cleanly..." << std::endl;
+                }
+                if (hdf5Writer_ && !(step % saveFreq == 0 || isFinal)) {
+                    const double* fieldPtr = isScatteredMode ? exportState.data() : state_.data();
+                    bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
+                                           saveOptions_.saveDivE || saveOptions_.saveDivH ||
+                                           saveOptions_.saveMagnitudeCurlE || saveOptions_.saveMagnitudeCurlH;
+                    std::vector<double> divE, divH, curlE, curlH;
+                    if (needDerivatives) {
+                        computeFieldDerivatives(fieldPtr, divE, divH, curlE, curlH);
+                    }
+                    Hdf5Writer::DerivedFields derived{
+                        divE.empty() ? nullptr : divE.data(),
+                        divH.empty() ? nullptr : divH.data(),
+                        curlE.empty() ? nullptr : curlE.data(),
+                        curlH.empty() ? nullptr : curlH.data()
+                    };
+                    hdf5Writer_->writeStep(step, currentTime_, fieldPtr, npts, &derived);
+                }
+                stopSimulation = true;
+            }
 #ifndef USE_HIP
             nvtxRangePushA("Case::computeDiagnostics");
 #endif
             double maxE = getMaxE();
             double maxH = getMaxH();
             double energy = computeTotalEnergy();
+            if (energy > peakScatteredEnergy) {
+                peakScatteredEnergy = energy;
+            }
 #ifndef USE_HIP
             nvtxRangePop();
 #endif
@@ -648,10 +758,96 @@ void Case::simulate() {
                           << std::setw(14) << std::fixed << std::setprecision(5) << maxH 
                           << std::setw(16) << std::scientific << std::setprecision(6) << energy << std::endl;
             }
+
+            // Automatic energy-based stopping criteria:
+            if (initEnergy > 0.0) {
+                // Total-Field mode:
+                //  1) Stop if energy exceeds +5% of initial energy (numerical instability guard)
+                //  2) Stop if energy drops to <= 50% of initial energy (wave energy absorbed / exited domain)
+                if (std::isnan(energy) || std::isinf(energy) || energy > 1.05 * initEnergy) {
+                    if (Comm::isRoot()) {
+                        std::cout << "\n[STOP] Simulation terminated at step " << step
+                                  << " (t = " << std::fixed << std::setprecision(5) << currentTime_ << "): "
+                                  << "Total energy (" << std::scientific << std::setprecision(6) << energy
+                                  << ") exceeded +5% of initial energy (" << initEnergy
+                                  << "). Stopping to prevent numerical instability." << std::endl;
+                    }
+                    stopSimulation = true;
+                } else if (energy <= 0.50 * initEnergy) {
+                    if (Comm::isRoot()) {
+                        std::cout << "\n[STOP] Simulation completed at step " << step
+                                  << " (t = " << std::fixed << std::setprecision(5) << currentTime_ << "): "
+                                  << "Total energy (" << std::scientific << std::setprecision(6) << energy
+                                  << ") dropped to <= 50% of initial energy (" << initEnergy
+                                  << ") as wave energy exited the domain." << std::endl;
+                    }
+                    if (hdf5Writer_ && !(step % saveFreq == 0 || isFinal)) {
+                        const double* fieldPtr = isScatteredMode ? exportState.data() : state_.data();
+                        bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
+                                               saveOptions_.saveDivE || saveOptions_.saveDivH ||
+                                               saveOptions_.saveMagnitudeCurlE || saveOptions_.saveMagnitudeCurlH;
+                        std::vector<double> divE, divH, curlE, curlH;
+                        if (needDerivatives) {
+                            computeFieldDerivatives(fieldPtr, divE, divH, curlE, curlH);
+                        }
+                        Hdf5Writer::DerivedFields derived{
+                            divE.empty() ? nullptr : divE.data(),
+                            divH.empty() ? nullptr : divH.data(),
+                            curlE.empty() ? nullptr : curlE.data(),
+                            curlH.empty() ? nullptr : curlH.data()
+                        };
+                        hdf5Writer_->writeStep(step, currentTime_, fieldPtr, npts, &derived);
+                    }
+                    stopSimulation = true;
+                }
+            } else if (isScatteredMode) {
+                // Scattered-Field mode (initial energy at t=0 is 0):
+                //  1) Stop if NaN/Inf or runaway energy > 1e3
+                //  2) Stop once the incident pulse has passed the sphere and scattered energy drops to <= 0.5% of peak
+                if (std::isnan(energy) || std::isinf(energy) || energy > 1.0e3) {
+                    if (Comm::isRoot()) {
+                        std::cout << "\n[STOP] Simulation terminated at step " << step
+                                  << " (t = " << std::fixed << std::setprecision(5) << currentTime_ << "): "
+                                  << "Scattered energy (" << std::scientific << std::setprecision(6) << energy
+                                  << ") exceeded stability limit." << std::endl;
+                    }
+                    stopSimulation = true;
+                } else if (currentTime_ > tPulsePassedSphere && peakScatteredEnergy > 1e-12 &&
+                           energy <= 0.005 * peakScatteredEnergy) {
+                    if (Comm::isRoot()) {
+                        std::cout << "\n[STOP] Simulation completed at step " << step
+                                  << " (t = " << std::fixed << std::setprecision(5) << currentTime_ << "): "
+                                  << "Scattered energy (" << std::scientific << std::setprecision(6) << energy
+                                  << ") decayed to <= 0.5% of peak scattered energy (" << peakScatteredEnergy
+                                  << ") as scattered waves exited into the UPML." << std::endl;
+                    }
+                    if (hdf5Writer_ && !(step % saveFreq == 0 || isFinal)) {
+                        const double* fieldPtr = exportState.data();
+                        bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
+                                               saveOptions_.saveDivE || saveOptions_.saveDivH ||
+                                               saveOptions_.saveMagnitudeCurlE || saveOptions_.saveMagnitudeCurlH;
+                        std::vector<double> divE, divH, curlE, curlH;
+                        if (needDerivatives) {
+                            computeFieldDerivatives(fieldPtr, divE, divH, curlE, curlH);
+                        }
+                        Hdf5Writer::DerivedFields derived{
+                            divE.empty() ? nullptr : divE.data(),
+                            divH.empty() ? nullptr : divH.data(),
+                            curlE.empty() ? nullptr : curlE.data(),
+                            curlH.empty() ? nullptr : curlH.data()
+                        };
+                        hdf5Writer_->writeStep(step, currentTime_, fieldPtr, npts, &derived);
+                    }
+                    stopSimulation = true;
+                }
+            }
         }
 #ifndef USE_HIP
         nvtxRangePop();
 #endif
+        if (stopSimulation) {
+            break;
+        }
     }
 
     dgSolver_->downloadState(state_.data(), state_.size());
@@ -668,11 +864,12 @@ void Case::postprocess() {
     const std::string& outDir = config_.outputDir;
     bool bSaveOutput = (!outDir.empty() && outDir != "none" && outDir != "None" && outDir != "NONE");
 
-    // Finalize probe observations
+    // Finalize probe observations and Near-to-Far-Field (NTFF) RCS calculation
 #ifndef USE_HIP
     nvtxRangePushA("Case::probesFinalize");
 #endif
     probes_.finalize();
+    rcsMonitor_.finalize();
 #ifndef USE_HIP
     nvtxRangePop();
 #endif
@@ -793,6 +990,74 @@ double Case::getMaxH() const {
     return Comm::allreduceMax(maxVal);
 }
 
+void Case::reconstructTotalField(double time, StateVector& outTotalState) const {
+    outTotalState = state_;
+    if (!mesh_ || !rcsMonitor_.config().incidentPlaneWave.enabled) {
+        return;
+    }
+
+    const auto& incWave = rcsMonitor_.config().incidentPlaneWave;
+    const auto& x = mesh_->getCoordX();
+    const auto& y = mesh_->getCoordY();
+    const auto& z = mesh_->getCoordZ();
+    const int npts = mesh_->getTotalPoints();
+    const double rInnerMask = std::max(0.0, incWave.sphereRadius - 1.0e-4);
+    const double rInnerMaskSq = rInnerMask * rInnerMask;
+
+    double* Ex = &outTotalState[0 * npts];
+    double* Ey = &outTotalState[1 * npts];
+    double* Ez = &outTotalState[2 * npts];
+    double* Hx = &outTotalState[3 * npts];
+    double* Hy = &outTotalState[4 * npts];
+    double* Hz = &outTotalState[5 * npts];
+
+    for (int i = 0; i < npts; ++i) {
+        double rSq = x[i] * x[i] + y[i] * y[i] + z[i] * z[i];
+        if (rSq < rInnerMaskSq) {
+            // Strictly inside the PEC sphere: guarantee null total field
+            Ex[i] = 0.0; Ey[i] = 0.0; Ez[i] = 0.0;
+            Hx[i] = 0.0; Hy[i] = 0.0; Hz[i] = 0.0;
+        } else {
+            double ex_inc = 0.0, ey_inc = 0.0, ez_inc = 0.0;
+            double hx_inc = 0.0, hy_inc = 0.0, hz_inc = 0.0;
+            incWave.evaluate(x[i], y[i], z[i], time,
+                             ex_inc, ey_inc, ez_inc,
+                             hx_inc, hy_inc, hz_inc);
+            Ex[i] += ex_inc;
+            Ey[i] += ey_inc;
+            Ez[i] += ez_inc;
+            Hx[i] += hx_inc;
+            Hy[i] += hy_inc;
+            Hz[i] += hz_inc;
+        }
+    }
+
+    // On PEC scatterer surface nodes, enforce exact tangential electric field cancellation
+    // (n x E_tot = 0 => E_tot = (n . E_tot) n) and zero normal magnetic field (n . H_tot = 0)
+    const auto& faces = mesh_->getFaces();
+    const auto& faceData = mesh_->getFaceData();
+    for (size_t fIdx = 0; fIdx < faceData.size(); ++fIdx) {
+        const auto& fd = faceData[fIdx];
+        int neighborId = (fIdx < faces.size()) ? faces[fIdx].neighborElementId : -1;
+        BcType bc = BoundaryConditions::parseBcTag(fd.bcType, neighborId);
+        if (bc != BcType::PEC) continue;
+
+        for (const auto& pt : fd.points) {
+            int v = pt.volIdxMinus;
+            double nx = pt.nx, ny = pt.ny, nz = pt.nz;
+            double eDotN = Ex[v] * nx + Ey[v] * ny + Ez[v] * nz;
+            Ex[v] = eDotN * nx;
+            Ey[v] = eDotN * ny;
+            Ez[v] = eDotN * nz;
+
+            double hDotN = Hx[v] * nx + Hy[v] * ny + Hz[v] * nz;
+            Hx[v] -= hDotN * nx;
+            Hy[v] -= hDotN * ny;
+            Hz[v] -= hDotN * nz;
+        }
+    }
+}
+
 void Case::saveFields(const std::string& filename, double time) const {
     std::ofstream file(filename);
     if (!file.is_open()) {
@@ -800,17 +1065,20 @@ void Case::saveFields(const std::string& filename, double time) const {
         return;
     }
 
+    StateVector exportState;
+    reconstructTotalField(time, exportState);
+
     const auto& x = mesh_->getCoordX();
     const auto& y = mesh_->getCoordY();
     const auto& z = mesh_->getCoordZ();
     const int npts = mesh_->getTotalPoints();
 
-    const double* Ex = &state_[0 * npts];
-    const double* Ey = &state_[1 * npts];
-    const double* Ez = &state_[2 * npts];
-    const double* Hx = &state_[3 * npts];
-    const double* Hy = &state_[4 * npts];
-    const double* Hz = &state_[5 * npts];
+    const double* Ex = &exportState[0 * npts];
+    const double* Ey = &exportState[1 * npts];
+    const double* Ez = &exportState[2 * npts];
+    const double* Hx = &exportState[3 * npts];
+    const double* Hy = &exportState[4 * npts];
+    const double* Hz = &exportState[5 * npts];
 
     file << "# NekWave Field Export (t = " << std::scientific << std::setprecision(6) << time << ")\n";
     file << "x,y,z,Ex,Ey,Ez,Hx,Hy,Hz\n";
