@@ -21,7 +21,8 @@
 struct Config {
     // Standard DG-SEM simulation settings
     std::string meshFile = "";            // Path to mesh file (.rea or custom)
-    int order = 3;                        // Polynomial order N (collocation points per direction)
+    int polyOrder = 2;                    // Polynomial order p (degree of polynomial basis, p = N - 1)
+    int order = 3;                        // Number of 1D GLL collocation points per direction (N = polyOrder + 1)
     double cfl = -1.0;                    // CFL number (negative: auto-calculated)
     double dt = -1.0;                     // Time step size (negative: auto-calculated)
     int numSteps = 100;                   // Total simulation steps (or max_steps)
@@ -45,7 +46,11 @@ struct Config {
     bool hasExplicitBoundsZ = false;
     std::string outputDir = "output";     // Output directory for CSVs and plots
     bool exportFields = false;            // Whether to export 3D volume nodal fields (field_initial.csv, field_final.csv)
-    bool exportContinuousVtk = false;    // Whether to average DG interface nodes into a continuous CG mesh for ParaView
+    bool exportContinuous = false;        // Whether to merge doubled DG interface GLL nodes into a continuous CG mesh
+    bool exportContinuousVtk = false;     // Legacy alias for exportContinuous
+    std::string exportPrecision = "float32"; // HDF5 floating-point precision ("float32" or "float64")
+    int hdf5Compression = 2;              // HDF5 DEFLATE compression level (0 = uncompressed, 1..9 = zlib level)
+    bool hdf5Shuffle = true;              // HDF5 byte-shuffle filter prior to DEFLATE compression
     bool scatteredFieldMode = false;      // True to solve in Scattered-Field formulation (analytical incident wave on PEC, reconstruct total field on save)
 
     // Boundary condition settings (default outer BC: "PEC"; options: "PEC", "PMC", "PML", "PERIODIC")
@@ -177,7 +182,14 @@ struct Config {
 
         // Map standard keys
         if (lkey == "mesh_file" || lkey == "mesh") meshFile = trimVal;
-        else if (lkey == "order" || lkey == "n") order = std::stoi(trimVal);
+        else if (lkey == "poly_order" || lkey == "polynomial_order" || lkey == "p" || lkey == "order") {
+            polyOrder = std::stoi(trimVal);
+            order = polyOrder + 1;
+        }
+        else if (lkey == "n" || lkey == "gll_points") {
+            order = std::stoi(trimVal);
+            polyOrder = order - 1;
+        }
         else if (lkey == "cfl") {
             if (toLower(trimVal) == "auto") cfl = -1.0;
             else cfl = std::stod(trimVal);
@@ -226,9 +238,31 @@ struct Config {
             std::string lv = toLower(trimVal);
             exportFields = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
         }
-        else if (lkey == "export_continuous_vtk" || lkey == "continuous_vtk" || lkey == "export_continuous") {
+        else if (lkey == "export_continuous" || lkey == "continuous" || lkey == "export_continuous_vtk" || lkey == "continuous_vtk") {
             std::string lv = toLower(trimVal);
-            exportContinuousVtk = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
+            exportContinuous = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
+            exportContinuousVtk = exportContinuous;
+        }
+        else if (lkey == "export_precision" || lkey == "hdf5_precision" || lkey == "precision") {
+            exportPrecision = toLower(trimVal);
+        }
+        else if (lkey == "hdf5_compression" || lkey == "compression_level" || lkey == "compression" || lkey == "deflate_level" || lkey == "deflate") {
+            std::string lv = toLower(trimVal);
+            if (lv == "false" || lv == "none" || lv == "off") {
+                hdf5Compression = 0;
+            } else if (lv == "true" || lv == "on") {
+                hdf5Compression = 2;
+            } else {
+                try {
+                    hdf5Compression = std::max(0, std::min(9, std::stoi(trimVal)));
+                } catch (...) {
+                    hdf5Compression = 0;
+                }
+            }
+        }
+        else if (lkey == "hdf5_shuffle" || lkey == "shuffle") {
+            std::string lv = toLower(trimVal);
+            hdf5Shuffle = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
         }
         else if (lkey == "scattered_field_mode" || lkey == "scatteredfieldmode" || lkey == "scattered_field") {
             std::string lv = toLower(trimVal);

@@ -437,7 +437,7 @@ void JsonConfigLoadingTest() {
             "periodic_x": true
         },
         "numerics": {
-            "order": 5,
+            "poly_order": 5,
             "cfl": "auto",
             "dt": 0.001,
             "c0": 0.5
@@ -451,7 +451,11 @@ void JsonConfigLoadingTest() {
             "save_frequency": 100,
             "output_dir": "test_output",
             "export_fields": true,
-            "export_format": "hdf5"
+            "export_format": "hdf5",
+            "export_continuous": true,
+            "export_precision": "float32",
+            "hdf5_compression": 2,
+            "hdf5_shuffle": true
         },
         "probes": [
             [0.1, 0.2, 0.3],
@@ -477,7 +481,8 @@ void JsonConfigLoadingTest() {
     EXPECT_NEAR(cfg.zmin,  0.0, 1e-12);
     EXPECT_NEAR(cfg.zmax,  3.0, 1e-12);
     EXPECT_TRUE(cfg.periodicX);
-    EXPECT_TRUE(cfg.order == 5);
+    EXPECT_TRUE(cfg.polyOrder == 5);
+    EXPECT_TRUE(cfg.order == 6);
     EXPECT_NEAR(cfg.dt, 0.001, 1e-12);
     EXPECT_NEAR(cfg.c0, 0.5, 1e-12);
     EXPECT_NEAR(cfg.finalTime, 12.5, 1e-12);
@@ -487,6 +492,10 @@ void JsonConfigLoadingTest() {
     EXPECT_TRUE(cfg.outputDir == "test_output");
     EXPECT_TRUE(cfg.exportFields);
     EXPECT_TRUE(cfg.exportFormat == "hdf5");
+    EXPECT_TRUE(cfg.exportContinuous);
+    EXPECT_TRUE(cfg.exportPrecision == "float32");
+    EXPECT_TRUE(cfg.hdf5Compression == 2);
+    EXPECT_TRUE(cfg.hdf5Shuffle);
     EXPECT_TRUE(cfg.probes.size() == 2);
     EXPECT_NEAR(cfg.probes[0][0], 0.1, 1e-12);
     EXPECT_NEAR(cfg.probes[1][1], 1.5, 1e-12);
@@ -501,7 +510,7 @@ void JsonConfigLoadingTest() {
             "file": "contrib/NekCEM/tests/3dboxpec/3dboxpec.rea"
         },
         "numerics": {
-            "order": 4,
+            "poly_order": 4,
             "c0": 0.0
         }
     })";
@@ -509,7 +518,8 @@ void JsonConfigLoadingTest() {
     nekwave::JsonValue rootNek = nekwave::JsonValue::parse(nekcemJson);
     cfgNek.loadFromJson(rootNek);
     EXPECT_TRUE(cfgNek.meshFile == "contrib/NekCEM/tests/3dboxpec/3dboxpec.rea");
-    EXPECT_TRUE(cfgNek.order == 4);
+    EXPECT_TRUE(cfgNek.polyOrder == 4);
+    EXPECT_TRUE(cfgNek.order == 5);
 
     // Test 3: Programmatic wave_type in C++ Case
     Case c;

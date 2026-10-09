@@ -135,7 +135,7 @@ void Case::preprocess(const Config& cfg) {
         std::cout << "[PREPROCESS] Generating Cartesian box mesh: "
                   << config_.nelx << " x " << config_.nely << " x " << config_.nelz
                   << " = " << config_.nelx * config_.nely * config_.nelz 
-                  << " elements (Order N = " << config_.order << ")" << std::endl;
+                  << " elements (poly_order p = " << (config_.order - 1) << ", N = " << config_.order << ")" << std::endl;
         std::cout << "             Domain: [" << config_.xmin << ", " << config_.xmax << "] x ["
                   << config_.ymin << ", " << config_.ymax << "] x ["
                   << config_.zmin << ", " << config_.zmax << "]" << std::endl;
@@ -156,7 +156,7 @@ void Case::preprocess(const Config& cfg) {
                              config_.defaultBc);
     } else if (!config_.meshFile.empty() && config_.meshFile != "box") {
         std::cout << "[PREPROCESS] Loading mesh file: " << config_.meshFile 
-                  << " (Order N = " << config_.order << ")" << std::endl;
+                  << " (poly_order p = " << (config_.order - 1) << ", N = " << config_.order << ")" << std::endl;
         bool bOk = false;
         if (config_.meshFile.find(".re2") != std::string::npos) {
             bOk = mesh_->loadFromRe2(config_.meshFile);
@@ -478,9 +478,18 @@ void Case::preprocess(const Config& cfg) {
 #endif
         reconstructTotalField(0.0, exportState);
         if (config_.exportFormat == "hdf5" || config_.exportFormat == "vtk") {
+            std::string prec = config_.exportPrecision;
+            if (prec == "float32" || prec == "fp32" || prec == "single" || prec == "f32" || prec == "4") {
+                saveOptions_.useFloat32 = true;
+            } else if (prec == "float64" || prec == "fp64" || prec == "double" || prec == "f64" || prec == "8") {
+                saveOptions_.useFloat32 = false;
+            }
+            saveOptions_.compressionLevel = std::max(0, std::min(9, config_.hdf5Compression));
+            saveOptions_.enableShuffle = config_.hdf5Shuffle;
+
             hdf5Writer_.reset(new Hdf5Writer());
             hdf5Writer_->setFieldSaveOptions(saveOptions_);
-            hdf5Writer_->initialize(outDir + "/fields.h5", *mesh_, true, config_.exportContinuousVtk);
+            hdf5Writer_->initialize(outDir + "/fields.h5", *mesh_, true, config_.exportContinuous);
             bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
                                    saveOptions_.saveDivE || saveOptions_.saveDivH ||
                                    saveOptions_.saveMagnitudeCurlE || saveOptions_.saveMagnitudeCurlH;
@@ -535,7 +544,7 @@ void Case::preprocess(const Config& cfg) {
         std::cout << "               NekWave Solver Setup Summary               " << std::endl;
         std::cout << "----------------------------------------------------------\n" << std::endl;
         std::cout << "  Elements:          " << mesh_->getNumElements() << std::endl;
-        std::cout << "  Polynomial Order:  " << mesh_->getN() << " (Np = " << mesh_->getNumPointsPerElement() << " nodes/elem)" << std::endl;
+        std::cout << "  Polynomial Order:  p = " << (mesh_->getN() - 1) << " (N = " << mesh_->getN() << " GLL pts/dir, Np = " << mesh_->getNumPointsPerElement() << " nodes/elem)" << std::endl;
         std::cout << "  Total Collocation: " << npts << " points" << std::endl;
         std::cout << "  Domain Dimensions: Lx = " << config_.Lx << ", Ly = " << config_.Ly << ", Lz = " << config_.Lz << std::endl;
         std::cout << "  Bounding Box:      [" << config_.xmin << ", " << config_.xmax << "] x [" 
@@ -556,6 +565,13 @@ void Case::preprocess(const Config& cfg) {
         }
         std::cout << "  Output Frequency:  " << config_.outputFreq << " steps" << std::endl;
         std::cout << "  Save Frequency:    " << config_.saveFreq << " steps" << std::endl;
+        if (bSaveOutput && config_.exportFields) {
+            std::cout << "  Export Format:     " << config_.exportFormat
+                      << " (" << (saveOptions_.useFloat32 ? "float32" : "float64")
+                      << ", deflate=" << saveOptions_.compressionLevel
+                      << (saveOptions_.compressionLevel > 0 && saveOptions_.enableShuffle ? "+shuffle" : "")
+                      << ", " << (config_.exportContinuous ? "continuous CG" : "discontinuous DG") << ")" << std::endl;
+        }
         std::cout << "  Initial Energy:    " << std::scientific << std::setprecision(2) << initEnergy << std::endl;
         std::cout << "  Initial max|E|:    " << std::scientific << std::setprecision(2) << initMaxE 
                   << " | max|H|: " << std::scientific << std::setprecision(2) << initMaxH << std::endl;

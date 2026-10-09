@@ -142,8 +142,8 @@ int main(int argc, char* argv[]) {
     saveOptions.saveCurlH = false;
     saveOptions.saveDivE = false;
     saveOptions.saveDivH = false;
-    saveOptions.saveMagnitudeE = true;
-    saveOptions.saveMagnitudeH = true;
+    saveOptions.saveMagnitudeE = false;
+    saveOptions.saveMagnitudeH = false;
     saveOptions.saveMagnitudeCurlE = false;
     saveOptions.saveMagnitudeCurlH = false;
     saveOptions.saveEnergyDensity = true;

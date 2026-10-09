@@ -119,7 +119,8 @@ public:
     double finalTime() const { return config_.finalTime; }
     int outputFreq() const { return config_.outputFreq; }
     int saveFreq() const { return config_.saveFreq; }
-    bool exportContinuousVtk() const { return config_.exportContinuousVtk; }
+    bool exportContinuous() const { return config_.exportContinuous; }
+    bool exportContinuousVtk() const { return config_.exportContinuous; }
 
     /**
      * @brief Computes exact DG spectral spatial derivatives (divergence and curl) on GLL nodes.
