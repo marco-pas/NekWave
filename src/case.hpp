@@ -161,6 +161,21 @@ private:
     bool bIsSimulated_;
     bool bIsPostprocessed_;
     SaveOptions saveOptions_;
+
+    struct PhaseTimings {
+        double preprocessSec = 0.0;
+        double loadMeshSec = 0.0;
+        double initSolverSec = 0.0;
+        double solverStepSec = 0.0;
+        double downloadStateSec = 0.0;
+        double probesAndRcsSec = 0.0;
+        double hdf5IoSec = 0.0;
+        double diagnosticsSec = 0.0;
+        double postprocessSec = 0.0;
+        double simulateTotalSec = 0.0;
+    } timings_;
+
+    DgSolver::MemoryAndHardwareStats lastMemHwStats_{};
 };
 
 #endif // NW_SRC_CASE_HPP

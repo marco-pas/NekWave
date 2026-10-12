@@ -6,17 +6,16 @@
 
 #include "case.hpp"
 #include "comm.hpp"
-
-#ifndef USE_HIP
-#include <nvtx3/nvToolsExt.h>
-#endif
+#include "device/gpu_runtime.hpp"
 
 #include <iostream>
 #include <iomanip>
 #include <cmath>
 #include <cassert>
 #include <csignal>
+#include <chrono>
 #include <sys/stat.h>
+#include <sys/resource.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -26,6 +25,14 @@ namespace {
 volatile sig_atomic_t g_terminationSignalReceived = 0;
 void nekwaveSignalHandler(int /*signum*/) {
     g_terminationSignalReceived = 1;
+}
+
+size_t getHostPeakRssBytes() {
+    struct rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        return static_cast<size_t>(usage.ru_maxrss) * 1024ULL;
+    }
+    return 0;
 }
 } // namespace
 
@@ -56,7 +63,14 @@ Case::~Case() {
 
 void Case::loadConfig(const std::string& configFile) {
     if (!configFile.empty()) {
-        config_.loadFromFile(configFile);
+        if (!config_.loadFromFile(configFile)) {
+            if (Comm::isRoot()) {
+                std::cerr << "[FATAL ERROR] Failed to load configuration file '" << configFile
+                          << "'. Terminating simulation." << std::endl;
+            }
+            Comm::finalize();
+            std::exit(EXIT_FAILURE);
+        }
         // If waveType_ was already specified programmatically in C++, ensure it takes precedence
         if (!waveType_.empty()) {
             config_.set("wave_type", waveType_);
@@ -104,8 +118,13 @@ void Case::preprocess() {
 }
 
 void Case::preprocess(const Config& cfg) {
+    using Clock = std::chrono::high_resolution_clock;
+    auto tPreStart = Clock::now();
+    NW_PROFILER_PUSH("Case::preprocess");
+
     Comm::init();
     config_ = cfg;
+    timings_ = PhaseTimings{};
 
     bool bSaveOutput = (!config_.outputDir.empty() && 
                         config_.outputDir != "none" && 
@@ -127,26 +146,27 @@ void Case::preprocess(const Config& cfg) {
     mesh_->setN(config_.order);
     mesh_->setPmlConfig(PmlConfig(config_.pmlThickness, config_.pmlOrder, config_.pmlReflectErr));
 
-#ifndef USE_HIP
-    nvtxRangePushA("Case::loadMesh");
-#endif
+    auto tMeshStart = Clock::now();
+    NW_PROFILER_PUSH("Case::loadMesh");
     // Mesh setup: Built-in box generator or external .rea mesh file
     if (config_.nelx > 0 && config_.nely > 0 && config_.nelz > 0) {
-        std::cout << "[PREPROCESS] Generating Cartesian box mesh: "
-                  << config_.nelx << " x " << config_.nely << " x " << config_.nelz
-                  << " = " << config_.nelx * config_.nely * config_.nelz 
-                  << " elements (poly_order p = " << (config_.order - 1) << ", N = " << config_.order << ")" << std::endl;
-        std::cout << "             Domain: [" << config_.xmin << ", " << config_.xmax << "] x ["
-                  << config_.ymin << ", " << config_.ymax << "] x ["
-                  << config_.zmin << ", " << config_.zmax << "]" << std::endl;
-        if (config_.periodicX || config_.periodicY || config_.periodicZ) {
-            std::cout << "             Boundary Conditions: Periodic in ["
-                      << (config_.periodicX ? "X " : "")
-                      << (config_.periodicY ? "Y " : "")
-                      << (config_.periodicZ ? "Z " : "")
-                      << "]" << std::endl;
-        } else {
-            std::cout << "             Boundary Conditions: " << config_.defaultBc << std::endl;
+        if (Comm::isRoot()) {
+            std::cout << "[PREPROCESS] Generating Cartesian box mesh: "
+                      << config_.nelx << " x " << config_.nely << " x " << config_.nelz
+                      << " = " << config_.nelx * config_.nely * config_.nelz 
+                      << " elements (poly_order p = " << (config_.order - 1) << ", N = " << config_.order << ")" << std::endl;
+            std::cout << "             Domain: [" << config_.xmin << ", " << config_.xmax << "] x ["
+                      << config_.ymin << ", " << config_.ymax << "] x ["
+                      << config_.zmin << ", " << config_.zmax << "]" << std::endl;
+            if (config_.periodicX || config_.periodicY || config_.periodicZ) {
+                std::cout << "             Boundary Conditions: Periodic in ["
+                          << (config_.periodicX ? "X " : "")
+                          << (config_.periodicY ? "Y " : "")
+                          << (config_.periodicZ ? "Z " : "")
+                          << "]" << std::endl;
+            } else {
+                std::cout << "             Boundary Conditions: " << config_.defaultBc << std::endl;
+            }
         }
         mesh_->createBoxMesh(config_.nelx, config_.nely, config_.nelz,
                              config_.xmin, config_.xmax,
@@ -155,8 +175,10 @@ void Case::preprocess(const Config& cfg) {
                              config_.periodicX, config_.periodicY, config_.periodicZ,
                              config_.defaultBc);
     } else if (!config_.meshFile.empty() && config_.meshFile != "box") {
-        std::cout << "[PREPROCESS] Loading mesh file: " << config_.meshFile 
-                  << " (poly_order p = " << (config_.order - 1) << ", N = " << config_.order << ")" << std::endl;
+        if (Comm::isRoot()) {
+            std::cout << "[PREPROCESS] Loading mesh file: " << config_.meshFile 
+                      << " (poly_order p = " << (config_.order - 1) << ", N = " << config_.order << ")" << std::endl;
+        }
         bool bOk = false;
         if (config_.meshFile.find(".re2") != std::string::npos) {
             bOk = mesh_->loadFromRe2(config_.meshFile);
@@ -164,14 +186,25 @@ void Case::preprocess(const Config& cfg) {
             bOk = mesh_->loadFromRea(config_.meshFile);
         }
         if (!bOk) {
-            std::cerr << "Warning: Could not load mesh. Falling back to default 3x3x3 mesh." << std::endl;
-            mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0,
-                                 config_.periodicX, config_.periodicY, config_.periodicZ,
-                                 config_.defaultBc);
+            if (Comm::isRoot()) {
+                std::cerr << "[FATAL ERROR] Specified mesh file '" << config_.meshFile
+                          << "' could not be found or loaded. Terminating simulation." << std::endl;
+            }
+            NW_PROFILER_POP();
+            NW_PROFILER_POP();
+            Comm::finalize();
+            std::exit(EXIT_FAILURE);
+        }
+        if (Comm::isRoot()) {
+            std::cout << "[PREPROCESS] Successfully loaded mesh '" << config_.meshFile
+                      << "': " << mesh_->getNumElements() << " elements ("
+                      << mesh_->getTotalPoints() << " GLL collocation points)." << std::endl;
         }
     } else {
-        std::cout << "[PREPROCESS] Using default 3x3x3 Cartesian box mesh (27 elements, Order N = " 
-                  << config_.order << ")" << std::endl;
+        if (Comm::isRoot()) {
+            std::cout << "[PREPROCESS] Using default 3x3x3 Cartesian box mesh (27 elements, Order N = " 
+                      << config_.order << ")" << std::endl;
+        }
         mesh_->createBoxMesh(3, 3, 3, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0,
                              config_.periodicX, config_.periodicY, config_.periodicZ,
                              config_.defaultBc);
@@ -203,19 +236,14 @@ void Case::preprocess(const Config& cfg) {
             config_.zmin = minZ; config_.zmax = maxZ; config_.Lz = maxZ - minZ;
         }
     }
-#ifndef USE_HIP
-    nvtxRangePop();
-#endif
+    NW_PROFILER_POP();
+    timings_.loadMeshSec += std::chrono::duration<double>(Clock::now() - tMeshStart).count();
 
     // Partition mesh across MPI ranks if running in parallel
     if (Comm::size() > 1) {
-#ifndef USE_HIP
-        nvtxRangePushA("Case::partitionMesh");
-#endif
+        NW_PROFILER_PUSH("Case::partitionMesh");
         mesh_->partition(Comm::rank(), Comm::size());
-#ifndef USE_HIP
-        nvtxRangePop();
-#endif
+        NW_PROFILER_POP();
     }
 
     // Allocate the state vector with 6 variables for local collocation points
@@ -249,9 +277,7 @@ void Case::preprocess(const Config& cfg) {
     int actualNumModes = config_.getInt("num_modes", 1);
     std::vector<double> actualModeK;
 
-#ifndef USE_HIP
-    nvtxRangePushA("Case::initFields");
-#endif
+    NW_PROFILER_PUSH("Case::initFields");
     // Field initialization!
     if (initialConditionHook_) {
         std::cout << "[PREPROCESS] Evaluating user initial condition hook..." << std::endl;
@@ -402,13 +428,9 @@ void Case::preprocess(const Config& cfg) {
     } else {
         std::cout << "[PREPROCESS] No initial condition hook provided; all electromagnetic fields initialized to 0.0." << std::endl;
     }
-#ifndef USE_HIP
-    nvtxRangePop();
-#endif
+    NW_PROFILER_POP();
 
-#ifndef USE_HIP
-    nvtxRangePushA("Case::initProbes");
-#endif
+    NW_PROFILER_PUSH("Case::initProbes");
     // Assemble probe coordinates
     std::vector<std::array<double, 3>> allProbes = config_.probes;
     for (const auto& p : customProbes_) {
@@ -453,9 +475,7 @@ void Case::preprocess(const Config& cfg) {
     probes_.init(*mesh_, allProbes, outDir, actualNumModes, config_.Lx, config_.nelx, actualModeK);
     rcsMonitor_.config().c0 = config_.c0;
     rcsMonitor_.init(*mesh_, outDir);
-#ifndef USE_HIP
-    nvtxRangePop();
-#endif
+    NW_PROFILER_POP();
 
     // Synchronize maxSteps and numSteps
     int maxSteps = -1;
@@ -473,9 +493,8 @@ void Case::preprocess(const Config& cfg) {
     // Export initial fields (t = 0) if enabled
     StateVector exportState;
     if (bSaveOutput && config_.exportFields) {
-#ifndef USE_HIP
-        nvtxRangePushA("Case::initialExport");
-#endif
+        auto tIoStart = Clock::now();
+        NW_PROFILER_PUSH("Case::initialExport");
         reconstructTotalField(0.0, exportState);
         if (config_.exportFormat == "hdf5" || config_.exportFormat == "vtk") {
             std::string prec = config_.exportPrecision;
@@ -507,34 +526,41 @@ void Case::preprocess(const Config& cfg) {
         } else {
             saveFields(outDir + "/field_initial.csv", 0.0);
         }
-#ifndef USE_HIP
-        nvtxRangePop();
-#endif
+        NW_PROFILER_POP();
+        timings_.hdf5IoSec += std::chrono::duration<double>(Clock::now() - tIoStart).count();
     }
 
-    // Record t = 0 on probes and RCS surface monitor
-    if (rcsMonitor_.config().incidentPlaneWave.enabled) {
-        if (exportState.empty()) {
-            reconstructTotalField(0.0, exportState);
+    // Record t = 0 on probes and RCS surface monitor only if active
+    if (probes_.getNumProbes() > 0) {
+        if (rcsMonitor_.config().incidentPlaneWave.enabled) {
+            if (exportState.empty()) {
+                reconstructTotalField(0.0, exportState);
+            }
+            probes_.record(0, 0.0, exportState, npts);
+        } else {
+            probes_.record(0, 0.0, state_, npts);
         }
-        probes_.record(0, 0.0, exportState, npts);
-    } else {
-        probes_.record(0, 0.0, state_, npts);
     }
-    rcsMonitor_.record(0, 0.0, 0.5 * dt_, state_, npts);
+    if (rcsMonitor_.isEnabled()) {
+        rcsMonitor_.record(0, 0.0, 0.5 * dt_, state_, npts);
+    }
 
-    // Evaluate initial diagnostics across all ranks
-    double initEnergy = computeTotalEnergy();
-    double initMaxE = getMaxE();
-    double initMaxH = getMaxH();
+    // Evaluate initial diagnostics across all ranks (only if enabled in config)
+    double initEnergy = config_.outputEnergy ? computeTotalEnergy() : 0.0;
+    double initMaxE = config_.outputMaxFields ? getMaxE() : 0.0;
+    double initMaxH = config_.outputMaxFields ? getMaxH() : 0.0;
 
-    // Initialize continuous energy log if output is enabled
-    if (Comm::isRoot() && bSaveOutput) {
+    // Initialize continuous energy log if output and at least one diagnostic are enabled
+    if (Comm::isRoot() && bSaveOutput && (config_.outputMaxFields || config_.outputEnergy)) {
         energyFile_.open(outDir + "/energy_history.csv");
         if (energyFile_.is_open()) {
             energyFile_ << "step,time,maxE,maxH,energy\n";
             energyFile_ << std::scientific << std::setprecision(8);
-            energyFile_ << 0 << "," << 0.0 << "," << initMaxE << "," << initMaxH << "," << initEnergy << "\n";
+            energyFile_ << 0 << "," << 0.0 << ",";
+            if (config_.outputMaxFields) energyFile_ << initMaxE << "," << initMaxH << ",";
+            else energyFile_ << "-,-,";
+            if (config_.outputEnergy) energyFile_ << initEnergy << "\n";
+            else energyFile_ << "-\n";
             energyFile_.flush();
         }
     }
@@ -572,13 +598,23 @@ void Case::preprocess(const Config& cfg) {
                       << (saveOptions_.compressionLevel > 0 && saveOptions_.enableShuffle ? "+shuffle" : "")
                       << ", " << (config_.exportContinuous ? "continuous CG" : "discontinuous DG") << ")" << std::endl;
         }
-        std::cout << "  Initial Energy:    " << std::scientific << std::setprecision(2) << initEnergy << std::endl;
-        std::cout << "  Initial max|E|:    " << std::scientific << std::setprecision(2) << initMaxE 
-                  << " | max|H|: " << std::scientific << std::setprecision(2) << initMaxH << std::endl;
+        if (config_.outputEnergy) {
+            std::cout << "  Initial Energy:    " << std::scientific << std::setprecision(2) << initEnergy << std::endl;
+        } else {
+            std::cout << "  Initial Energy:    -" << std::endl;
+        }
+        if (config_.outputMaxFields) {
+            std::cout << "  Initial max|E|:    " << std::scientific << std::setprecision(2) << initMaxE 
+                      << " | max|H|: " << std::scientific << std::setprecision(2) << initMaxH << std::endl;
+        } else {
+            std::cout << "  Initial max|E|:    - | max|H|: -" << std::endl;
+        }
         std::cout << "\n----------------------------------------------------------\n" << std::endl;
     }
 
     bIsPreprocessed_ = true;
+    NW_PROFILER_POP();
+    timings_.preprocessSec += std::chrono::duration<double>(Clock::now() - tPreStart).count();
 }
 
 // ----------------------
@@ -586,6 +622,9 @@ void Case::preprocess(const Config& cfg) {
 // ----------------------
 void Case::simulate() {
     assert(bIsPreprocessed_ && "Must call preprocess() before simulate()");
+    using Clock = std::chrono::high_resolution_clock;
+    auto tSimStart = Clock::now();
+    NW_PROFILER_PUSH("Case::simulate");
 
     const int npts = mesh_->getTotalPoints();
     const int maxSteps = config_.maxSteps;
@@ -596,18 +635,45 @@ void Case::simulate() {
     if (Comm::isRoot()) {
         std::cout << "[SIMULATE] Initializing full GPU data residency (DgSolver)..." << std::endl;
     }
-#ifndef USE_HIP
-    nvtxRangePushA("Case::initSolverState");
-#endif
+    auto tInitStart = Clock::now();
+    NW_PROFILER_PUSH("Case::initSolverState");
     dgSolver_.reset(new DgSolver());
     dgSolver_->initialize(*mesh_, config_.c0);
     dgSolver_->setIncidentWave(rcsMonitor_.config().incidentPlaneWave);
     dgSolver_->uploadState(state_.data(), state_.size());
-#ifndef USE_HIP
-    nvtxRangePop();
-#endif
+    lastMemHwStats_ = dgSolver_->getMemoryAndHardwareStats();
+    NW_PROFILER_POP();
+    timings_.initSolverSec += std::chrono::duration<double>(Clock::now() - tInitStart).count();
 
     if (Comm::isRoot()) {
+        const double mb = 1.0 / (1024.0 * 1024.0);
+        const double gb = 1.0 / (1024.0 * 1024.0 * 1024.0);
+        size_t hostRss = getHostPeakRssBytes();
+        std::cout << "\n----------------------------------------------------------" << std::endl;
+        std::cout << "             Hardware & Memory Footprint (Rank 0)         " << std::endl;
+        std::cout << "----------------------------------------------------------" << std::endl;
+        std::cout << "  GPU Device:        " << lastMemHwStats_.deviceName
+                  << " (" << lastMemHwStats_.computeUnits << " CUs/SMs, "
+                  << std::fixed << std::setprecision(0) << (lastMemHwStats_.clockRateKHz / 1000.0) << " MHz)" << std::endl;
+        std::cout << "  GPU VRAM Solver:   " << std::fixed << std::setprecision(2)
+                  << (lastMemHwStats_.totalNekWaveVramBytes * mb) << " MiB total allocated by DgSolver" << std::endl;
+        std::cout << "    - State & LSRK:  " << (lastMemHwStats_.stateBuffersBytes * mb) << " MiB" << std::endl;
+        std::cout << "    - Vol Metrics:   " << (lastMemHwStats_.metricBuffersBytes * mb) << " MiB" << std::endl;
+        std::cout << "    - Face Topo:     " << (lastMemHwStats_.faceTopologyBytes * mb) << " MiB" << std::endl;
+        std::cout << "    - Face Scratch:  " << (lastMemHwStats_.faceScratchBytes * mb) << " MiB" << std::endl;
+        if (lastMemHwStats_.pmlBuffersBytes > 0) {
+            std::cout << "    - UPML Aux:      " << (lastMemHwStats_.pmlBuffersBytes * mb) << " MiB" << std::endl;
+        }
+        if (lastMemHwStats_.mpiHaloBuffersBytes > 0) {
+            std::cout << "    - MPI Halos:     " << (lastMemHwStats_.mpiHaloBuffersBytes * mb) << " MiB" << std::endl;
+        }
+        if (lastMemHwStats_.totalGlobalMemBytes > 0) {
+            std::cout << "  GPU Driver VRAM:   " << (lastMemHwStats_.driverUsedVramBytes * mb) << " MiB used / "
+                      << (lastMemHwStats_.totalGlobalMemBytes * gb) << " GiB total" << std::endl;
+        }
+        std::cout << "  Host CPU Peak RSS: " << (hostRss * mb) << " MiB" << std::endl;
+        std::cout << "----------------------------------------------------------" << std::endl;
+
         std::cout << "\n[SIMULATE] Advancing time integration on GPU (LSRK45)..." << std::endl;
         std::cout << std::setw(8) << "Step" 
                   << std::setw(14) << "Time" 
@@ -617,12 +683,17 @@ void Case::simulate() {
         std::cout << "------------------------------------------------------------------" << std::endl;
     }
 
-    const double initEnergy = computeTotalEnergy();
+    const double initEnergy = config_.outputEnergy ? computeTotalEnergy() : 0.0;
     double peakScatteredEnergy = 0.0;
     const bool isScatteredMode = rcsMonitor_.config().incidentPlaneWave.enabled;
     const auto& incWave = rcsMonitor_.config().incidentPlaneWave;
     const double tPulsePassedSphere = std::abs(incWave.x0) + incWave.sphereRadius + 4.5 * incWave.sigmaX;
     StateVector exportState;
+
+    const bool hasActiveProbes   = (probes_.getNumProbes() > 0);
+    const bool hasActiveRcs      = rcsMonitor_.isEnabled();
+    const bool needDiagReduction = (config_.outputMaxFields || config_.outputEnergy);
+    bool lastStepStateDownloaded = false;
 
     g_terminationSignalReceived = 0;
     std::signal(SIGTERM, nekwaveSignalHandler);
@@ -644,44 +715,57 @@ void Case::simulate() {
             currentDt = finalTime - currentTime_;
         }
 
-#ifndef USE_HIP
-        nvtxRangePushA("Case::step");
-#endif
+        NW_PROFILER_PUSH("Case::step");
         step++;
+        auto tStepStart = Clock::now();
         dgSolver_->step(currentDt, currentTime_);
+        timings_.solverStepSec += std::chrono::duration<double>(Clock::now() - tStepStart).count();
         currentTime_ += currentDt;
         currentStep_ = step;
 
-#ifndef USE_HIP
-        nvtxRangePushA("Case::downloadState");
-#endif
-        dgSolver_->downloadState(state_.data(), state_.size());
-#ifndef USE_HIP
-        nvtxRangePop();
-#endif
-
-#ifndef USE_HIP
-        nvtxRangePushA("Case::probesRecord");
-#endif
-        if (isScatteredMode) {
-            reconstructTotalField(currentTime_, exportState);
-            probes_.record(step, currentTime_, exportState, npts);
-        } else {
-            probes_.record(step, currentTime_, state_, npts);
-        }
-        rcsMonitor_.record(step, currentTime_, currentDt, state_, npts);
-#ifndef USE_HIP
-        nvtxRangePop();
-#endif
-
         bool isFinal = (maxSteps > 0 && step >= maxSteps) || (finalTime > 0.0 && currentTime_ >= finalTime - 1e-13);
+        bool willSave = (step % saveFreq == 0 || isFinal) && (hdf5Writer_ != nullptr || hasActiveRcs);
+        bool willDiag = (step % outFreq == 0 || isFinal);
+
+        bool stateDownloaded = false;
+        if (hasActiveProbes || hasActiveRcs || willSave || (willDiag && needDiagReduction)) {
+            auto tDlStart = Clock::now();
+            NW_PROFILER_PUSH("Case::downloadState");
+            dgSolver_->downloadState(state_.data(), state_.size());
+            NW_PROFILER_POP();
+            timings_.downloadStateSec += std::chrono::duration<double>(Clock::now() - tDlStart).count();
+            stateDownloaded = true;
+        }
+
+        bool exportStateReconstructed = false;
+        if (hasActiveProbes || hasActiveRcs) {
+            auto tProbesStart = Clock::now();
+            NW_PROFILER_PUSH("Case::probesRecord");
+            if (hasActiveProbes) {
+                if (isScatteredMode) {
+                    reconstructTotalField(currentTime_, exportState);
+                    exportStateReconstructed = true;
+                    probes_.record(step, currentTime_, exportState, npts);
+                } else {
+                    probes_.record(step, currentTime_, state_, npts);
+                }
+            }
+            if (hasActiveRcs) {
+                rcsMonitor_.record(step, currentTime_, currentDt, state_, npts);
+            }
+            NW_PROFILER_POP();
+            timings_.probesAndRcsSec += std::chrono::duration<double>(Clock::now() - tProbesStart).count();
+        }
 
         // Save HDF5/VTK snapshots and checkpoint RCS spectra according to saveFreq or on final step
         if (step % saveFreq == 0 || isFinal) {
+            auto tIoStart = Clock::now();
             if (hdf5Writer_) {
-#ifndef USE_HIP
-                nvtxRangePushA("Case::hdf5WriteStep");
-#endif
+                NW_PROFILER_PUSH("Case::hdf5WriteStep");
+                if (isScatteredMode && !exportStateReconstructed) {
+                    reconstructTotalField(currentTime_, exportState);
+                    exportStateReconstructed = true;
+                }
                 const double* fieldPtr = isScatteredMode ? exportState.data() : state_.data();
                 bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
                                        saveOptions_.saveDivE || saveOptions_.saveDivH ||
@@ -697,11 +781,12 @@ void Case::simulate() {
                     curlH.empty() ? nullptr : curlH.data()
                 };
                 hdf5Writer_->writeStep(step, currentTime_, fieldPtr, npts, &derived);
-#ifndef USE_HIP
-                nvtxRangePop();
-#endif
+                NW_PROFILER_POP();
             }
-            rcsMonitor_.writeSpectra(false);
+            if (hasActiveRcs) {
+                rcsMonitor_.writeSpectra(false);
+            }
+            timings_.hdf5IoSec += std::chrono::duration<double>(Clock::now() - tIoStart).count();
         }
 
         // Output diagnostics according to outFreq or on final step
@@ -715,6 +800,15 @@ void Case::simulate() {
                               << "). Saving state and finalizing cleanly..." << std::endl;
                 }
                 if (hdf5Writer_ && !(step % saveFreq == 0 || isFinal)) {
+                    auto tIoStart = Clock::now();
+                    if (!stateDownloaded) {
+                        dgSolver_->downloadState(state_.data(), state_.size());
+                        stateDownloaded = true;
+                    }
+                    if (isScatteredMode && !exportStateReconstructed) {
+                        reconstructTotalField(currentTime_, exportState);
+                        exportStateReconstructed = true;
+                    }
                     const double* fieldPtr = isScatteredMode ? exportState.data() : state_.data();
                     bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
                                            saveOptions_.saveDivE || saveOptions_.saveDivH ||
@@ -730,37 +824,59 @@ void Case::simulate() {
                         curlH.empty() ? nullptr : curlH.data()
                     };
                     hdf5Writer_->writeStep(step, currentTime_, fieldPtr, npts, &derived);
+                    timings_.hdf5IoSec += std::chrono::duration<double>(Clock::now() - tIoStart).count();
                 }
                 stopSimulation = true;
             }
-#ifndef USE_HIP
-            nvtxRangePushA("Case::computeDiagnostics");
-#endif
-            double maxE = getMaxE();
-            double maxH = getMaxH();
-            double energy = computeTotalEnergy();
-            if (energy > peakScatteredEnergy) {
-                peakScatteredEnergy = energy;
+
+            double maxE = 0.0;
+            double maxH = 0.0;
+            double energy = 0.0;
+            if (needDiagReduction) {
+                auto tDiagStart = Clock::now();
+                NW_PROFILER_PUSH("Case::computeDiagnostics");
+                if (config_.outputMaxFields) {
+                    maxE = getMaxE();
+                    maxH = getMaxH();
+                }
+                if (config_.outputEnergy) {
+                    energy = computeTotalEnergy();
+                    if (energy > peakScatteredEnergy) {
+                        peakScatteredEnergy = energy;
+                    }
+                }
+                NW_PROFILER_POP();
+                timings_.diagnosticsSec += std::chrono::duration<double>(Clock::now() - tDiagStart).count();
             }
-#ifndef USE_HIP
-            nvtxRangePop();
-#endif
 
             if (Comm::isRoot()) {
                 if (energyFile_.is_open()) {
-                    energyFile_ << step << "," << currentTime_ << "," << maxE << "," << maxH << "," << energy << "\n";
+                    energyFile_ << step << "," << currentTime_ << ",";
+                    if (config_.outputMaxFields) energyFile_ << maxE << "," << maxH << ",";
+                    else energyFile_ << "-,-,";
+                    if (config_.outputEnergy) energyFile_ << energy << "\n";
+                    else energyFile_ << "-\n";
                     energyFile_.flush();
                 }
 
                 std::cout << std::setw(8) << step 
-                          << std::setw(14) << std::fixed << std::setprecision(5) << currentTime_ 
-                          << std::setw(14) << std::fixed << std::setprecision(5) << maxE 
-                          << std::setw(14) << std::fixed << std::setprecision(5) << maxH 
-                          << std::setw(16) << std::scientific << std::setprecision(6) << energy << std::endl;
+                          << std::setw(14) << std::fixed << std::setprecision(5) << currentTime_;
+                if (config_.outputMaxFields) {
+                    std::cout << std::setw(14) << std::fixed << std::setprecision(5) << maxE 
+                              << std::setw(14) << std::fixed << std::setprecision(5) << maxH;
+                } else {
+                    std::cout << std::setw(14) << "-"
+                              << std::setw(14) << "-";
+                }
+                if (config_.outputEnergy) {
+                    std::cout << std::setw(16) << std::scientific << std::setprecision(6) << energy << std::endl;
+                } else {
+                    std::cout << std::setw(16) << "-" << std::endl;
+                }
             }
 
-            // Automatic energy-based stopping criteria:
-            if (initEnergy > 0.0) {
+            // Automatic energy-based stopping criteria (only evaluated when output_energy is enabled):
+            if (config_.outputEnergy && initEnergy > 0.0) {
                 // Total-Field mode:
                 //  1) Stop if energy exceeds +5% of initial energy (numerical instability guard)
                 //  2) Stop if energy drops to <= 50% of initial energy (wave energy absorbed / exited domain)
@@ -782,6 +898,7 @@ void Case::simulate() {
                                   << ") as wave energy exited the domain." << std::endl;
                     }
                     if (hdf5Writer_ && !(step % saveFreq == 0 || isFinal)) {
+                        auto tIoStart = Clock::now();
                         const double* fieldPtr = isScatteredMode ? exportState.data() : state_.data();
                         bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
                                                saveOptions_.saveDivE || saveOptions_.saveDivH ||
@@ -797,10 +914,11 @@ void Case::simulate() {
                             curlH.empty() ? nullptr : curlH.data()
                         };
                         hdf5Writer_->writeStep(step, currentTime_, fieldPtr, npts, &derived);
+                        timings_.hdf5IoSec += std::chrono::duration<double>(Clock::now() - tIoStart).count();
                     }
                     stopSimulation = true;
                 }
-            } else if (isScatteredMode) {
+            } else if (config_.outputEnergy && isScatteredMode) {
                 // Scattered-Field mode (initial energy at t=0 is 0):
                 //  1) Stop if NaN/Inf or runaway energy > 1e3
                 //  2) Stop once the incident pulse has passed the sphere and scattered energy drops to <= 0.5% of peak
@@ -822,6 +940,7 @@ void Case::simulate() {
                                   << ") as scattered waves exited into the UPML." << std::endl;
                     }
                     if (hdf5Writer_ && !(step % saveFreq == 0 || isFinal)) {
+                        auto tIoStart = Clock::now();
                         const double* fieldPtr = exportState.data();
                         bool needDerivatives = saveOptions_.saveCurlE || saveOptions_.saveCurlH ||
                                                saveOptions_.saveDivE || saveOptions_.saveDivH ||
@@ -837,22 +956,29 @@ void Case::simulate() {
                             curlH.empty() ? nullptr : curlH.data()
                         };
                         hdf5Writer_->writeStep(step, currentTime_, fieldPtr, npts, &derived);
+                        timings_.hdf5IoSec += std::chrono::duration<double>(Clock::now() - tIoStart).count();
                     }
                     stopSimulation = true;
                 }
             }
         }
-#ifndef USE_HIP
-        nvtxRangePop();
-#endif
+        lastStepStateDownloaded = stateDownloaded;
+        NW_PROFILER_POP();
         if (stopSimulation) {
             break;
         }
     }
 
-    dgSolver_->downloadState(state_.data(), state_.size());
+    if (!lastStepStateDownloaded &&
+        (needDiagReduction || config_.exportFields || postprocessingHook_ != nullptr)) {
+        auto tDlEndStart = Clock::now();
+        dgSolver_->downloadState(state_.data(), state_.size());
+        timings_.downloadStateSec += std::chrono::duration<double>(Clock::now() - tDlEndStart).count();
+    }
 
     bIsSimulated_ = true;
+    NW_PROFILER_POP();
+    timings_.simulateTotalSec += std::chrono::duration<double>(Clock::now() - tSimStart).count();
 }
 
 // --------------------------
@@ -860,19 +986,18 @@ void Case::simulate() {
 // --------------------------
 void Case::postprocess() {
     assert(bIsSimulated_ && "Must call simulate() before postprocess()");
+    using Clock = std::chrono::high_resolution_clock;
+    auto tPostStart = Clock::now();
+    NW_PROFILER_PUSH("Case::postprocess");
 
     const std::string& outDir = config_.outputDir;
     bool bSaveOutput = (!outDir.empty() && outDir != "none" && outDir != "None" && outDir != "NONE");
 
     // Finalize probe observations and Near-to-Far-Field (NTFF) RCS calculation
-#ifndef USE_HIP
-    nvtxRangePushA("Case::probesFinalize");
-#endif
+    NW_PROFILER_PUSH("Case::probesFinalize");
     probes_.finalize();
     rcsMonitor_.finalize();
-#ifndef USE_HIP
-    nvtxRangePop();
-#endif
+    NW_PROFILER_POP();
 
     // Close energy history log
     if (energyFile_.is_open()) {
@@ -884,13 +1009,11 @@ void Case::postprocess() {
 
     // Finalize HDF5 time series writer if active
     if (hdf5Writer_) {
-#ifndef USE_HIP
-        nvtxRangePushA("Case::hdf5Close");
-#endif
+        auto tIoStart = Clock::now();
+        NW_PROFILER_PUSH("Case::hdf5Close");
         hdf5Writer_->close();
-#ifndef USE_HIP
-        nvtxRangePop();
-#endif
+        NW_PROFILER_POP();
+        timings_.hdf5IoSec += std::chrono::duration<double>(Clock::now() - tIoStart).count();
     }
 
     // Export final field distributions if enabled and format is not HDF5/VTK
@@ -911,8 +1034,109 @@ void Case::postprocess() {
         postprocessingHook_(*this);
     }
 
+    // Refresh peak memory stats before releasing GPU memory
     if (dgSolver_) {
+        lastMemHwStats_ = dgSolver_->getMemoryAndHardwareStats();
         dgSolver_->finalize();
+    }
+
+    NW_PROFILER_POP();
+    timings_.postprocessSec += std::chrono::duration<double>(Clock::now() - tPostStart).count();
+
+    if (Comm::isRoot()) {
+        const double totalWallSec = std::max(1e-9, timings_.preprocessSec + timings_.simulateTotalSec + timings_.postprocessSec);
+        const int stepsDone = std::max(1, currentStep_);
+        const double nptsTotal = static_cast<double>(mesh_->getTotalPoints());
+        const double mdofPerSec = (nptsTotal * 6.0 * stepsDone / 1.0e6) / std::max(1e-9, timings_.solverStepSec);
+        size_t hostPeakRss = getHostPeakRssBytes();
+
+        std::cout << "\n----------------------------------------------------------" << std::endl;
+        std::cout << "              HPC Performance & Trace Summary             " << std::endl;
+        std::cout << "----------------------------------------------------------" << std::endl;
+        std::cout << std::fixed << std::setprecision(3);
+        std::cout << "  Total Wall Time:       " << std::setw(8) << totalWallSec << " s (100.0%)" << std::endl;
+        std::cout << "    - Preprocess:        " << std::setw(8) << timings_.preprocessSec << " s ("
+                  << std::setprecision(1) << (100.0 * timings_.preprocessSec / totalWallSec) << "%)" << std::setprecision(3) << std::endl;
+        std::cout << "    - GPU Solver Init:   " << std::setw(8) << timings_.initSolverSec << " s ("
+                  << std::setprecision(1) << (100.0 * timings_.initSolverSec / totalWallSec) << "%)" << std::setprecision(3) << std::endl;
+        std::cout << "    - GPU LSRK45 Steps:  " << std::setw(8) << timings_.solverStepSec << " s ("
+                  << std::setprecision(1) << (100.0 * timings_.solverStepSec / totalWallSec) << "%)" << std::setprecision(3) << std::endl;
+        std::cout << "    - D2H State Copy:    " << std::setw(8) << timings_.downloadStateSec << " s ("
+                  << std::setprecision(1) << (100.0 * timings_.downloadStateSec / totalWallSec) << "%)" << std::setprecision(3) << std::endl;
+        std::cout << "    - Probes & NTFF RCS: " << std::setw(8) << timings_.probesAndRcsSec << " s ("
+                  << std::setprecision(1) << (100.0 * timings_.probesAndRcsSec / totalWallSec) << "%)" << std::setprecision(3) << std::endl;
+        std::cout << "    - HDF5 / Field I/O:  " << std::setw(8) << timings_.hdf5IoSec << " s ("
+                  << std::setprecision(1) << (100.0 * timings_.hdf5IoSec / totalWallSec) << "%)" << std::setprecision(3) << std::endl;
+        std::cout << "    - Diagnostics:       " << std::setw(8) << timings_.diagnosticsSec << " s ("
+                  << std::setprecision(1) << (100.0 * timings_.diagnosticsSec / totalWallSec) << "%)" << std::setprecision(3) << std::endl;
+        std::cout << "    - Postprocess:       " << std::setw(8) << timings_.postprocessSec << " s ("
+                  << std::setprecision(1) << (100.0 * timings_.postprocessSec / totalWallSec) << "%)" << std::setprecision(3) << std::endl;
+        std::cout << "  GPU Step Throughput:   " << std::setprecision(2) << (stepsDone / std::max(1e-9, timings_.solverStepSec))
+                  << " steps/s (" << mdofPerSec << " MDOF/s)" << std::endl;
+        std::cout << "----------------------------------------------------------\n" << std::endl;
+
+        if (bSaveOutput) {
+            std::ofstream tel(outDir + "/hpc_telemetry.json");
+            if (tel.is_open()) {
+                size_t hostStateBytes = state_.size() * sizeof(double);
+                size_t hostMeshBytes = mesh_->getTotalPoints() * 14ULL * sizeof(double) +
+                                       mesh_->getFaceData().size() * 64ULL;
+                tel << "{\n"
+                    << "  \"hardware\": {\n"
+                    << "    \"device_name\": \"" << lastMemHwStats_.deviceName << "\",\n"
+                    << "    \"compute_units\": " << lastMemHwStats_.computeUnits << ",\n"
+                    << "    \"clock_rate_khz\": " << lastMemHwStats_.clockRateKHz << ",\n"
+                    << "    \"memory_clock_rate_khz\": " << lastMemHwStats_.memoryClockRateKHz << ",\n"
+                    << "    \"memory_bus_width_bits\": " << lastMemHwStats_.memoryBusWidthBits << ",\n"
+                    << "    \"total_global_mem_bytes\": " << lastMemHwStats_.totalGlobalMemBytes << ",\n"
+                    << "    \"mpi_ranks\": " << Comm::size() << "\n"
+                    << "  },\n"
+                    << "  \"problem\": {\n"
+                    << "    \"num_elements\": " << lastMemHwStats_.numElements << ",\n"
+                    << "    \"poly_order\": " << (lastMemHwStats_.orderN - 1) << ",\n"
+                    << "    \"order_n\": " << lastMemHwStats_.orderN << ",\n"
+                    << "    \"npts\": " << lastMemHwStats_.npts << ",\n"
+                    << "    \"total_face_points\": " << lastMemHwStats_.totalFacePoints << ",\n"
+                    << "    \"max_pml_elements\": " << lastMemHwStats_.maxPmlElements << ",\n"
+                    << "    \"npts_pml\": " << lastMemHwStats_.nptsPml << ",\n"
+                    << "    \"num_halo_points\": " << lastMemHwStats_.numHaloPoints << ",\n"
+                    << "    \"steps_executed\": " << currentStep_ << ",\n"
+                    << "    \"dt\": " << std::scientific << std::setprecision(8) << dt_ << ",\n"
+                    << "    \"cfl\": " << cfl_ << "\n"
+                    << "  },\n"
+                    << "  \"memory_bytes\": {\n"
+                    << "    \"gpu_state_and_rk\": " << lastMemHwStats_.stateBuffersBytes << ",\n"
+                    << "    \"gpu_volume_metrics\": " << lastMemHwStats_.metricBuffersBytes << ",\n"
+                    << "    \"gpu_face_topology\": " << lastMemHwStats_.faceTopologyBytes << ",\n"
+                    << "    \"gpu_face_scratch\": " << lastMemHwStats_.faceScratchBytes << ",\n"
+                    << "    \"gpu_pml_auxiliary\": " << lastMemHwStats_.pmlBuffersBytes << ",\n"
+                    << "    \"gpu_mpi_halo\": " << lastMemHwStats_.mpiHaloBuffersBytes << ",\n"
+                    << "    \"gpu_total_solver\": " << lastMemHwStats_.totalNekWaveVramBytes << ",\n"
+                    << "    \"gpu_driver_used\": " << lastMemHwStats_.driverUsedVramBytes << ",\n"
+                    << "    \"gpu_driver_free\": " << lastMemHwStats_.driverFreeVramBytes << ",\n"
+                    << "    \"gpu_driver_total\": " << lastMemHwStats_.totalGlobalMemBytes << ",\n"
+                    << "    \"host_peak_rss\": " << hostPeakRss << ",\n"
+                    << "    \"host_state_vector\": " << hostStateBytes << ",\n"
+                    << "    \"host_mesh_metrics\": " << hostMeshBytes << "\n"
+                    << "  },\n"
+                    << "  \"phase_timings_sec\": {\n"
+                    << std::fixed << std::setprecision(6)
+                    << "    \"preprocess\": " << timings_.preprocessSec << ",\n"
+                    << "    \"load_mesh\": " << timings_.loadMeshSec << ",\n"
+                    << "    \"init_solver\": " << timings_.initSolverSec << ",\n"
+                    << "    \"gpu_solver_step\": " << timings_.solverStepSec << ",\n"
+                    << "    \"device_to_host_copy\": " << timings_.downloadStateSec << ",\n"
+                    << "    \"probes_and_rcs\": " << timings_.probesAndRcsSec << ",\n"
+                    << "    \"hdf5_io\": " << timings_.hdf5IoSec << ",\n"
+                    << "    \"diagnostics\": " << timings_.diagnosticsSec << ",\n"
+                    << "    \"postprocess\": " << timings_.postprocessSec << ",\n"
+                    << "    \"total_simulate\": " << timings_.simulateTotalSec << ",\n"
+                    << "    \"total_wall\": " << totalWallSec << "\n"
+                    << "  }\n"
+                    << "}\n";
+                tel.close();
+            }
+        }
     }
 
     bIsPostprocessed_ = true;
