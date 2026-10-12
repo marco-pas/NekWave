@@ -287,9 +287,7 @@ public:
 
     void uploadState(const double* hostState, size_t size) {
         assert(bInitialized_ && size == static_cast<size_t>(totalEntries_));
-#ifndef USE_HIP
-        nvtxRangePushA("DgSolver::uploadState");
-#endif
+        NW_PROFILER_PUSH("DgSolver::uploadState");
         if (numHaloPoints_ == 0) {
             NW_GPU_CHECK(cudaMemcpyAsync(d_state_, hostState, size * sizeof(double), cudaMemcpyHostToDevice, stream_));
         } else {
@@ -301,16 +299,12 @@ public:
             ));
         }
         NW_GPU_CHECK(cudaStreamSynchronize(stream_));
-#ifndef USE_HIP
-        nvtxRangePop();
-#endif
+        NW_PROFILER_POP();
     }
 
     void downloadState(double* hostState, size_t size) const {
         assert(bInitialized_ && size == static_cast<size_t>(totalEntries_));
-#ifndef USE_HIP
-        nvtxRangePushA("DgSolver::downloadState");
-#endif
+        NW_PROFILER_PUSH("DgSolver::downloadState");
         if (numHaloPoints_ == 0) {
             NW_GPU_CHECK(cudaMemcpyAsync(hostState, d_state_, size * sizeof(double), cudaMemcpyDeviceToHost, stream_));
         } else {
@@ -322,9 +316,7 @@ public:
             ));
         }
         NW_GPU_CHECK(cudaStreamSynchronize(stream_));
-#ifndef USE_HIP
-        nvtxRangePop();
-#endif
+        NW_PROFILER_POP();
     }
 
     /**
@@ -351,9 +343,7 @@ public:
      */
     void step(double dt, double time) {
         assert(bInitialized_);
-#ifndef USE_HIP
-        nvtxRangePushA("DgSolver::step");
-#endif
+        NW_PROFILER_PUSH("DgSolver::step");
 
         // Pointers into the 6 field components of state_ (using stateStride_)
         const double* Ex = d_state_ + 0 * stateStride_;
@@ -374,15 +364,11 @@ public:
         // Advance through the 5 stages of Low-Storage Runge-Kutta (LSRK45)
         for (int stage = 0; stage < 5; ++stage) {
             const double stageTime = time + rk4c_[stage] * dt;
-#ifndef USE_HIP
-            nvtxRangePushA("LSRK45_Stage");
-#endif
+            NW_PROFILER_PUSH("LSRK45_Stage");
 #ifdef NEKWAVE_ENABLE_MPI
             std::vector<MPI_Request> mpiReqs;
             if (numHaloPoints_ > 0) {
-#ifndef USE_HIP
-                nvtxRangePushA("MPI_Irecv");
-#endif
+                NW_PROFILER_PUSH("MPI_Irecv");
                 mpiReqs.reserve(2 * haloExchanges_.size());
                 // 1. Post non-blocking receives for ghost traces
                 for (size_t h = 0; h < haloExchanges_.size(); ++h) {
@@ -393,13 +379,9 @@ public:
                               ex.neighborRank, tag, MPI_COMM_WORLD, &req);
                     mpiReqs.push_back(req);
                 }
-#ifndef USE_HIP
-                nvtxRangePop();
-#endif
+                NW_PROFILER_POP();
 
-#ifndef USE_HIP
-                nvtxRangePushA("MPI_PackHalo");
-#endif
+                NW_PROFILER_PUSH("MPI_PackHalo");
                 // 2. Pack send buffer on GPU from local volume traces
                 nekwave::device::launch_pack_halo(
                     d_state_, d_mpiSendBuf_, d_sendVolIndices_,
@@ -407,14 +389,10 @@ public:
                     numHaloPoints_, stateStride_, stream_
                 );
                 NW_GPU_CHECK(cudaStreamSynchronize(stream_));
-#ifndef USE_HIP
-                nvtxRangePop();
-#endif
+                NW_PROFILER_POP();
 
-#ifndef USE_HIP
-                nvtxRangePushA("MPI_Isend");
-#endif
-                // 3. Post non-blocking sends directly from GPU memory (CUDA-aware MPI)
+                NW_PROFILER_PUSH("MPI_Isend");
+                // 3. Post non-blocking sends directly from GPU memory (CUDA/ROCm-aware MPI)
                 for (size_t h = 0; h < haloExchanges_.size(); ++h) {
                     const auto& ex = haloExchanges_[h];
                     int tag = 2000 + stage;
@@ -423,15 +401,11 @@ public:
                               ex.neighborRank, tag, MPI_COMM_WORLD, &req);
                     mpiReqs.push_back(req);
                 }
-#ifndef USE_HIP
-                nvtxRangePop();
-#endif
+                NW_PROFILER_POP();
             }
 #endif
 
-#ifndef USE_HIP
-            nvtxRangePushA("Launch_VolumeCurl");
-#endif
+            NW_PROFILER_PUSH("Launch_VolumeCurl");
             // ------------------------------------------------------------------
             // Step 1: Volume curl of H for Electric field residual: +curl(H)
             // Evaluates dE/dt = +(1/eps) * curl(H) in reference curvilinear coordinates
@@ -457,38 +431,26 @@ public:
                 d_rz_, d_sz_, d_tz_,
                 -1.0, N_, nelt_, stream_
             );
-#ifndef USE_HIP
-            nvtxRangePop();
-#endif
+            NW_PROFILER_POP();
 
 #ifdef NEKWAVE_ENABLE_MPI
             // Synchronize MPI communication before surface flux evaluation
             if (numHaloPoints_ > 0) {
-#ifndef USE_HIP
-                nvtxRangePushA("MPI_Waitall");
-#endif
+                NW_PROFILER_PUSH("MPI_Waitall");
                 MPI_Waitall(static_cast<int>(mpiReqs.size()), mpiReqs.data(), MPI_STATUSES_IGNORE);
-#ifndef USE_HIP
-                nvtxRangePop();
-#endif
+                NW_PROFILER_POP();
 
-#ifndef USE_HIP
-                nvtxRangePushA("MPI_UnpackHalo");
-#endif
+                NW_PROFILER_PUSH("MPI_UnpackHalo");
                 // Unpack received ghost data into ghost slots of d_state_
                 nekwave::device::launch_unpack_halo(
                     d_mpiRecvBuf_, d_state_, d_recvBufOffsets_,
                     d_exchangeSizes_, numHaloPoints_, npts_, stateStride_, stream_
                 );
-#ifndef USE_HIP
-                nvtxRangePop();
-#endif
+                NW_PROFILER_POP();
             }
 #endif
 
-#ifndef USE_HIP
-            nvtxRangePushA("Launch_SurfaceFluxes");
-#endif
+            NW_PROFILER_PUSH("Launch_SurfaceFluxes");
             // ------------------------------------------------------------------
             // Step 3: Restrict volume solution fields to face traces (fEN, fHN)
             // Corresponds to cem_maxwell_restrict_to_face in NekCEM
@@ -545,13 +507,9 @@ public:
             nekwave::device::launch_inv_mass(
                 d_rhs_, d_jac_, d_w3_, nelt_, nxyz_, npts_, stream_
             );
-#ifndef USE_HIP
-            nvtxRangePop();
-#endif
+            NW_PROFILER_POP();
 
-#ifndef USE_HIP
-            nvtxRangePushA("Launch_UpdateLSRK45");
-#endif
+            NW_PROFILER_PUSH("Launch_UpdateLSRK45");
             // ------------------------------------------------------------------
             // Step 7: Update LSRK45 state & auxiliary vector 'k'
             // Carpenter & Kennedy (1994) low-storage state update:
@@ -568,27 +526,17 @@ public:
                     rk4a_[stage], rk4b_[stage], dt, nptsPml_, nptsPml_, stream_
                 );
             }
-#ifndef USE_HIP
-            nvtxRangePop();
-#endif
+            NW_PROFILER_POP();
 
-#ifndef USE_HIP
-            nvtxRangePop(); // LSRK45_Stage
-#endif
+            NW_PROFILER_POP(); // LSRK45_Stage
         }
 
         // Stream synchronization only occurs at the end of the full time step
-#ifndef USE_HIP
-        nvtxRangePushA("StreamSynchronize");
-#endif
+        NW_PROFILER_PUSH("StreamSynchronize");
         NW_GPU_CHECK(cudaStreamSynchronize(stream_));
-#ifndef USE_HIP
-        nvtxRangePop();
-#endif
+        NW_PROFILER_POP();
 
-#ifndef USE_HIP
-        nvtxRangePop(); // DgSolver::step
-#endif
+        NW_PROFILER_POP(); // DgSolver::step
     }
 
     void freeBuffers() {
@@ -657,21 +605,93 @@ public:
         bInitialized_ = false;
     }
 
+    MemoryAndHardwareStats getMemoryAndHardwareStats() const {
+        MemoryAndHardwareStats stats;
+        stats.orderN = N_;
+        stats.numElements = nelt_;
+        stats.npts = npts_;
+        stats.totalFacePoints = totalFacePoints_;
+        stats.maxPmlElements = maxPml_;
+        stats.nptsPml = nptsPml_;
+        stats.numHaloPoints = numHaloPoints_;
+
+        stats.stateBuffersBytes = (6 * static_cast<size_t>(stateStride_) + 2 * static_cast<size_t>(totalEntries_)) * sizeof(double);
+        stats.metricBuffersBytes = (static_cast<size_t>(N_ * N_) + static_cast<size_t>(nxyz_) + 10 * static_cast<size_t>(npts_)) * sizeof(double);
+        stats.faceTopologyBytes = 3 * static_cast<size_t>(totalFacePoints_) * sizeof(int) +
+                                  7 * static_cast<size_t>(totalFacePoints_) * sizeof(double);
+        stats.faceScratchBytes = 12 * static_cast<size_t>(totalFacePoints_) * sizeof(double);
+        if (maxPml_ > 0) {
+            stats.pmlBuffersBytes = static_cast<size_t>(maxPml_) * sizeof(int) +
+                                    (3 * static_cast<size_t>(npts_) + 18 * static_cast<size_t>(nptsPml_)) * sizeof(double);
+        }
+        if (numHaloPoints_ > 0) {
+            stats.mpiHaloBuffersBytes = 4 * static_cast<size_t>(numHaloPoints_) * sizeof(int) +
+                                        12 * static_cast<size_t>(numHaloPoints_) * sizeof(double);
+        }
+        stats.totalNekWaveVramBytes = stats.stateBuffersBytes + stats.metricBuffersBytes +
+                                      stats.faceTopologyBytes + stats.faceScratchBytes +
+                                      stats.pmlBuffersBytes + stats.mpiHaloBuffersBytes;
+
+        int dev = 0;
+#if defined(USE_HIP) || defined(NEKWAVE_ENABLE_HIP) || defined(__HIPCC__) || defined(__HIP__)
+        if (hipGetDevice(&dev) == hipSuccess) {
+            hipDeviceProp_t prop;
+            if (hipGetDeviceProperties(&prop, dev) == hipSuccess) {
+                stats.deviceName = prop.name;
+                stats.archName = prop.gcnArchName;
+                stats.computeUnits = prop.multiProcessorCount;
+                stats.clockRateKHz = prop.clockRate;
+                stats.memoryClockRateKHz = prop.memoryClockRate;
+                stats.memoryBusWidthBits = prop.memoryBusWidth;
+                stats.totalGlobalMemBytes = prop.totalGlobalMem;
+                stats.sharedMemPerBlockBytes = prop.sharedMemPerBlock;
+            }
+        }
+        size_t freeMem = 0, totalMem = 0;
+        if (hipMemGetInfo(&freeMem, &totalMem) == hipSuccess) {
+            stats.driverFreeVramBytes = freeMem;
+            stats.driverUsedVramBytes = (totalMem >= freeMem) ? (totalMem - freeMem) : 0;
+            if (stats.totalGlobalMemBytes == 0) stats.totalGlobalMemBytes = totalMem;
+        }
+#else
+        if (cudaGetDevice(&dev) == cudaSuccess) {
+            cudaDeviceProp prop;
+            if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+                stats.deviceName = prop.name;
+                stats.archName = "sm_" + std::to_string(prop.major * 10 + prop.minor);
+                stats.computeUnits = prop.multiProcessorCount;
+                stats.clockRateKHz = prop.clockRate;
+                stats.memoryClockRateKHz = prop.memoryClockRate;
+                stats.memoryBusWidthBits = prop.memoryBusWidth;
+                stats.totalGlobalMemBytes = prop.totalGlobalMem;
+                stats.sharedMemPerBlockBytes = prop.sharedMemPerBlock;
+            }
+        }
+        size_t freeMem = 0, totalMem = 0;
+        if (cudaMemGetInfo(&freeMem, &totalMem) == cudaSuccess) {
+            stats.driverFreeVramBytes = freeMem;
+            stats.driverUsedVramBytes = (totalMem >= freeMem) ? (totalMem - freeMem) : 0;
+            if (stats.totalGlobalMemBytes == 0) stats.totalGlobalMemBytes = totalMem;
+        }
+#endif
+        return stats;
+    }
+
 private:
     bool bInitialized_;
     cudaStream_t stream_;
 
-    int N_;
-    int nelt_;
-    int nxyz_;
-    int npts_;
-    int numHaloPoints_;
-    int stateStride_;
-    int totalEntries_;
-    int totalFacePoints_;
+    int N_ = 0;
+    int nelt_ = 0;
+    int nxyz_ = 0;
+    int npts_ = 0;
+    int numHaloPoints_ = 0;
+    int stateStride_ = 0;
+    int totalEntries_ = 0;
+    int totalFacePoints_ = 0;
     int maxPml_ = 0;
     int nptsPml_ = 0;
-    double c0_;
+    double c0_ = 1.0;
     IncidentPlaneWaveConfig incWave_;
 
     std::vector<double> rk4a_;
@@ -755,4 +775,8 @@ void DgSolver::step(double dt, double time) {
 
 void DgSolver::finalize() {
     impl_->freeBuffers();
+}
+
+DgSolver::MemoryAndHardwareStats DgSolver::getMemoryAndHardwareStats() const {
+    return impl_->getMemoryAndHardwareStats();
 }
