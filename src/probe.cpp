@@ -44,6 +44,13 @@ void ProbeManager::init(const Mesh& mesh,
     m_outputDir = outputDir;
     m_probes.clear();
 
+    // if no coords for probes then set to empty
+    if (targetCoords.empty()) {
+        m_initialized = false;
+        m_saveToFile = false;
+        return;
+    }
+
     bool bSaveToFile = (!m_outputDir.empty() && m_outputDir != "none" && m_outputDir != "None" && m_outputDir != "NONE");
     m_saveToFile = bSaveToFile;
 
