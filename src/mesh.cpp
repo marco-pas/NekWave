@@ -4,9 +4,8 @@
 // this is also where the operator gets built as these olny depend on the mesh topology
 
 #include "mesh.hpp"
-#ifndef USE_HIP
-#include <nvtx3/nvToolsExt.h>
-#endif
+#include "device/gpu_runtime.hpp"
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -64,6 +63,9 @@ void Mesh::setN(int N) {
 
 // @@ GLL collocation points, weights, and derivative matrix setup
 void Mesh::setupGLL() {
+    using Clock = std::chrono::high_resolution_clock;
+    auto tStart = Clock::now();
+    NW_PROFILER_PUSH("Mesh::setupGLL");
     int N = m_N;
     int p = N - 1; // polynomial degree
 
@@ -144,6 +146,8 @@ void Mesh::setupGLL() {
             }
         }
     }
+    NW_PROFILER_POP();
+    m_subTimings.gllAndVolumeMetricsSec += std::chrono::duration<double>(Clock::now() - tStart).count();
 }
 
 // @@ configuring an element with an affine bounding box transformation
@@ -188,6 +192,9 @@ void Mesh::setAffineBox(int elementIdx, double xmin, double xmax,
 // General Trilinear Coordinate Transformation
 // x(r,s,t) = sum_{a=0}^7 N_a(r,s,t) * v_a
 void Mesh::computeMetricsFromCorners() {
+    using Clock = std::chrono::high_resolution_clock;
+    auto tStart = Clock::now();
+    NW_PROFILER_PUSH("Mesh::computeMetricsFromCorners");
     m_coord_x.assign(m_totalPoints, 0.0);
     m_coord_y.assign(m_totalPoints, 0.0);
     m_coord_z.assign(m_totalPoints, 0.0);
@@ -313,6 +320,8 @@ void Mesh::computeMetricsFromCorners() {
             }
         }
     }
+    NW_PROFILER_POP();
+    m_subTimings.gllAndVolumeMetricsSec += std::chrono::duration<double>(Clock::now() - tStart).count();
 }
 
 // @@ Helper to resolve relative mesh file paths across working directories and NEKWAVE_SOURCE_DIR
@@ -339,14 +348,20 @@ static std::string resolveMeshFilePath(const std::string& filename, std::ios_bas
 
 // @@ .rea file parser taken 1-to-1 from NekCEM / Nek5000
 bool Mesh::loadFromRea(const std::string& filename) {
+    using Clock = std::chrono::high_resolution_clock;
+    m_subTimings = PreprocessSubTimings{};
+    auto tParseStart = Clock::now();
+    NW_PROFILER_PUSH("Mesh::parseReaFile");
     std::string resolvedPath = resolveMeshFilePath(filename, std::ios_base::in);
     if (resolvedPath.empty()) {
         std::cerr << "[ERROR] Could not open .rea mesh file: '" << filename << "'" << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
     std::ifstream file(resolvedPath);
     if (!file.is_open()) {
         std::cerr << "[ERROR] Could not open .rea mesh file: '" << resolvedPath << "'" << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -371,6 +386,7 @@ bool Mesh::loadFromRea(const std::string& filename) {
 
     if (!foundMesh) {
         std::cerr << "Error: Could not find **MESH DATA** section in " << resolvedPath << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -381,6 +397,7 @@ bool Mesh::loadFromRea(const std::string& filename) {
     }
 
     if (nel < 0) {
+        NW_PROFILER_POP();
         std::cout << "[MESH] Negative NEL = " << nel << " indicates binary .re2 mesh. Redirecting to loadFromRe2..." << std::endl;
         std::string re2name = resolvedPath;
         size_t dotPos = re2name.rfind('.');
@@ -394,6 +411,7 @@ bool Mesh::loadFromRea(const std::string& filename) {
 
     if (nel == 0) {
         std::cerr << "Error: Invalid number of elements (NEL = " << nel << ") in " << resolvedPath << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -467,6 +485,8 @@ bool Mesh::loadFromRea(const std::string& filename) {
             m_faces.push_back(info);
         }
     }
+    NW_PROFILER_POP();
+    m_subTimings.fileReadAndConnectivitySec += std::chrono::duration<double>(Clock::now() - tParseStart).count();
 
     // @@ setting up GLL basis and evaluating metrics
     setupGLL();
@@ -479,14 +499,20 @@ bool Mesh::loadFromRea(const std::string& filename) {
 
 // @@ load mesh directly from a NekCEM binary .re2 file
 bool Mesh::loadFromRe2(const std::string& filename, int nel) {
+    using Clock = std::chrono::high_resolution_clock;
+    m_subTimings = PreprocessSubTimings{};
+    auto tParseStart = Clock::now();
+    NW_PROFILER_PUSH("Mesh::parseRe2AndPairFaces");
     std::string resolvedPath = resolveMeshFilePath(filename, std::ios::binary);
     if (resolvedPath.empty()) {
         std::cerr << "[ERROR] Could not open .re2 mesh file: '" << filename << "'" << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
     std::ifstream file(resolvedPath, std::ios::binary);
     if (!file.is_open()) {
         std::cerr << "[ERROR] Could not open .re2 mesh file: '" << resolvedPath << "'" << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -495,6 +521,7 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
     file.read(header, 80);
     if (!file) {
         std::cerr << "Error: Failed to read header from " << filename << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -503,6 +530,7 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
     file.read(reinterpret_cast<char*>(&tag), sizeof(float));
     if (!file) {
         std::cerr << "Error: Failed to read tag from " << filename << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -518,6 +546,7 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
 
     if (nel <= 0) {
         std::cerr << "Error: Invalid number of elements (NEL = " << nel << ") in " << filename << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -530,6 +559,7 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
     file.read(reinterpret_cast<char*>(elemBuf.data()), static_cast<std::streamsize>(elemBuf.size() * sizeof(double)));
     if (!file) {
         std::cerr << "[ERROR] Failed to read element coordinate block from " << resolvedPath << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -650,6 +680,8 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
             }
         }
     }
+    NW_PROFILER_POP();
+    m_subTimings.fileReadAndConnectivitySec += std::chrono::duration<double>(Clock::now() - tParseStart).count();
 
     setupGLL();
     computeMetricsFromCorners();
@@ -712,13 +744,14 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                          const std::string& outerBc) {
     if (nelx < 1 || nely < 1 || nelz < 1) return false;
 
-#ifndef USE_HIP
-    nvtxRangePushA("Mesh::createBoxMesh");
-#endif
+    using Clock = std::chrono::high_resolution_clock;
+    m_subTimings = PreprocessSubTimings{};
+    NW_PROFILER_PUSH("Mesh::createBoxMesh");
     m_numElements = nelx * nely * nelz;
     m_totalPoints = m_numElements * m_numPointsPerElement;
     setupGLL();
 
+    auto tBoxStart = Clock::now();
     std::string extBc = BoundaryConditions::toString(BoundaryConditions::parseBcTag(outerBc, -1));
     if (extBc == "E" || extBc == "PERIODIC" || extBc == "MPI") {
         extBc = "PEC";
@@ -861,15 +894,14 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
             }
         }
     }
+    m_subTimings.fileReadAndConnectivitySec += std::chrono::duration<double>(Clock::now() - tBoxStart).count();
 
     // Evaluate metric factor tensors and face trace connections
     computeMetricsFromCorners();
     setupFaceData();
     setupPml();
 
-#ifndef USE_HIP
-    nvtxRangePop();
-#endif
+    NW_PROFILER_POP();
     return true;
 }
 
@@ -912,6 +944,7 @@ void Mesh::initialize() {
 // @@ compute minimum node distance dxmin matching NekCEM's get_dxmin
 // Finds smallest spacing between adjacent GLL nodes across all hex elements --> CFL
 double Mesh::computeMinNodeDistance() const {
+    NW_PROFILER_PUSH("Mesh::computeMinNodeDistance");
     double minD2 = 1.0e20;
     int N = m_N;
     double dxiMin = (N > 1) ? (m_gll_z[1] - m_gll_z[0]) : 2.0;
@@ -967,6 +1000,7 @@ double Mesh::computeMinNodeDistance() const {
         }
     }
 
+    NW_PROFILER_POP();
     return std::sqrt(minD2);
 }
 
@@ -1024,9 +1058,9 @@ int Mesh::getFaceNodeVolIndex(int elemId, int faceId, int p, int q) const {
 // @@ computing outward physical normal vectors, face quadrature weights, and neighbor node connectivity
 // PIOLA transform & NANSON formula: n * dA = J * J^{-T} * n_ref * dA_ref
 void Mesh::setupFaceData() {
-#ifndef USE_HIP
-    nvtxRangePushA("Mesh::setupFaceData");
-#endif
+    using Clock = std::chrono::high_resolution_clock;
+    auto tStart = Clock::now();
+    NW_PROFILER_PUSH("Mesh::setupFaceData");
     const size_t numFaces = m_faces.size();
     m_faceData.resize(numFaces);
 
@@ -1174,14 +1208,18 @@ void Mesh::setupFaceData() {
             }
         }
     }
-#ifndef USE_HIP
-    nvtxRangePop();
-#endif
+    NW_PROFILER_POP();
+    m_subTimings.faceNormalsAndMatchingSec += std::chrono::duration<double>(Clock::now() - tStart).count();
 }
 
 // @@ initialize UPML topology and conductivity profiles if PML boundary faces exist
 void Mesh::setupPml() {
+    using Clock = std::chrono::high_resolution_clock;
+    auto tStart = Clock::now();
+    NW_PROFILER_PUSH("Mesh::setupPml");
     m_pmlData = BoundaryConditions::initializePml(*this, m_pmlConfig);
+    NW_PROFILER_POP();
+    m_subTimings.pmlInitSec += std::chrono::duration<double>(Clock::now() - tStart).count();
 }
 
 // @@ multi-GPU MPI domain decomposition (Recursive Coordinate Bisection)

@@ -165,6 +165,12 @@ private:
     struct PhaseTimings {
         double preprocessSec = 0.0;
         double loadMeshSec = 0.0;
+        double meshParseAndTopoSec = 0.0;
+        double volumeMetricsSec = 0.0;
+        double faceSetupSec = 0.0;
+        double pmlSetupSec = 0.0;
+        double cflAndDtSec = 0.0;
+        double initFieldsAndProbesSec = 0.0;
         double initSolverSec = 0.0;
         double solverStepSec = 0.0;
         double downloadStateSec = 0.0;

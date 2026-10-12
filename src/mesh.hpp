@@ -165,6 +165,15 @@ public:
     const PmlData& getPmlData() const { return m_pmlData; }
     void setupPml();
 
+    // @@ Sub-phase timings recorded during mesh loading & geometric preprocessing
+    struct PreprocessSubTimings {
+        double fileReadAndConnectivitySec = 0.0;
+        double gllAndVolumeMetricsSec = 0.0;
+        double faceNormalsAndMatchingSec = 0.0;
+        double pmlInitSec = 0.0;
+    };
+    const PreprocessSubTimings& getSubTimings() const { return m_subTimings; }
+
 private:
     // @@ store polynomial degree parameters
     int m_N;
@@ -227,6 +236,7 @@ private:
     // @@ UPML state
     PmlConfig m_pmlConfig;
     PmlData m_pmlData;
+    PreprocessSubTimings m_subTimings;
 };
 
 #endif // NW_SRC_MESH_HPP

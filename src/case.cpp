@@ -246,6 +246,14 @@ void Case::preprocess(const Config& cfg) {
         NW_PROFILER_POP();
     }
 
+    const auto& meshSub = mesh_->getSubTimings();
+    timings_.meshParseAndTopoSec = meshSub.fileReadAndConnectivitySec;
+    timings_.volumeMetricsSec    = meshSub.gllAndVolumeMetricsSec;
+    timings_.faceSetupSec        = meshSub.faceNormalsAndMatchingSec;
+    timings_.pmlSetupSec         = meshSub.pmlInitSec;
+
+    auto tCflStart = Clock::now();
+    NW_PROFILER_PUSH("Case::computeCflAndDt");
     // Allocate the state vector with 6 variables for local collocation points
     const int npts = mesh_->getTotalPoints();
     state_.assign(6 * npts, 0.0); // Everything set to 0
@@ -265,6 +273,8 @@ void Case::preprocess(const Config& cfg) {
         cfl_ = mesh_->computeAutomaticCFL(0.3);
         dt_ = (cfl_ * dxmin) / waveSpeed;
     }
+    NW_PROFILER_POP();
+    timings_.cflAndDtSec += std::chrono::duration<double>(Clock::now() - tCflStart).count();
 
     currentTime_ = 0.0;
     currentStep_ = 0;
@@ -277,6 +287,7 @@ void Case::preprocess(const Config& cfg) {
     int actualNumModes = config_.getInt("num_modes", 1);
     std::vector<double> actualModeK;
 
+    auto tInitFieldsStart = Clock::now();
     NW_PROFILER_PUSH("Case::initFields");
     // Field initialization!
     if (initialConditionHook_) {
@@ -476,6 +487,7 @@ void Case::preprocess(const Config& cfg) {
     rcsMonitor_.config().c0 = config_.c0;
     rcsMonitor_.init(*mesh_, outDir);
     NW_PROFILER_POP();
+    timings_.initFieldsAndProbesSec += std::chrono::duration<double>(Clock::now() - tInitFieldsStart).count();
 
     // Synchronize maxSteps and numSteps
     int maxSteps = -1;
@@ -1057,6 +1069,12 @@ void Case::postprocess() {
         std::cout << "  Total Wall Time:       " << std::setw(8) << totalWallSec << " s (100.0%)" << std::endl;
         std::cout << "    - Preprocess:        " << std::setw(8) << timings_.preprocessSec << " s ("
                   << std::setprecision(1) << (100.0 * timings_.preprocessSec / totalWallSec) << "%)" << std::setprecision(3) << std::endl;
+        std::cout << "      * Mesh I/O & Topo: " << std::setw(8) << timings_.meshParseAndTopoSec << " s" << std::endl;
+        std::cout << "      * Volume Metrics:  " << std::setw(8) << timings_.volumeMetricsSec << " s" << std::endl;
+        std::cout << "      * Face Setup:      " << std::setw(8) << timings_.faceSetupSec << " s" << std::endl;
+        std::cout << "      * PML Init:        " << std::setw(8) << timings_.pmlSetupSec << " s" << std::endl;
+        std::cout << "      * CFL & dt Scan:   " << std::setw(8) << timings_.cflAndDtSec << " s" << std::endl;
+        std::cout << "      * Init Fields/Prb: " << std::setw(8) << timings_.initFieldsAndProbesSec << " s" << std::endl;
         std::cout << "    - GPU Solver Init:   " << std::setw(8) << timings_.initSolverSec << " s ("
                   << std::setprecision(1) << (100.0 * timings_.initSolverSec / totalWallSec) << "%)" << std::setprecision(3) << std::endl;
         std::cout << "    - GPU LSRK45 Steps:  " << std::setw(8) << timings_.solverStepSec << " s ("
@@ -1123,6 +1141,12 @@ void Case::postprocess() {
                     << std::fixed << std::setprecision(6)
                     << "    \"preprocess\": " << timings_.preprocessSec << ",\n"
                     << "    \"load_mesh\": " << timings_.loadMeshSec << ",\n"
+                    << "    \"preprocess_mesh_parse_and_topo\": " << timings_.meshParseAndTopoSec << ",\n"
+                    << "    \"preprocess_volume_metrics\": " << timings_.volumeMetricsSec << ",\n"
+                    << "    \"preprocess_face_setup\": " << timings_.faceSetupSec << ",\n"
+                    << "    \"preprocess_pml_setup\": " << timings_.pmlSetupSec << ",\n"
+                    << "    \"preprocess_cfl_and_dt\": " << timings_.cflAndDtSec << ",\n"
+                    << "    \"preprocess_init_fields_and_probes\": " << timings_.initFieldsAndProbesSec << ",\n"
                     << "    \"init_solver\": " << timings_.initSolverSec << ",\n"
                     << "    \"gpu_solver_step\": " << timings_.solverStepSec << ",\n"
                     << "    \"device_to_host_copy\": " << timings_.downloadStateSec << ",\n"
