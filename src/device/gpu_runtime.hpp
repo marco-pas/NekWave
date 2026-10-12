@@ -20,11 +20,22 @@
 #include <hip/hip_runtime.h>
 
 #if defined(__has_include)
-#  if __has_include(<roctx.h>)
+#  if __has_include(<roctracer/roctx.h>)
+#    include <roctracer/roctx.h>
+#    define NW_PROFILER_PUSH(name) roctxRangePushA(name)
+#    define NW_PROFILER_POP()      roctxRangePop()
+#  elif __has_include(<roctx.h>)
 #    include <roctx.h>
 #    define NW_PROFILER_PUSH(name) roctxRangePushA(name)
 #    define NW_PROFILER_POP()      roctxRangePop()
 #  endif
+#endif
+
+#if !defined(NW_PROFILER_PUSH) && defined(NEKWAVE_HAVE_ROCTX)
+extern "C" int roctxRangePushA(const char* message);
+extern "C" int roctxRangePop(void);
+#  define NW_PROFILER_PUSH(name) roctxRangePushA(name)
+#  define NW_PROFILER_POP()      roctxRangePop()
 #endif
 
 #ifndef NW_PROFILER_PUSH
