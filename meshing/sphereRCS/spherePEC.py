@@ -23,7 +23,7 @@ gmsh.initialize()
 gmsh.model.add("RCS_Hex_Mesh")
 
 # --- 1. Geometric & Meshing Parameters ---
-box_L = 3.5                  # Outer side length of the full domain including PML (m)
+box_L = 3.0                  # Outer side length of the full domain including PML (m)
 pml_thickness = 0.25         # Thickness of the outer PML absorbing layer (m) (set 0.0 for surface-only PML)
 r_sphere = 0.3               # Radius of the PEC sphere (m)
 mesh_size = 0.08            # Target characteristic element size (m)
