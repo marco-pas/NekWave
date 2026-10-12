@@ -110,6 +110,16 @@ if(ENABLE_HIP)
         target_compile_definitions(nekwave_device PUBLIC USE_HIP=1 NEKWAVE_ENABLE_HIP=1)
     endif()
 
+    find_library(ROCTX_LIB
+        NAMES roctx64
+        PATHS "${ROCM_PATH}/lib" /opt/rocm/lib
+    )
+    if(ROCTX_LIB)
+        message(STATUS "[NekWave] Found ROCm ROCTX trace library: ${ROCTX_LIB}")
+        target_compile_definitions(nekwave_device PUBLIC NEKWAVE_HAVE_ROCTX=1)
+        target_link_libraries(nekwave_device PUBLIC "${ROCTX_LIB}")
+    endif()
+
     set(CUDA_INCLUDE_DIR "")
     set(CMAKE_BUILD_RPATH "${CMAKE_BUILD_RPATH};${ROCM_PATH}/lib;${ROCM_PATH}/lib/llvm/lib;${ROCM_PATH}/llvm/lib")
     set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${ROCM_PATH}/lib;${ROCM_PATH}/lib/llvm/lib;${ROCM_PATH}/llvm/lib")
