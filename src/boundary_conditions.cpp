@@ -122,10 +122,10 @@ bool BoundaryConditions::hasPmlFaces(const Mesh& mesh) {
 
 bool BoundaryConditions::validatePmlConfig(const PmlConfig& cfg) {
     // Matches pml_errchk in contrib/NekCEM/src/cem_maxwell_pml.F
-    if (cfg.thickness < 1 || cfg.thickness > 10) {
+    if (cfg.thickness < 1 || cfg.thickness > 100) {
         if (Comm::isRoot()) {
             std::cerr << "[PML ERROR] Invalid pml_thickness = " << cfg.thickness
-                      << ". Must be between 1 and 10." << std::endl;
+                      << ". Must be between 1 and 100." << std::endl;
         }
         return false;
     }
@@ -158,15 +158,21 @@ void BoundaryConditions::marchFaces(const Mesh& mesh, std::vector<double>& facea
     const int nelt = mesh.getNumElements();
     const int N = mesh.getN();
     const int N2 = N * N;
+    const int checkIdx = (N >= 3) ? (N + 1) : 0;
 
     // 1. Increment opposing faces inside each element if at least one is non-zero
     for (int elt = 0; elt < nelt; ++elt) {
         for (int axis = 0; axis < 3; ++axis) {
             int posFace = posFaces[axis];
             int negFace = negFaces[axis];
+            const size_t posBase = static_cast<size_t>(elt * 6 + posFace) * N2;
+            const size_t negBase = static_cast<size_t>(elt * 6 + negFace) * N2;
+            if (faceary[posBase + checkIdx] + faceary[negBase + checkIdx] == 0.0) {
+                continue;
+            }
             for (int idx = 0; idx < N2; ++idx) {
-                double& posVal = faceary[(elt * 6 + posFace) * N2 + idx];
-                double& negVal = faceary[(elt * 6 + negFace) * N2 + idx];
+                double& posVal = faceary[posBase + idx];
+                double& negVal = faceary[negBase + idx];
                 if (posVal + negVal != 0.0) {
                     posVal += 1.0;
                     negVal += 1.0;
@@ -177,38 +183,42 @@ void BoundaryConditions::marchFaces(const Mesh& mesh, std::vector<double>& facea
 
     // 2. Maximum across shared interior neighboring element faces (gs_op max)
     // Note: Do not march across periodic boundaries (matches NekCEM comment in march_faces).
+    // Since each shared interior face pair {(eltA, faceA), (eltB, faceB)} is disjoint from
+    // all other pairs and max(vA, vB) is idempotent, updating in-place is exact and avoids
+    // reallocating/copying the multi-GB faceary buffer on every marching step.
     const auto& faces = mesh.getFaces();
-    std::vector<double> synced = faceary;
     for (const auto& f : faces) {
         int eltA = f.elementId;
         int faceA = f.faceId;
         int eltB = f.neighborElementId;
         int faceB = f.neighborFaceId;
 
-        if (eltB >= 0 && faceB >= 0 && parseBcTag(f.bcType, eltB) == BcType::INTERIOR) {
+        if (eltB < 0 || faceB < 0) continue;
+        const size_t baseA = static_cast<size_t>(eltA * 6 + faceA) * N2;
+        const size_t baseB = static_cast<size_t>(eltB * 6 + faceB) * N2;
+        if (faceary[baseA + checkIdx] == 0.0 && faceary[baseB + checkIdx] == 0.0) {
+            continue;
+        }
+
+        if (parseBcTag(f.bcType, eltB) == BcType::INTERIOR) {
             if (N >= 3) {
                 for (int iz = 1; iz < N - 1; ++iz) {
                     for (int ix = 1; ix < N - 1; ++ix) {
                         int idx = iz * N + ix;
-                        double vA = faceary[(eltA * 6 + faceA) * N2 + idx];
-                        double vB = faceary[(eltB * 6 + faceB) * N2 + idx];
-                        double m = std::max(vA, vB);
-                        synced[(eltA * 6 + faceA) * N2 + idx] = m;
-                        synced[(eltB * 6 + faceB) * N2 + idx] = m;
+                        double m = std::max(faceary[baseA + idx], faceary[baseB + idx]);
+                        faceary[baseA + idx] = m;
+                        faceary[baseB + idx] = m;
                     }
                 }
             } else {
                 for (int idx = 0; idx < N2; ++idx) {
-                    double vA = faceary[(eltA * 6 + faceA) * N2 + idx];
-                    double vB = faceary[(eltB * 6 + faceB) * N2 + idx];
-                    double m = std::max(vA, vB);
-                    synced[(eltA * 6 + faceA) * N2 + idx] = m;
-                    synced[(eltB * 6 + faceB) * N2 + idx] = m;
+                    double m = std::max(faceary[baseA + idx], faceary[baseB + idx]);
+                    faceary[baseA + idx] = m;
+                    faceary[baseB + idx] = m;
                 }
             }
         }
     }
-    faceary.swap(synced);
 }
 
 void BoundaryConditions::pmlFillFaceArray(const Mesh& mesh, std::vector<double>& faceary, int thick) {
