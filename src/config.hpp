@@ -30,6 +30,8 @@ struct Config {
     bool hasExplicitMaxSteps = false;     // True if max_steps or num_steps was explicitly set
     double finalTime = -1.0;              // Simulation termination time (< 0 if unlimited / step governed)
     int outputFreq = 10;                  // Diagnostic and logging frequency (stdout + energy history)
+    bool outputMaxFields = true;          // Whether to compute and print max|E| and max|H| at output_frequency
+    bool outputEnergy = true;             // Whether to compute and print Total Energy at output_frequency
     int saveFreq = -1;                    // Field snapshot export frequency (-1: defaults to outputFreq)
     std::string exportFormat = "hdf5";    // Snapshot export format ("hdf5" or "csv" or "vtk")
     double pulseSigma = 20.0;             // Gaussian pulse spatial width
@@ -208,6 +210,14 @@ struct Config {
         }
         else if (lkey == "output_frequency" || lkey == "output_freq" || lkey == "freq") {
             outputFreq = std::stoi(trimVal);
+        }
+        else if (lkey == "output_max_fields" || lkey == "outputmaxfields") {
+            std::string lv = toLower(trimVal);
+            outputMaxFields = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
+        }
+        else if (lkey == "output_energy" || lkey == "outputenergy") {
+            std::string lv = toLower(trimVal);
+            outputEnergy = (lv == "true" || lv == "1" || lv == "yes" || lv == "on");
         }
         else if (lkey == "save_frequency" || lkey == "save_freq" || lkey == "export_freq") {
             saveFreq = std::stoi(trimVal);
@@ -418,19 +428,28 @@ struct Config {
         std::ifstream file;
         std::string resolvedPath = "";
         for (const auto& cand : candidates) {
-            file.open(cand);
-            if (file.is_open()) { resolvedPath = cand; break; }
-            std::string parentPath = "../" + cand;
-            file.open(parentPath);
-            if (file.is_open()) { resolvedPath = parentPath; break; }
-            std::string grandParentPath = "../../" + cand;
-            file.open(grandParentPath);
-            if (file.is_open()) { resolvedPath = grandParentPath; break; }
+            std::vector<std::string> searchPaths = {
+                cand,
+                "../" + cand,
+                "../../" + cand,
+                "../../../" + cand
+#ifdef NEKWAVE_SOURCE_DIR
+                , std::string(NEKWAVE_SOURCE_DIR) + "/" + cand
+#endif
+            };
+            for (const auto& sp : searchPaths) {
+                file.open(sp);
+                if (file.is_open()) {
+                    resolvedPath = sp;
+                    break;
+                }
+                file.clear();
+            }
+            if (file.is_open()) break;
         }
 
         if (!file.is_open()) {
-            std::cerr << "Warning: Could not open config file '" << filename 
-                      << "'. Using default parameters." << std::endl;
+            std::cerr << "[ERROR] Could not open configuration file '" << filename << "'." << std::endl;
             return false;
         }
 
