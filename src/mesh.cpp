@@ -13,6 +13,8 @@
 #include <iostream>
 #include <algorithm>
 #include <map>
+#include <unordered_map>
+#include <cstdint>
 #include <tuple>
 
 // @@ Helper to evaluate the Legendre polynomial of degree n at x
@@ -313,17 +315,38 @@ void Mesh::computeMetricsFromCorners() {
     }
 }
 
+// @@ Helper to resolve relative mesh file paths across working directories and NEKWAVE_SOURCE_DIR
+static std::string resolveMeshFilePath(const std::string& filename, std::ios_base::openmode mode = std::ios_base::in) {
+    if (filename.empty()) return "";
+    std::vector<std::string> candidates = {
+        filename,
+        "../" + filename,
+        "../../" + filename,
+        "../../../" + filename
+#ifdef NEKWAVE_SOURCE_DIR
+        , std::string(NEKWAVE_SOURCE_DIR) + "/" + filename
+#endif
+    };
+    for (const auto& cand : candidates) {
+        std::ifstream testFile(cand, mode);
+        if (testFile.is_open()) {
+            testFile.close();
+            return cand;
+        }
+    }
+    return "";
+}
+
 // @@ .rea file parser taken 1-to-1 from NekCEM / Nek5000
 bool Mesh::loadFromRea(const std::string& filename) {
-    std::ifstream file(filename);
+    std::string resolvedPath = resolveMeshFilePath(filename, std::ios_base::in);
+    if (resolvedPath.empty()) {
+        std::cerr << "[ERROR] Could not open .rea mesh file: '" << filename << "'" << std::endl;
+        return false;
+    }
+    std::ifstream file(resolvedPath);
     if (!file.is_open()) {
-        // Fallback: check ../<filename> if executed from build/ subdirectory
-        std::ifstream fileFallback("../" + filename);
-        if (fileFallback.is_open()) {
-            fileFallback.close();
-            return loadFromRea("../" + filename);
-        }
-        std::cerr << "Error: Could not open .rea file: " << filename << std::endl;
+        std::cerr << "[ERROR] Could not open .rea mesh file: '" << resolvedPath << "'" << std::endl;
         return false;
     }
 
@@ -347,7 +370,7 @@ bool Mesh::loadFromRea(const std::string& filename) {
     }
 
     if (!foundMesh) {
-        std::cerr << "Error: Could not find **MESH DATA** section in " << filename << std::endl;
+        std::cerr << "Error: Could not find **MESH DATA** section in " << resolvedPath << std::endl;
         return false;
     }
 
@@ -359,7 +382,7 @@ bool Mesh::loadFromRea(const std::string& filename) {
 
     if (nel < 0) {
         std::cout << "[MESH] Negative NEL = " << nel << " indicates binary .re2 mesh. Redirecting to loadFromRe2..." << std::endl;
-        std::string re2name = filename;
+        std::string re2name = resolvedPath;
         size_t dotPos = re2name.rfind('.');
         if (dotPos != std::string::npos) {
             re2name = re2name.substr(0, dotPos) + ".re2";
@@ -370,7 +393,7 @@ bool Mesh::loadFromRea(const std::string& filename) {
     }
 
     if (nel == 0) {
-        std::cerr << "Error: Invalid number of elements (NEL = " << nel << ") in " << filename << std::endl;
+        std::cerr << "Error: Invalid number of elements (NEL = " << nel << ") in " << resolvedPath << std::endl;
         return false;
     }
 
@@ -456,14 +479,14 @@ bool Mesh::loadFromRea(const std::string& filename) {
 
 // @@ load mesh directly from a NekCEM binary .re2 file
 bool Mesh::loadFromRe2(const std::string& filename, int nel) {
-    std::ifstream file(filename, std::ios::binary);
+    std::string resolvedPath = resolveMeshFilePath(filename, std::ios::binary);
+    if (resolvedPath.empty()) {
+        std::cerr << "[ERROR] Could not open .re2 mesh file: '" << filename << "'" << std::endl;
+        return false;
+    }
+    std::ifstream file(resolvedPath, std::ios::binary);
     if (!file.is_open()) {
-        std::ifstream fileFallback("../" + filename, std::ios::binary);
-        if (fileFallback.is_open()) {
-            fileFallback.close();
-            return loadFromRe2("../" + filename, nel);
-        }
-        std::cerr << "Error: Could not open .re2 file: " << filename << std::endl;
+        std::cerr << "[ERROR] Could not open .re2 mesh file: '" << resolvedPath << "'" << std::endl;
         return false;
     }
 
@@ -502,19 +525,25 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
     m_totalPoints = m_numElements * m_numPointsPerElement;
     m_elementCorners.resize(m_numElements);
 
-    // Read elements: group (double) + 8 x (double) + 8 y (double) + 8 z (double)
-    for (int e = 0; e < nel; ++e) {
-        double group = 0.0;
-        double x[8], y[8], z[8];
-        file.read(reinterpret_cast<char*>(&group), sizeof(double));
-        file.read(reinterpret_cast<char*>(x), 8 * sizeof(double));
-        file.read(reinterpret_cast<char*>(y), 8 * sizeof(double));
-        file.read(reinterpret_cast<char*>(z), 8 * sizeof(double));
+    // Bulk-read all elements: each element is 25 doubles (group + 8 x + 8 y + 8 z)
+    std::vector<double> elemBuf(static_cast<size_t>(nel) * 25);
+    file.read(reinterpret_cast<char*>(elemBuf.data()), static_cast<std::streamsize>(elemBuf.size() * sizeof(double)));
+    if (!file) {
+        std::cerr << "[ERROR] Failed to read element coordinate block from " << resolvedPath << std::endl;
+        return false;
+    }
 
+    for (int e = 0; e < nel; ++e) {
+        const double* rec = &elemBuf[static_cast<size_t>(e) * 25];
+        const double* x = rec + 1;
+        const double* y = rec + 9;
+        const double* z = rec + 17;
         for (int a = 0; a < 8; ++a) {
             m_elementCorners[e][a] = {x[a], y[a], z[a]};
         }
     }
+    elemBuf.clear();
+    elemBuf.shrink_to_fit();
 
     // Read curved faces count
     double ncurvD = 0.0;
@@ -525,51 +554,39 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
     file.read(reinterpret_cast<char*>(&nbcD), sizeof(double));
     int nbc = static_cast<int>(nbcD);
 
-    // Map: (elemId, faceId) -> FaceInfo
-    std::map<std::pair<int, int>, FaceInfo> bcMap;
+    m_faces.clear();
+    m_faces.resize(static_cast<size_t>(nel) * 6);
+    std::vector<uint8_t> hasBc(static_cast<size_t>(nel) * 6, 0);
+
     for (int i = 0; i < nbc; ++i) {
-        double elemD = 0.0, faceD = 0.0, nbrElemD = 0.0, nbrFaceD = 0.0;
-        double p1 = 0.0, p2 = 0.0, p3 = 0.0;
+        double bcDoubles[7] = {0.0};
         char tagStr[9] = {0};
 
-        file.read(reinterpret_cast<char*>(&elemD), sizeof(double));
-        file.read(reinterpret_cast<char*>(&faceD), sizeof(double));
-        file.read(reinterpret_cast<char*>(&nbrElemD), sizeof(double));
-        file.read(reinterpret_cast<char*>(&nbrFaceD), sizeof(double));
-        file.read(reinterpret_cast<char*>(&p1), sizeof(double));
-        file.read(reinterpret_cast<char*>(&p2), sizeof(double));
-        file.read(reinterpret_cast<char*>(&p3), sizeof(double));
+        file.read(reinterpret_cast<char*>(bcDoubles), 7 * sizeof(double));
         file.read(tagStr, 8);
 
-        int e = static_cast<int>(elemD) - 1;
-        int f = static_cast<int>(faceD) - 1;
-        int nbrE = (nbrElemD > 0.0) ? (static_cast<int>(nbrElemD) - 1) : -1;
-        int nbrF = (nbrFaceD > 0.0) ? (static_cast<int>(nbrFaceD) - 1) : -1;
+        int e = static_cast<int>(bcDoubles[0]) - 1;
+        int f = static_cast<int>(bcDoubles[1]) - 1;
+        int nbrE = (bcDoubles[2] > 0.0) ? (static_cast<int>(bcDoubles[2]) - 1) : -1;
+        int nbrF = (bcDoubles[3] > 0.0) ? (static_cast<int>(bcDoubles[3]) - 1) : -1;
+
+        if (e < 0 || e >= nel || f < 0 || f >= 6) continue;
 
         std::string rawTag(tagStr);
         BcType parsedBc = BoundaryConditions::parseBcTag(rawTag, nbrE);
         if (parsedBc == BcType::INTERIOR && nbrE >= 0 && rawTag.find('E') == std::string::npos) {
-            // In .re2 BC records, only boundary/periodic faces are listed; a connected record without 'E' is periodic
             parsedBc = BcType::PERIODIC;
         }
-        std::string bcType = BoundaryConditions::toString(parsedBc);
 
-        FaceInfo info;
-        info.elementId = e;
-        info.faceId = f;
-        info.bcType = bcType;
-        info.neighborElementId = nbrE;
-        info.neighborFaceId = nbrF;
-        bcMap[{e, f}] = info;
+        size_t idx = static_cast<size_t>(e) * 6 + static_cast<size_t>(f);
+        m_faces[idx].elementId = e;
+        m_faces[idx].faceId = f;
+        m_faces[idx].bcType = BoundaryConditions::toString(parsedBc);
+        m_faces[idx].neighborElementId = nbrE;
+        m_faces[idx].neighborFaceId = nbrF;
+        hasBc[idx] = 1;
     }
 
-    // Hex face corner definitions matching NekWave / NekCEM:
-    // Face 0 (s=-1): 0, 1, 5, 4
-    // Face 1 (r=+1): 1, 2, 6, 5
-    // Face 2 (s=+1): 2, 3, 7, 6
-    // Face 3 (r=-1): 3, 0, 4, 7
-    // Face 4 (t=-1): 0, 3, 2, 1
-    // Face 5 (t=+1): 4, 5, 6, 7
     const int faceCorners[6][4] = {
         {0, 1, 5, 4},
         {1, 2, 6, 5},
@@ -579,65 +596,57 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
         {4, 5, 6, 7}
     };
 
-    // Index face centroids for interior conforming faces
-    std::map<std::tuple<long long, long long, long long>, std::pair<int, int>> interiorCenters;
-    auto makeKey = [](double cx, double cy, double cz) {
-        long long ix = static_cast<long long>(std::round(cx * 100000.0));
-        long long iy = static_cast<long long>(std::round(cy * 100000.0));
-        long long iz = static_cast<long long>(std::round(cz * 100000.0));
-        return std::make_tuple(ix, iy, iz);
+    // O(1) spatial hash table for pairing interior conforming faces by centroid
+    std::unordered_map<uint64_t, int> interiorCenters;
+    interiorCenters.reserve(static_cast<size_t>(nel) * 3);
+    auto makeHashKey = [](double cx, double cy, double cz) -> uint64_t {
+        uint64_t ux = static_cast<uint64_t>(static_cast<int64_t>(std::llround(cx * 1000000.0)));
+        uint64_t uy = static_cast<uint64_t>(static_cast<int64_t>(std::llround(cy * 1000000.0)));
+        uint64_t uz = static_cast<uint64_t>(static_cast<int64_t>(std::llround(cz * 1000000.0)));
+        uint64_t h = ux * 0x9E3779B97F4A7C15ULL;
+        h ^= uy * 0xBF58476D1CE4E5B9ULL + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+        h ^= uz * 0x94D049BB133111EBULL + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+        return h;
     };
-
-    m_faces.clear();
-    m_faces.resize(nel * 6);
 
     for (int e = 0; e < nel; ++e) {
         for (int f = 0; f < 6; ++f) {
             int idx = e * 6 + f;
-            auto it = bcMap.find({e, f});
-            if (it != bcMap.end()) {
-                m_faces[idx] = it->second;
+            if (hasBc[idx]) continue;
+
+            double cx = 0.0, cy = 0.0, cz = 0.0;
+            for (int v = 0; v < 4; ++v) {
+                int cIdx = faceCorners[f][v];
+                cx += m_elementCorners[e][cIdx][0] * 0.25;
+                cy += m_elementCorners[e][cIdx][1] * 0.25;
+                cz += m_elementCorners[e][cIdx][2] * 0.25;
+            }
+            uint64_t key = makeHashKey(cx, cy, cz);
+            auto cIt = interiorCenters.find(key);
+            if (cIt != interiorCenters.end()) {
+                int otherIdx = cIt->second;
+                int otherE = otherIdx / 6;
+                int otherF = otherIdx % 6;
+
+                m_faces[idx].elementId = e;
+                m_faces[idx].faceId = f;
+                m_faces[idx].bcType = "E";
+                m_faces[idx].neighborElementId = otherE;
+                m_faces[idx].neighborFaceId = otherF;
+
+                m_faces[otherIdx].elementId = otherE;
+                m_faces[otherIdx].faceId = otherF;
+                m_faces[otherIdx].bcType = "E";
+                m_faces[otherIdx].neighborElementId = e;
+                m_faces[otherIdx].neighborFaceId = f;
+                interiorCenters.erase(cIt);
             } else {
-                // Interior face: match neighbor via centroid
-                double cx = 0.0, cy = 0.0, cz = 0.0;
-                for (int v = 0; v < 4; ++v) {
-                    int cIdx = faceCorners[f][v];
-                    cx += m_elementCorners[e][cIdx][0] * 0.25;
-                    cy += m_elementCorners[e][cIdx][1] * 0.25;
-                    cz += m_elementCorners[e][cIdx][2] * 0.25;
-                }
-                auto key = makeKey(cx, cy, cz);
-                auto cIt = interiorCenters.find(key);
-                if (cIt != interiorCenters.end()) {
-                    int otherE = cIt->second.first;
-                    int otherF = cIt->second.second;
-                    int otherIdx = otherE * 6 + otherF;
-
-                    FaceInfo infoThis;
-                    infoThis.elementId = e;
-                    infoThis.faceId = f;
-                    infoThis.bcType = "E";
-                    infoThis.neighborElementId = otherE;
-                    infoThis.neighborFaceId = otherF;
-                    m_faces[idx] = infoThis;
-
-                    FaceInfo infoOther;
-                    infoOther.elementId = otherE;
-                    infoOther.faceId = otherF;
-                    infoOther.bcType = "E";
-                    infoOther.neighborElementId = e;
-                    infoOther.neighborFaceId = f;
-                    m_faces[otherIdx] = infoOther;
-                } else {
-                    FaceInfo infoFirst;
-                    infoFirst.elementId = e;
-                    infoFirst.faceId = f;
-                    infoFirst.bcType = "PEC";
-                    infoFirst.neighborElementId = -1;
-                    infoFirst.neighborFaceId = -1;
-                    m_faces[idx] = infoFirst;
-                    interiorCenters[key] = {e, f};
-                }
+                m_faces[idx].elementId = e;
+                m_faces[idx].faceId = f;
+                m_faces[idx].bcType = "PEC";
+                m_faces[idx].neighborElementId = -1;
+                m_faces[idx].neighborFaceId = -1;
+                interiorCenters.emplace(key, idx);
             }
         }
     }
@@ -1018,19 +1027,69 @@ void Mesh::setupFaceData() {
 #ifndef USE_HIP
     nvtxRangePushA("Mesh::setupFaceData");
 #endif
-    m_faceData.clear();
-    m_faceData.reserve(m_faces.size());
+    const size_t numFaces = m_faces.size();
+    m_faceData.resize(numFaces);
 
-    int N = m_N;
-    for (const auto& face : m_faces) {
-        ElementFaceData efd;
+    const int N = m_N;
+    const int N2 = N * N;
+
+    for (size_t fIdx = 0; fIdx < numFaces; ++fIdx) {
+        const auto& face = m_faces[fIdx];
+        ElementFaceData& efd = m_faceData[fIdx];
         efd.elementId = face.elementId;
         efd.faceId = face.faceId;
         efd.bcType = face.bcType;
-        efd.points.reserve(N * N);
+        efd.points.resize(N2);
 
-        int eA = face.elementId;
-        int fA = face.faceId;
+        const int eA = face.elementId;
+        const int fA = face.faceId;
+        const int eB = face.neighborElementId;
+        const int fB = face.neighborFaceId;
+        const BcType bc = BoundaryConditions::parseBcTag(face.bcType, eB);
+        const bool isExterior = (bc == BcType::PEC || bc == BcType::PMC || bc == BcType::PML || eB < 0);
+        const bool isPeriodic = (!isExterior && bc == BcType::PERIODIC);
+
+        // For conformal interior faces, determine which of the 8 D4 square symmetries
+        // maps (pA, qA) on (eA, fA) to (pB, qB) on (eB, fB) using the corner nodes.
+        int matchedOrient = -1;
+        if (!isExterior && !isPeriodic && N > 1) {
+            const int vA00 = getFaceNodeVolIndex(eA, fA, 0, 0);
+            const int vA10 = getFaceNodeVolIndex(eA, fA, N - 1, 0);
+            const int vA01 = getFaceNodeVolIndex(eA, fA, 0, N - 1);
+            for (int orient = 0; orient < 8; ++orient) {
+                auto mapCoord = [N, orient](int p, int q, int& pB, int& qB) {
+                    int u = (orient & 4) ? q : p;
+                    int v = (orient & 4) ? p : q;
+                    pB = (orient & 1) ? (N - 1 - u) : u;
+                    qB = (orient & 2) ? (N - 1 - v) : v;
+                };
+                int pB00, qB00, pB10, qB10, pB01, qB01;
+                mapCoord(0, 0, pB00, qB00);
+                mapCoord(N - 1, 0, pB10, qB10);
+                mapCoord(0, N - 1, pB01, qB01);
+
+                const int vB00 = getFaceNodeVolIndex(eB, fB, pB00, qB00);
+                const double dx00 = m_coord_x[vA00] - m_coord_x[vB00];
+                const double dy00 = m_coord_y[vA00] - m_coord_y[vB00];
+                const double dz00 = m_coord_z[vA00] - m_coord_z[vB00];
+                if (dx00 * dx00 + dy00 * dy00 + dz00 * dz00 > 1.0e-12) continue;
+
+                const int vB10 = getFaceNodeVolIndex(eB, fB, pB10, qB10);
+                const double dx10 = m_coord_x[vA10] - m_coord_x[vB10];
+                const double dy10 = m_coord_y[vA10] - m_coord_y[vB10];
+                const double dz10 = m_coord_z[vA10] - m_coord_z[vB10];
+                if (dx10 * dx10 + dy10 * dy10 + dz10 * dz10 > 1.0e-12) continue;
+
+                const int vB01 = getFaceNodeVolIndex(eB, fB, pB01, qB01);
+                const double dx01 = m_coord_x[vA01] - m_coord_x[vB01];
+                const double dy01 = m_coord_y[vA01] - m_coord_y[vB01];
+                const double dz01 = m_coord_z[vA01] - m_coord_z[vB01];
+                if (dx01 * dx01 + dy01 * dy01 + dz01 * dz01 > 1.0e-12) continue;
+
+                matchedOrient = orient;
+                break;
+            }
+        }
 
         for (int qA = 0; qA < N; ++qA) {
             for (int pA = 0; pA < N; ++pA) {
@@ -1069,44 +1128,51 @@ void Mesh::setupFaceData() {
                 pt.nz = (L > 1e-14) ? (Nz / L) : 0.0;
                 pt.dA = L * w2;
 
-                // Determine exterior neighbor node index via canonical BcType
-                BcType bc = BoundaryConditions::parseBcTag(face.bcType, face.neighborElementId);
-                if (bc == BcType::PEC || bc == BcType::PMC || bc == BcType::PML || face.neighborElementId < 0) {
+                if (isExterior) {
                     pt.volIdxPlus = -1;
-                } else if (bc == BcType::PERIODIC) {
+                } else if (isPeriodic) {
                     // Periodic boundary: aligned opposite Cartesian faces map directly by (pA, qA)
-                    int eB = face.neighborElementId;
-                    int fB = face.neighborFaceId;
                     pt.volIdxPlus = getFaceNodeVolIndex(eB, fB, pA, qA);
                 } else {
-                    int eB = face.neighborElementId;
-                    int fB = face.neighborFaceId;
-                    double xA = m_coord_x[vM];
-                    double yA = m_coord_y[vM];
-                    double zA = m_coord_z[vM];
-
                     int matchedVolB = -1;
-                    double bestDist2 = 1.0e30;
-                    for (int qB = 0; qB < N; ++qB) {
-                        for (int pB = 0; pB < N; ++pB) {
-                            int vB = getFaceNodeVolIndex(eB, fB, pB, qB);
-                            double dx = xA - m_coord_x[vB];
-                            double dy = yA - m_coord_y[vB];
-                            double dz = zA - m_coord_z[vB];
-                            double d2 = dx * dx + dy * dy + dz * dz;
-                            if (d2 < bestDist2) {
-                                bestDist2 = d2;
-                                matchedVolB = vB;
+                    if (matchedOrient >= 0) {
+                        int u = (matchedOrient & 4) ? qA : pA;
+                        int v = (matchedOrient & 4) ? pA : qA;
+                        int pB = (matchedOrient & 1) ? (N - 1 - u) : u;
+                        int qB = (matchedOrient & 2) ? (N - 1 - v) : v;
+                        int vB = getFaceNodeVolIndex(eB, fB, pB, qB);
+                        double dx = m_coord_x[vM] - m_coord_x[vB];
+                        double dy = m_coord_y[vM] - m_coord_y[vB];
+                        double dz = m_coord_z[vM] - m_coord_z[vB];
+                        if (dx * dx + dy * dy + dz * dz < 1.0e-12) {
+                            matchedVolB = vB;
+                        }
+                    }
+                    if (matchedVolB < 0) {
+                        double xA = m_coord_x[vM];
+                        double yA = m_coord_y[vM];
+                        double zA = m_coord_z[vM];
+                        double bestDist2 = 1.0e30;
+                        for (int qB = 0; qB < N; ++qB) {
+                            for (int pB = 0; pB < N; ++pB) {
+                                int vB = getFaceNodeVolIndex(eB, fB, pB, qB);
+                                double dx = xA - m_coord_x[vB];
+                                double dy = yA - m_coord_y[vB];
+                                double dz = zA - m_coord_z[vB];
+                                double d2 = dx * dx + dy * dy + dz * dz;
+                                if (d2 < bestDist2) {
+                                    bestDist2 = d2;
+                                    matchedVolB = vB;
+                                }
                             }
                         }
                     }
                     pt.volIdxPlus = matchedVolB;
                 }
 
-                efd.points.push_back(pt);
+                efd.points[qA * N + pA] = pt;
             }
         }
-        m_faceData.push_back(efd);
     }
 #ifndef USE_HIP
     nvtxRangePop();
