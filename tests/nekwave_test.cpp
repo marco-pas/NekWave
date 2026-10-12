@@ -503,11 +503,11 @@ void JsonConfigLoadingTest() {
     // Verify wave_type was ignored and not stored
     EXPECT_TRUE(!cfg.has("wave_type"));
 
-    // Test 2: NekCEM .rea mesh in JSON format
+    // Test 2: NekCEM .rea mesh in JSON format (sphereRCS_dense)
     std::string nekcemJson = R"({
         "mesh": {
             "type": "nekcem",
-            "file": "contrib/NekCEM/tests/3dboxpec/3dboxpec.rea"
+            "file": "meshing/sphereRCS_dense/spherePEC.rea"
         },
         "numerics": {
             "poly_order": 4,
@@ -517,9 +517,15 @@ void JsonConfigLoadingTest() {
     Config cfgNek;
     nekwave::JsonValue rootNek = nekwave::JsonValue::parse(nekcemJson);
     cfgNek.loadFromJson(rootNek);
-    EXPECT_TRUE(cfgNek.meshFile == "contrib/NekCEM/tests/3dboxpec/3dboxpec.rea");
+    EXPECT_TRUE(cfgNek.meshFile == "meshing/sphereRCS_dense/spherePEC.rea");
     EXPECT_TRUE(cfgNek.polyOrder == 4);
     EXPECT_TRUE(cfgNek.order == 5);
+
+    // Verify sphereRCS_dense mesh file loads 16,524 elements and missing mesh returns false
+    Mesh sphereMesh(2, 1);
+    EXPECT_TRUE(sphereMesh.loadFromRea(cfgNek.meshFile));
+    EXPECT_TRUE(sphereMesh.getNumElements() == 16524);
+    EXPECT_TRUE(!sphereMesh.loadFromRea("meshing/nonexistent_mesh_file.rea"));
 
     // Test 3: Programmatic wave_type in C++ Case
     Case c;
