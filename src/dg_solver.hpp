@@ -59,6 +59,29 @@ public:
     bool initialize(const Mesh& mesh, double c0);
 
     /**
+     * @brief Performs GPU-native mesh preprocessing (volume GLL coordinates/metrics,
+     *        face normals/matching, UPML damping profiles, and CFL min node distance)
+     *        and initializes all GPU solver buffers without allocating or transferring
+     *        multi-GB expanded volume/face arrays on the host.
+     */
+    bool preprocessAndInitialize(Mesh& mesh, double c0,
+                                 double* outDxmin = nullptr,
+                                 bool downloadHostCoords = false);
+
+    struct GpuPreprocessTimings {
+        bool usedGpuPreprocess = false;
+        double topoUploadSec = 0.0;
+        double volumeMetricsKernelSec = 0.0;
+        double faceSetupKernelSec = 0.0;
+        double pmlSigmaKernelSec = 0.0;
+        double minDistKernelSec = 0.0;
+        double hostCoordsDownloadSec = 0.0;
+        size_t h2dTopologyBytes = 0;
+    };
+
+    GpuPreprocessTimings getGpuPreprocessTimings() const;
+
+    /**
      * @brief Configures the analytical incident plane wave for Scattered-Field PEC boundary excitation.
      */
     void setIncidentWave(const IncidentPlaneWaveConfig& incWave);

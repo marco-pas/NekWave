@@ -145,6 +145,8 @@ void Case::preprocess(const Config& cfg) {
 
     mesh_->setN(config_.order);
     mesh_->setPmlConfig(PmlConfig(config_.pmlThickness, config_.pmlOrder, config_.pmlReflectErr));
+    bSolverInitializedInPreprocess_ = false;
+    hasNonZeroInitialCondition_ = false;
 
     auto tMeshStart = Clock::now();
     NW_PROFILER_PUSH("Case::loadMesh");
@@ -212,17 +214,10 @@ void Case::preprocess(const Config& cfg) {
 
     std::string currentWave = !waveType_.empty() ? waveType_ : config_.getString("wave_type");
     {
-        const auto& cx = mesh_->getCoordX();
-        const auto& cy = mesh_->getCoordY();
-        const auto& cz = mesh_->getCoordZ();
         double minX = 1e30, maxX = -1e30;
         double minY = 1e30, maxY = -1e30;
         double minZ = 1e30, maxZ = -1e30;
-        for (size_t k = 0; k < cx.size(); ++k) {
-            minX = std::min(minX, cx[k]); maxX = std::max(maxX, cx[k]);
-            minY = std::min(minY, cy[k]); maxY = std::max(maxY, cy[k]);
-            minZ = std::min(minZ, cz[k]); maxZ = std::max(maxZ, cz[k]);
-        }
+        mesh_->getCornerBoundingBox(minX, maxX, minY, maxY, minZ, maxZ);
         if (currentWave == "3dboxper" && std::abs(minX - (-1.0)) < 1e-3 && std::abs(maxX - 1.0) < 1e-3) {
             std::cout << "[PREPROCESS] Rescaling mesh domain from [-1, 1]^3 to [0, 2*pi]^3 matching NekCEM usrdat2..." << std::endl;
             mesh_->rescale(0.0, 2.0 * M_PI, 0.0, 2.0 * M_PI, 0.0, 2.0 * M_PI);
@@ -248,18 +243,86 @@ void Case::preprocess(const Config& cfg) {
 
     const auto& meshSub = mesh_->getSubTimings();
     timings_.meshParseAndTopoSec = meshSub.fileReadAndConnectivitySec;
-    timings_.volumeMetricsSec    = meshSub.gllAndVolumeMetricsSec;
-    timings_.faceSetupSec        = meshSub.faceNormalsAndMatchingSec;
     timings_.pmlSetupSec         = meshSub.pmlInitSec;
 
-    auto tCflStart = Clock::now();
-    NW_PROFILER_PUSH("Case::computeCflAndDt");
-    // Allocate the state vector with 6 variables for local collocation points
-    const int npts = mesh_->getTotalPoints();
-    state_.assign(6 * npts, 0.0); // Everything set to 0
+    // Assemble probe coordinates early so we know whether any host coordinates are needed
+    std::vector<std::array<double, 3>> allProbes = config_.probes;
+    for (const auto& p : customProbes_) {
+        allProbes.push_back(p);
+    }
+    const double xc = 0.5 * (config_.xmin + config_.xmax);
+    const double yc = 0.5 * (config_.ymin + config_.ymax);
+    const double zc = 0.5 * (config_.zmin + config_.zmax);
+    for (const auto& r : customRelativeProbes_) {
+        allProbes.push_back({{xc + r[0] * config_.Lx, yc + r[1] * config_.Ly, zc + r[2] * config_.Lz}});
+    }
+    if (allProbes.empty() && config_.has("num_probes")) {
+        int numProbes = config_.getInt("num_probes", 0);
+        if (numProbes > 0) {
+            if (config_.nelx == 1 && config_.nely == 1 && config_.nelz == 1) {
+                std::cout << "[PREPROCESS] Generating " << numProbes 
+                          << " observation probes placed at GLL collocation nodes..." << std::endl;
+                const auto& gllZ = mesh_->getGllZ();
+                int N = mesh_->getN();
+                int actualProbes = std::min(numProbes, N);
+                for (int p = 0; p < actualProbes; ++p) {
+                    double xp = config_.xmin + 0.5 * (1.0 + gllZ[p]) * config_.Lx;
+                    allProbes.push_back({{xp, yc, zc}});
+                }
+            } else {
+                std::cout << "[PREPROCESS] Generating " << numProbes 
+                          << " collinear observation probes along centerline x-axis..." << std::endl;
+                const double xStart = config_.xmin + 0.05 * config_.Lx;
+                const double xEnd   = config_.xmax - 0.05 * config_.Lx;
+                const double dxP    = (numProbes > 1) ? (xEnd - xStart) / (numProbes - 1) : 0.0;
+                for (int p = 0; p < numProbes; ++p) {
+                    allProbes.push_back({{xStart + p * dxP, yc, zc}});
+                }
+            }
+        }
+    }
 
-    // Calculate stable time-stepping metrics (synchronized across all ranks)
-    const double dxminLocal = mesh_->computeMinNodeDistance();
+    hasNonZeroInitialCondition_ = (initialConditionHook_ != nullptr ||
+                                   currentWave == "bloch" ||
+                                   currentWave == "periodic" ||
+                                   currentWave == "multimode" ||
+                                   currentWave == "packet" ||
+                                   currentWave == "gaussian");
+    const bool needHostCoordsAndJac = hasNonZeroInitialCondition_ ||
+                                      (bSaveOutput && config_.exportFields) ||
+                                      !allProbes.empty() ||
+                                      rcsMonitor_.config().enabled ||
+                                      config_.outputEnergy ||
+                                      postprocessingHook_ != nullptr;
+    const bool needHostState = needHostCoordsAndJac || config_.outputMaxFields;
+
+    const int npts = mesh_->getTotalPoints();
+    double dxminLocal = 0.0;
+
+    if (Comm::isRoot()) {
+        std::cout << "[PREPROCESS] Executing GPU-native mesh preprocessing (metrics, face normals, UPML sigma, CFL dxmin)..." << std::endl;
+    }
+    dgSolver_.reset(new DgSolver());
+    dgSolver_->preprocessAndInitialize(*mesh_, config_.c0, &dxminLocal, needHostCoordsAndJac);
+    dgSolver_->setIncidentWave(rcsMonitor_.config().incidentPlaneWave);
+    bSolverInitializedInPreprocess_ = true;
+
+    const auto gpuPre = dgSolver_->getGpuPreprocessTimings();
+    timings_.usedGpuPreprocess = gpuPre.usedGpuPreprocess;
+    timings_.gpuTopoUploadSec  = gpuPre.topoUploadSec;
+    timings_.volumeMetricsSec  = gpuPre.volumeMetricsKernelSec;
+    timings_.faceSetupSec      = gpuPre.faceSetupKernelSec;
+    timings_.gpuPmlSigmaSec    = gpuPre.pmlSigmaKernelSec;
+    timings_.cflAndDtSec       = gpuPre.minDistKernelSec;
+    timings_.h2dTopologyBytes  = gpuPre.h2dTopologyBytes;
+
+    if (needHostState) {
+        state_.assign(6 * static_cast<size_t>(npts), 0.0);
+    } else {
+        state_.clear();
+        state_.shrink_to_fit();
+    }
+
     const double dxmin = Comm::allreduceMin(dxminLocal);
     const double waveSpeed = 1.0;
 
@@ -273,16 +336,9 @@ void Case::preprocess(const Config& cfg) {
         cfl_ = mesh_->computeAutomaticCFL(0.3);
         dt_ = (cfl_ * dxmin) / waveSpeed;
     }
-    NW_PROFILER_POP();
-    timings_.cflAndDtSec += std::chrono::duration<double>(Clock::now() - tCflStart).count();
 
     currentTime_ = 0.0;
     currentStep_ = 0;
-
-    // Evaluate initial conditions
-    const auto& x = mesh_->getCoordX();
-    const auto& y = mesh_->getCoordY();
-    const auto& z = mesh_->getCoordZ();
 
     int actualNumModes = config_.getInt("num_modes", 1);
     std::vector<double> actualModeK;
@@ -292,6 +348,9 @@ void Case::preprocess(const Config& cfg) {
     // Field initialization!
     if (initialConditionHook_) {
         std::cout << "[PREPROCESS] Evaluating user initial condition hook..." << std::endl;
+        const auto& x = mesh_->getCoordX();
+        const auto& y = mesh_->getCoordY();
+        const auto& z = mesh_->getCoordZ();
         double* Ex = &state_[0 * npts];
         double* Ey = &state_[1 * npts];
         double* Ez = &state_[2 * npts];
@@ -312,6 +371,8 @@ void Case::preprocess(const Config& cfg) {
         }
     } else if (currentWave == "bloch" || currentWave == "periodic") {
         std::cout << "[PREPROCESS] Evaluating periodic Bloch electromagnetic plane wave in (Ez, Hx, Hy)..." << std::endl;
+        const auto& x = mesh_->getCoordX();
+        const auto& y = mesh_->getCoordY();
         double* Ez = &state_[2 * npts];
         double* Hx = &state_[3 * npts];
         double* Hy = &state_[4 * npts];
@@ -395,6 +456,8 @@ void Case::preprocess(const Config& cfg) {
         }
     } else if (currentWave == "multimode") {
         std::cout << "[PREPROCESS] Evaluating multi-harmonic sinusoidal standing wave packet in Ez..." << std::endl;
+        const auto& x = mesh_->getCoordX();
+        const auto& y = mesh_->getCoordY();
         double* Ez = &state_[2 * npts];
         const double Lx = config_.Lx;
         const double Ly = config_.Ly;
@@ -413,6 +476,8 @@ void Case::preprocess(const Config& cfg) {
         }
     } else if (currentWave == "packet") {
         std::cout << "[PREPROCESS] Evaluating modulated Gaussian wavepacket in Ez..." << std::endl;
+        const auto& x = mesh_->getCoordX();
+        const auto& y = mesh_->getCoordY();
         const double carrierK = config_.getDouble("carrier_k", 4.0 * M_PI);
         const double sigma    = config_.getDouble("packet_sigma", 0.30);
         const double x0       = config_.getDouble("packet_x0", config_.xmin + 0.25 * config_.Lx);
@@ -430,6 +495,9 @@ void Case::preprocess(const Config& cfg) {
         }
     } else if (currentWave == "gaussian") {
         std::cout << "[PREPROCESS] Evaluating Gaussian pulse in Ez..." << std::endl;
+        const auto& x = mesh_->getCoordX();
+        const auto& y = mesh_->getCoordY();
+        const auto& z = mesh_->getCoordZ();
         const double sigma = config_.pulseSigma;
         double* Ez = &state_[2 * npts];
         for (int k = 0; k < npts; ++k) {
@@ -437,52 +505,11 @@ void Case::preprocess(const Config& cfg) {
             Ez[k] = std::exp(-sigma * r2);
         }
     } else {
-        std::cout << "[PREPROCESS] No initial condition hook provided; all electromagnetic fields initialized to 0.0." << std::endl;
+        std::cout << "[PREPROCESS] No initial condition hook provided; all electromagnetic fields initialized to 0.0 on GPU." << std::endl;
     }
     NW_PROFILER_POP();
 
     NW_PROFILER_PUSH("Case::initProbes");
-    // Assemble probe coordinates
-    std::vector<std::array<double, 3>> allProbes = config_.probes;
-    for (const auto& p : customProbes_) {
-        allProbes.push_back(p);
-    }
-
-    // Convert any custom relative probes to physical coordinates
-    const double xc = 0.5 * (config_.xmin + config_.xmax);
-    const double yc = 0.5 * (config_.ymin + config_.ymax);
-    const double zc = 0.5 * (config_.zmin + config_.zmax);
-    for (const auto& r : customRelativeProbes_) {
-        allProbes.push_back({{xc + r[0] * config_.Lx, yc + r[1] * config_.Ly, zc + r[2] * config_.Lz}});
-    }
-
-    // If no explicit probes configured, check for num_probes parameter
-    if (allProbes.empty() && config_.has("num_probes")) {
-        int numProbes = config_.getInt("num_probes", 0);
-        if (numProbes > 0) {
-            if (config_.nelx == 1 && config_.nely == 1 && config_.nelz == 1) {
-                std::cout << "[PREPROCESS] Generating " << numProbes 
-                          << " observation probes placed at GLL collocation nodes..." << std::endl;
-                const auto& gllZ = mesh_->getGllZ();
-                int N = mesh_->getN();
-                int actualProbes = std::min(numProbes, N);
-                for (int p = 0; p < actualProbes; ++p) {
-                    double xp = config_.xmin + 0.5 * (1.0 + gllZ[p]) * config_.Lx;
-                    allProbes.push_back({{xp, yc, zc}});
-                }
-            } else {
-                std::cout << "[PREPROCESS] Generating " << numProbes 
-                          << " collinear observation probes along centerline x-axis..." << std::endl;
-                const double xStart = config_.xmin + 0.05 * config_.Lx;
-                const double xEnd   = config_.xmax - 0.05 * config_.Lx;
-                const double dxP    = (numProbes > 1) ? (xEnd - xStart) / (numProbes - 1) : 0.0;
-                for (int p = 0; p < numProbes; ++p) {
-                    allProbes.push_back({{xStart + p * dxP, yc, zc}});
-                }
-            }
-        }
-    }
-
     probes_.init(*mesh_, allProbes, outDir, actualNumModes, config_.Lx, config_.nelx, actualModeK);
     rcsMonitor_.config().c0 = config_.c0;
     rcsMonitor_.init(*mesh_, outDir);
@@ -588,7 +615,7 @@ void Case::preprocess(const Config& cfg) {
         std::cout << "  Bounding Box:      [" << config_.xmin << ", " << config_.xmax << "] x [" 
                   << config_.ymin << ", " << config_.ymax << "] x [" 
                   << config_.zmin << ", " << config_.zmax << "]" << std::endl;
-        std::cout << "  Faces Total:       " << mesh_->getFaceData().size() << std::endl;
+        std::cout << "  Faces Total:       " << (mesh_->hasHostFaceData() ? mesh_->getFaceData().size() : mesh_->getFaces().size()) << std::endl;
         std::cout << "  Flux Formulation:  " << ((config_.c0 == 0.0) ? "Central (C0 = 0.0, energy-conserving)" : "Upwind (C0 = 1.0, dissipative)") << std::endl;
         std::cout << "  Field Formulation: " << (config_.scatteredFieldMode ? "Scattered-Field (analytical E_inc on PEC, total field on save)" : "Total-Field") << std::endl;
         std::cout << "  Probes Active:     " << allProbes.size() << " locations in " << outDir << "/" << std::endl;
@@ -649,10 +676,14 @@ void Case::simulate() {
     }
     auto tInitStart = Clock::now();
     NW_PROFILER_PUSH("Case::initSolverState");
-    dgSolver_.reset(new DgSolver());
-    dgSolver_->initialize(*mesh_, config_.c0);
+    if (!bSolverInitializedInPreprocess_ || !dgSolver_) {
+        dgSolver_.reset(new DgSolver());
+        dgSolver_->initialize(*mesh_, config_.c0);
+    }
     dgSolver_->setIncidentWave(rcsMonitor_.config().incidentPlaneWave);
-    dgSolver_->uploadState(state_.data(), state_.size());
+    if (!state_.empty() && (hasNonZeroInitialCondition_ || !bSolverInitializedInPreprocess_)) {
+        dgSolver_->uploadState(state_.data(), state_.size());
+    }
     lastMemHwStats_ = dgSolver_->getMemoryAndHardwareStats();
     NW_PROFILER_POP();
     timings_.initSolverSec += std::chrono::duration<double>(Clock::now() - tInitStart).count();
@@ -1069,11 +1100,14 @@ void Case::postprocess() {
         std::cout << "  Total Wall Time:       " << std::setw(8) << totalWallSec << " s (100.0%)" << std::endl;
         std::cout << "    - Preprocess:        " << std::setw(8) << timings_.preprocessSec << " s ("
                   << std::setprecision(1) << (100.0 * timings_.preprocessSec / totalWallSec) << "%)" << std::setprecision(3) << std::endl;
-        std::cout << "      * Mesh I/O & Topo: " << std::setw(8) << timings_.meshParseAndTopoSec << " s" << std::endl;
-        std::cout << "      * Volume Metrics:  " << std::setw(8) << timings_.volumeMetricsSec << " s" << std::endl;
-        std::cout << "      * Face Setup:      " << std::setw(8) << timings_.faceSetupSec << " s" << std::endl;
-        std::cout << "      * PML Init:        " << std::setw(8) << timings_.pmlSetupSec << " s" << std::endl;
-        std::cout << "      * CFL & dt Scan:   " << std::setw(8) << timings_.cflAndDtSec << " s" << std::endl;
+        std::cout << "      * Mesh I/O & Topo: " << std::setw(8) << timings_.meshParseAndTopoSec << " s (CPU)" << std::endl;
+        std::cout << "      * PML Topology:    " << std::setw(8) << timings_.pmlSetupSec << " s (CPU)" << std::endl;
+        std::cout << "      * GPU Topo H2D:    " << std::setw(8) << timings_.gpuTopoUploadSec << " s ("
+                  << std::setprecision(1) << (timings_.h2dTopologyBytes / (1024.0 * 1024.0)) << " MiB)" << std::setprecision(3) << std::endl;
+        std::cout << "      * GPU Vol Metrics: " << std::setw(8) << timings_.volumeMetricsSec << " s (GPU kernel)" << std::endl;
+        std::cout << "      * GPU Face Setup:  " << std::setw(8) << timings_.faceSetupSec << " s (GPU kernel)" << std::endl;
+        std::cout << "      * GPU PML Sigma:   " << std::setw(8) << timings_.gpuPmlSigmaSec << " s (GPU kernel)" << std::endl;
+        std::cout << "      * GPU CFL dxmin:   " << std::setw(8) << timings_.cflAndDtSec << " s (GPU kernel)" << std::endl;
         std::cout << "      * Init Fields/Prb: " << std::setw(8) << timings_.initFieldsAndProbesSec << " s" << std::endl;
         std::cout << "    - GPU Solver Init:   " << std::setw(8) << timings_.initSolverSec << " s ("
                   << std::setprecision(1) << (100.0 * timings_.initSolverSec / totalWallSec) << "%)" << std::setprecision(3) << std::endl;
@@ -1097,8 +1131,7 @@ void Case::postprocess() {
             std::ofstream tel(outDir + "/hpc_telemetry.json");
             if (tel.is_open()) {
                 size_t hostStateBytes = state_.size() * sizeof(double);
-                size_t hostMeshBytes = mesh_->getTotalPoints() * 14ULL * sizeof(double) +
-                                       mesh_->getFaceData().size() * 64ULL;
+                size_t hostMeshBytes = mesh_->getAllocatedHostBytes();
                 tel << "{\n"
                     << "  \"hardware\": {\n"
                     << "    \"device_name\": \"" << lastMemHwStats_.deviceName << "\",\n"
@@ -1133,18 +1166,22 @@ void Case::postprocess() {
                     << "    \"gpu_driver_used\": " << lastMemHwStats_.driverUsedVramBytes << ",\n"
                     << "    \"gpu_driver_free\": " << lastMemHwStats_.driverFreeVramBytes << ",\n"
                     << "    \"gpu_driver_total\": " << lastMemHwStats_.totalGlobalMemBytes << ",\n"
+                    << "    \"h2d_preprocess_topology\": " << timings_.h2dTopologyBytes << ",\n"
                     << "    \"host_peak_rss\": " << hostPeakRss << ",\n"
                     << "    \"host_state_vector\": " << hostStateBytes << ",\n"
                     << "    \"host_mesh_metrics\": " << hostMeshBytes << "\n"
                     << "  },\n"
                     << "  \"phase_timings_sec\": {\n"
                     << std::fixed << std::setprecision(6)
+                    << "    \"used_gpu_preprocess\": " << (timings_.usedGpuPreprocess ? "true" : "false") << ",\n"
                     << "    \"preprocess\": " << timings_.preprocessSec << ",\n"
                     << "    \"load_mesh\": " << timings_.loadMeshSec << ",\n"
                     << "    \"preprocess_mesh_parse_and_topo\": " << timings_.meshParseAndTopoSec << ",\n"
+                    << "    \"preprocess_gpu_topo_upload\": " << timings_.gpuTopoUploadSec << ",\n"
                     << "    \"preprocess_volume_metrics\": " << timings_.volumeMetricsSec << ",\n"
                     << "    \"preprocess_face_setup\": " << timings_.faceSetupSec << ",\n"
                     << "    \"preprocess_pml_setup\": " << timings_.pmlSetupSec << ",\n"
+                    << "    \"preprocess_gpu_pml_sigma\": " << timings_.gpuPmlSigmaSec << ",\n"
                     << "    \"preprocess_cfl_and_dt\": " << timings_.cflAndDtSec << ",\n"
                     << "    \"preprocess_init_fields_and_probes\": " << timings_.initFieldsAndProbesSec << ",\n"
                     << "    \"init_solver\": " << timings_.initSolverSec << ",\n"
@@ -1361,15 +1398,8 @@ void Case::computeFieldDerivatives(const double* state,
     curlH.assign(3 * npts, 0.0);
 
     const auto& D = mesh_->getD();
-    const auto& rx = mesh_->getRx();
-    const auto& sx = mesh_->getSx();
-    const auto& tx = mesh_->getTx();
-    const auto& ry = mesh_->getRy();
-    const auto& sy = mesh_->getSy();
-    const auto& ty = mesh_->getTy();
-    const auto& rz = mesh_->getRz();
-    const auto& sz = mesh_->getSz();
-    const auto& tz = mesh_->getTz();
+    const auto& z = mesh_->getGllZ();
+    const auto& corners = mesh_->getElementCorners();
 
     const double* Ex = &state[0 * npts];
     const double* Ey = &state[1 * npts];
@@ -1387,11 +1417,54 @@ void Case::computeFieldDerivatives(const double* state,
 
     for (int e = 0; e < nelt; ++e) {
         int elemOffset = e * N3;
+        const auto& c = corners[e];
         for (int k = 0; k < N; ++k) {
+            double tk = z[k];
+            double tm = 0.5 * (1.0 - tk), tp = 0.5 * (1.0 + tk);
             for (int j = 0; j < N; ++j) {
+                double sj = z[j];
+                double sm = 0.5 * (1.0 - sj), sp = 0.5 * (1.0 + sj);
                 for (int i = 0; i < N; ++i) {
+                    double ri = z[i];
+                    double rm = 0.5 * (1.0 - ri), rp = 0.5 * (1.0 + ri);
+
                     int m = i + N * (j + N * k);
                     int p = elemOffset + m;
+
+                    double dNdr[8] = {
+                        -0.5 * sm * tm,  0.5 * sm * tm,  0.5 * sp * tm, -0.5 * sp * tm,
+                        -0.5 * sm * tp,  0.5 * sm * tp,  0.5 * sp * tp, -0.5 * sp * tp
+                    };
+                    double dNds[8] = {
+                        -0.5 * rm * tm, -0.5 * rp * tm,  0.5 * rp * tm,  0.5 * rm * tm,
+                        -0.5 * rm * tp, -0.5 * rp * tp,  0.5 * rp * tp,  0.5 * rm * tp
+                    };
+                    double dNdt[8] = {
+                        -0.5 * rm * sm, -0.5 * rp * sm, -0.5 * rp * sp, -0.5 * rm * sp,
+                         0.5 * rm * sm,  0.5 * rp * sm,  0.5 * rp * sp,  0.5 * rm * sp
+                    };
+
+                    double xr = 0.0, xs = 0.0, xt = 0.0;
+                    double yr = 0.0, ys = 0.0, yt = 0.0;
+                    double zr = 0.0, zs = 0.0, zt = 0.0;
+                    for (int v = 0; v < 8; ++v) {
+                        xr += dNdr[v] * c[v][0]; xs += dNds[v] * c[v][0]; xt += dNdt[v] * c[v][0];
+                        yr += dNdr[v] * c[v][1]; ys += dNds[v] * c[v][1]; yt += dNdt[v] * c[v][1];
+                        zr += dNdr[v] * c[v][2]; zs += dNds[v] * c[v][2]; zt += dNdt[v] * c[v][2];
+                    }
+                    double detJ = xr * (ys * zt - yt * zs)
+                                - xs * (yr * zt - yt * zr)
+                                + xt * (yr * zs - ys * zr);
+                    double invJ = 1.0 / detJ;
+                    double rx_k =  (ys * zt - yt * zs) * invJ;
+                    double ry_k = -(xs * zt - xt * zs) * invJ;
+                    double rz_k =  (xs * yt - xt * ys) * invJ;
+                    double sx_k = -(yr * zt - yt * zr) * invJ;
+                    double sy_k =  (xr * zt - xt * zr) * invJ;
+                    double sz_k = -(xr * yt - xt * yr) * invJ;
+                    double tx_k =  (yr * zs - ys * zr) * invJ;
+                    double ty_k = -(xr * zs - xs * zr) * invJ;
+                    double tz_k =  (xr * ys - xs * yr) * invJ;
 
                     // Reference derivatives for E
                     double Ex_r = 0.0, Ex_s = 0.0, Ex_t = 0.0;
@@ -1436,10 +1509,6 @@ void Case::computeFieldDerivatives(const double* state,
                         Hy_t += d_kl * Hy[idx_t];
                         Hz_t += d_kl * Hz[idx_t];
                     }
-
-                    double rx_k = rx[p], sx_k = sx[p], tx_k = tx[p];
-                    double ry_k = ry[p], sy_k = sy[p], ty_k = ty[p];
-                    double rz_k = rz[p], sz_k = sz[p], tz_k = tz[p];
 
                     // Physical derivatives for E: dEx/dx, dEy/dy, dEz/dz, etc.
                     double dEx_dx = Ex_r * rx_k + Ex_s * sx_k + Ex_t * tx_k;

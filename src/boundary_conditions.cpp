@@ -80,40 +80,9 @@ std::string BoundaryConditions::toString(BcType bc) {
     }
 }
 
-void BoundaryConditions::buildFacePointBcTypes(const Mesh& mesh, std::vector<int>& h_bcType) {
-    const auto& faceData = mesh.getFaceData();
-    size_t totalFacePoints = 0;
-    for (const auto& fd : faceData) {
-        totalFacePoints += fd.points.size();
-    }
-
-    h_bcType.resize(totalFacePoints);
-    size_t ptIdx = 0;
-    for (const auto& fd : faceData) {
-        int samplePlus = fd.points.empty() ? -1 : fd.points[0].volIdxPlus;
-        BcType faceBc = parseBcTag(fd.bcType, samplePlus);
-
-        for (const auto& pt : fd.points) {
-            BcType ptBc = faceBc;
-            // If a face point has no exterior neighbor (volIdxPlus < 0), it cannot be INTERIOR/PERIODIC/MPI
-            if (pt.volIdxPlus < 0 &&
-                (ptBc == BcType::INTERIOR || ptBc == BcType::PERIODIC || ptBc == BcType::MPI_CUT)) {
-                ptBc = BcType::PEC;
-            }
-            h_bcType[ptIdx++] = static_cast<int>(ptBc);
-        }
-    }
-}
-
 bool BoundaryConditions::hasPmlFaces(const Mesh& mesh) {
     for (const auto& f : mesh.getFaces()) {
         if (parseBcTag(f.bcType, f.neighborElementId) == BcType::PML) {
-            return true;
-        }
-    }
-    for (const auto& fd : mesh.getFaceData()) {
-        int samplePlus = fd.points.empty() ? -1 : fd.points[0].volIdxPlus;
-        if (parseBcTag(fd.bcType, samplePlus) == BcType::PML) {
             return true;
         }
     }
@@ -146,112 +115,52 @@ bool BoundaryConditions::validatePmlConfig(const PmlConfig& cfg) {
     return true;
 }
 
-void BoundaryConditions::marchFaces(const Mesh& mesh, std::vector<double>& faceary) {
-    // Matches march_faces in contrib/NekCEM/src/cem_maxwell_pml.F
-    // NekWave faceId (0..5) corresponds to Ed's 1..6 numbering:
-    //   axis 0 (r): negFace = 3 (r = -1), posFace = 1 (r = +1)
-    //   axis 1 (s): negFace = 0 (s = -1), posFace = 2 (s = +1)
-    //   axis 2 (t): negFace = 4 (t = -1), posFace = 5 (t = +1)
+void BoundaryConditions::pmlFillFaceArray(const Mesh& mesh, std::vector<int>& faceLevel, int thick) {
+    // Matches pml_fill_faceary in contrib/NekCEM/src/cem_maxwell_pml.F
+    const int nelt = mesh.getNumElements();
     const int negFaces[3] = {3, 0, 4};
     const int posFaces[3] = {1, 2, 5};
 
-    const int nelt = mesh.getNumElements();
-    const int N = mesh.getN();
-    const int N2 = N * N;
-    const int checkIdx = (N >= 3) ? (N + 1) : 0;
-
-    // 1. Increment opposing faces inside each element if at least one is non-zero
-    for (int elt = 0; elt < nelt; ++elt) {
-        for (int axis = 0; axis < 3; ++axis) {
-            int posFace = posFaces[axis];
-            int negFace = negFaces[axis];
-            const size_t posBase = static_cast<size_t>(elt * 6 + posFace) * N2;
-            const size_t negBase = static_cast<size_t>(elt * 6 + negFace) * N2;
-            if (faceary[posBase + checkIdx] + faceary[negBase + checkIdx] == 0.0) {
-                continue;
-            }
-            for (int idx = 0; idx < N2; ++idx) {
-                double& posVal = faceary[posBase + idx];
-                double& negVal = faceary[negBase + idx];
-                if (posVal + negVal != 0.0) {
-                    posVal += 1.0;
-                    negVal += 1.0;
-                }
-            }
-        }
-    }
-
-    // 2. Maximum across shared interior neighboring element faces (gs_op max)
-    // Note: Do not march across periodic boundaries (matches NekCEM comment in march_faces).
-    // Since each shared interior face pair {(eltA, faceA), (eltB, faceB)} is disjoint from
-    // all other pairs and max(vA, vB) is idempotent, updating in-place is exact and avoids
-    // reallocating/copying the multi-GB faceary buffer on every marching step.
-    const auto& faces = mesh.getFaces();
-    for (const auto& f : faces) {
-        int eltA = f.elementId;
-        int faceA = f.faceId;
-        int eltB = f.neighborElementId;
-        int faceB = f.neighborFaceId;
-
-        if (eltB < 0 || faceB < 0) continue;
-        const size_t baseA = static_cast<size_t>(eltA * 6 + faceA) * N2;
-        const size_t baseB = static_cast<size_t>(eltB * 6 + faceB) * N2;
-        if (faceary[baseA + checkIdx] == 0.0 && faceary[baseB + checkIdx] == 0.0) {
-            continue;
-        }
-
-        if (parseBcTag(f.bcType, eltB) == BcType::INTERIOR) {
-            if (N >= 3) {
-                for (int iz = 1; iz < N - 1; ++iz) {
-                    for (int ix = 1; ix < N - 1; ++ix) {
-                        int idx = iz * N + ix;
-                        double m = std::max(faceary[baseA + idx], faceary[baseB + idx]);
-                        faceary[baseA + idx] = m;
-                        faceary[baseB + idx] = m;
-                    }
-                }
-            } else {
-                for (int idx = 0; idx < N2; ++idx) {
-                    double m = std::max(faceary[baseA + idx], faceary[baseB + idx]);
-                    faceary[baseA + idx] = m;
-                    faceary[baseB + idx] = m;
-                }
-            }
-        }
-    }
-}
-
-void BoundaryConditions::pmlFillFaceArray(const Mesh& mesh, std::vector<double>& faceary, int thick) {
-    // Matches pml_fill_faceary in contrib/NekCEM/src/cem_maxwell_pml.F
-    const int nelt = mesh.getNumElements();
-    const int N = mesh.getN();
-    const int N2 = N * N;
-
-    faceary.assign(static_cast<size_t>(nelt) * 6 * N2, 0.0);
+    // March 1 integer level per face (6 * nelt ints)
+    faceLevel.assign(static_cast<size_t>(nelt) * 6, 0);
 
     const auto& faces = mesh.getFaces();
+    // Pre-collect interior shared face pairs (with eltA < eltB to touch each pair once per step)
+    std::vector<std::pair<size_t, size_t>> interiorPairs;
+    interiorPairs.reserve(faces.size() / 2);
+
     for (const auto& f : faces) {
-        if (parseBcTag(f.bcType, f.neighborElementId) == BcType::PML) {
-            int elt = f.elementId;
-            int face = f.faceId;
-            if (N >= 3) {
-                // Seed interior nodes of PML faces (avoiding edges so values do not bleed sideways)
-                for (int iz = 1; iz < N - 1; ++iz) {
-                    for (int ix = 1; ix < N - 1; ++ix) {
-                        faceary[(elt * 6 + face) * N2 + iz * N + ix] = 1.0;
-                    }
-                }
-            } else {
-                for (int idx = 0; idx < N2; ++idx) {
-                    faceary[(elt * 6 + face) * N2 + idx] = 1.0;
-                }
+        const BcType bc = parseBcTag(f.bcType, f.neighborElementId);
+        if (bc == BcType::PML) {
+            faceLevel[static_cast<size_t>(f.elementId) * 6 + f.faceId] = 1;
+        } else if (bc == BcType::INTERIOR && f.neighborElementId >= 0 && f.neighborFaceId >= 0) {
+            if (f.elementId < f.neighborElementId ||
+                (f.elementId == f.neighborElementId && f.faceId < f.neighborFaceId)) {
+                size_t idxA = static_cast<size_t>(f.elementId) * 6 + f.faceId;
+                size_t idxB = static_cast<size_t>(f.neighborElementId) * 6 + f.neighborFaceId;
+                interiorPairs.push_back({idxA, idxB});
             }
         }
     }
 
-    // March inward through opposing hex faces `thick` times
+    // March inward through opposing hex faces `thick` times in O(nelt) using compact ints
     for (int step = 0; step < thick; ++step) {
-        marchFaces(mesh, faceary);
+        for (int elt = 0; elt < nelt; ++elt) {
+            const size_t base = static_cast<size_t>(elt) * 6;
+            for (int axis = 0; axis < 3; ++axis) {
+                int& pVal = faceLevel[base + posFaces[axis]];
+                int& nVal = faceLevel[base + negFaces[axis]];
+                if (pVal + nVal != 0) {
+                    pVal += 1;
+                    nVal += 1;
+                }
+            }
+        }
+        for (const auto& pr : interiorPairs) {
+            int m = std::max(faceLevel[pr.first], faceLevel[pr.second]);
+            faceLevel[pr.first] = m;
+            faceLevel[pr.second] = m;
+        }
     }
 }
 
@@ -262,17 +171,21 @@ int BoundaryConditions::dirLocalToGlobal(const Mesh& mesh, int elt, int symDir) 
     int axis = symDir / 2;
     locvec[axis] = (symDir % 2 == 0) ? -1.0 : 1.0;
 
-    int p0 = elt * mesh.getNumPointsPerElement();
+    // Evaluate trilinear Jacobian at corner 0 (r = -1, s = -1, t = -1) directly from corners
+    const auto& c = mesh.getElementCorners()[elt];
+    double xr = 0.5 * (c[1][0] - c[0][0]), yr = 0.5 * (c[1][1] - c[0][1]), zr = 0.5 * (c[1][2] - c[0][2]);
+    double xs = 0.5 * (c[3][0] - c[0][0]), ys = 0.5 * (c[3][1] - c[0][1]), zs = 0.5 * (c[3][2] - c[0][2]);
+    double xt = 0.5 * (c[4][0] - c[0][0]), yt = 0.5 * (c[4][1] - c[0][1]), zt = 0.5 * (c[4][2] - c[0][2]);
+    double detJ = xr * (ys * zt - yt * zs) - xs * (yr * zt - yt * zr) + xt * (yr * zs - ys * zr);
+    double invJ = (std::abs(detJ) > 1.0e-20) ? (1.0 / detJ) : 1.0;
+    double rx0 = invJ * (ys * zt - yt * zs), sx0 = invJ * (yt * zr - yr * zt), tx0 = invJ * (yr * zs - ys * zr);
+    double ry0 = invJ * (xt * zs - xs * zt), sy0 = invJ * (xr * zt - xt * zr), ty0 = invJ * (xs * zr - xr * zs);
+    double rz0 = invJ * (xs * yt - xt * ys), sz0 = invJ * (xt * yr - xr * yt), tz0 = invJ * (xr * ys - xs * yr);
+
     double globvec[3];
-    globvec[0] = mesh.getRx()[p0] * locvec[0]
-               + mesh.getSx()[p0] * locvec[1]
-               + mesh.getTx()[p0] * locvec[2];
-    globvec[1] = mesh.getRy()[p0] * locvec[0]
-               + mesh.getSy()[p0] * locvec[1]
-               + mesh.getTy()[p0] * locvec[2];
-    globvec[2] = mesh.getRz()[p0] * locvec[0]
-               + mesh.getSz()[p0] * locvec[1]
-               + mesh.getTz()[p0] * locvec[2];
+    globvec[0] = rx0 * locvec[0] + sx0 * locvec[1] + tx0 * locvec[2];
+    globvec[1] = ry0 * locvec[0] + sy0 * locvec[1] + ty0 * locvec[2];
+    globvec[2] = rz0 * locvec[0] + sz0 * locvec[1] + tz0 * locvec[2];
 
     int argmax = 0;
     double biggest = 0.0;
@@ -290,19 +203,15 @@ int BoundaryConditions::dirLocalToGlobal(const Mesh& mesh, int elt, int symDir) 
     return globdir;
 }
 
-void BoundaryConditions::pmlExtentAndTags(const Mesh& mesh, const std::vector<double>& faceary, PmlData& pml) {
+void BoundaryConditions::pmlExtentAndTags(const Mesh& mesh, const std::vector<int>& faceLevel, PmlData& pml) {
     // Matches pml_extent_and_tags in contrib/NekCEM/src/cem_maxwell_pml.F
     const int nelt = mesh.getNumElements();
-    const int N = mesh.getN();
-    const int N2 = N * N;
-    const int nxyz = mesh.getNumPointsPerElement();
 
     // Mapping from symmetric face index (0=-r, 1=+r, 2=-s, 3=+s, 4=-t, 5=+t)
     // to NekWave / Ed's faceId (0..5)
     const int eface0[6] = {3, 1, 0, 2, 4, 5};
     const int oppSymFace[6] = {1, 0, 3, 2, 5, 4};
 
-    const int indPtIdx = (N >= 3) ? (1 * N + 1) : 0;
     const double pmlInf = 1.0e20;
 
     for (int axis = 0; axis < 3; ++axis) {
@@ -314,17 +223,15 @@ void BoundaryConditions::pmlExtentAndTags(const Mesh& mesh, const std::vector<do
 
     pml.pmlTag.assign(nelt, 0);
 
-    const auto& xm1 = mesh.getCoordX();
-    const auto& ym1 = mesh.getCoordY();
-    const auto& zm1 = mesh.getCoordZ();
+    const auto& allCorners = mesh.getElementCorners();
 
     for (int elt = 0; elt < nelt; ++elt) {
         for (int axis = 0; axis < 3; ++axis) {
             int symFace = axis * 2; // Negative symmetric face along local axis
-            double farHere = faceary[(elt * 6 + eface0[symFace]) * N2 + indPtIdx];
-            double farOpp  = faceary[(elt * 6 + eface0[oppSymFace[symFace]]) * N2 + indPtIdx];
+            int farHere = faceLevel[static_cast<size_t>(elt) * 6 + eface0[symFace]];
+            int farOpp  = faceLevel[static_cast<size_t>(elt) * 6 + eface0[oppSymFace[symFace]]];
 
-            if (farHere != 0.0 && farOpp != 0.0) {
+            if (farHere != 0 && farOpp != 0) {
                 if (farHere == farOpp) {
                     if (Comm::isRoot()) {
                         std::cerr << "[PML ERROR] No gradient in PML indicators in element " << elt
@@ -341,24 +248,21 @@ void BoundaryConditions::pmlExtentAndTags(const Mesh& mesh, const std::vector<do
                 int negGlobFace = globAxis * 2;
                 int posGlobFace = globAxis * 2 + 1;
 
-                const std::vector<double>& coordArr =
-                    (globAxis == 0) ? xm1 : ((globAxis == 1) ? ym1 : zm1);
-
                 double minCoord =  pmlInf;
                 double maxCoord = -pmlInf;
-                int base = elt * nxyz;
-                for (int i = 0; i < nxyz; ++i) {
-                    double c = coordArr[base + i];
-                    minCoord = std::min(minCoord, c);
-                    maxCoord = std::max(maxCoord, c);
+                const auto& c = allCorners[elt];
+                for (int a = 0; a < 8; ++a) {
+                    double val = c[a][globAxis];
+                    minCoord = std::min(minCoord, val);
+                    maxCoord = std::max(maxCoord, val);
                 }
 
-                if (globSign * (farHere - farOpp) > 0.0) {
+                if (globSign * (farHere - farOpp) > 0) {
                     // Positive-side PML slab (+X, +Y, or +Z)
                     pml.pmlInner[posGlobFace] = std::min(pml.pmlInner[posGlobFace], minCoord);
                     pml.pmlOuter[posGlobFace] = std::max(pml.pmlOuter[posGlobFace], maxCoord);
                     pml.pmlTag[elt] |= (1 << posGlobFace);
-                } else if (globSign * (farHere - farOpp) < 0.0) {
+                } else if (globSign * (farHere - farOpp) < 0) {
                     // Negative-side PML slab (-X, -Y, or -Z)
                     pml.pmlInner[negGlobFace] = std::max(pml.pmlInner[negGlobFace], maxCoord);
                     pml.pmlOuter[negGlobFace] = std::min(pml.pmlOuter[negGlobFace], minCoord);
@@ -381,18 +285,16 @@ void BoundaryConditions::pmlExtentAndTags(const Mesh& mesh, const std::vector<do
     // an orthogonal PML slab [pmlInner, pmlOuter] also enables conductivity along that axis.
     for (int elt = 0; elt < nelt; ++elt) {
         if (pml.pmlTag[elt] == 0) continue;
-        int base = elt * nxyz;
+        const auto& c = allCorners[elt];
         for (int axis = 0; axis < 3; ++axis) {
-            const std::vector<double>& coordArr =
-                (axis == 0) ? xm1 : ((axis == 1) ? ym1 : zm1);
             int negFace = axis * 2 + 0;
             int posFace = axis * 2 + 1;
             double minC =  pmlInf;
             double maxC = -pmlInf;
-            for (int i = 0; i < nxyz; ++i) {
-                double c = coordArr[base + i];
-                minC = std::min(minC, c);
-                maxC = std::max(maxC, c);
+            for (int a = 0; a < 8; ++a) {
+                double val = c[a][axis];
+                minC = std::min(minC, val);
+                maxC = std::max(maxC, val);
             }
             if (pml.pmlInner[negFace] > -0.5 * pmlInf &&
                 minC < pml.pmlInner[negFace] - 1.0e-12) {
@@ -407,14 +309,11 @@ void BoundaryConditions::pmlExtentAndTags(const Mesh& mesh, const std::vector<do
 }
 
 void BoundaryConditions::pmlCalcSigma(const Mesh& mesh, const PmlConfig& cfg, PmlData& pml) {
-    // Matches pml_calc_sigma in contrib/NekCEM/src/cem_maxwell_pml.F (Taflove Eq. 7.55, 7.57)
+    // Builds compact PML element index list (pmlPtr); point-wise conductivity
+    // profile d_pmlSigma is evaluated directly on the GPU via gpu_compute_pml_sigma_kernel.
     const int nelt = mesh.getNumElements();
-    const int nxyz = mesh.getNumPointsPerElement();
-    const int npts = mesh.getTotalPoints();
 
-    pml.pmlSigma.assign(static_cast<size_t>(3) * npts, 0.0);
     pml.pmlPtr.clear();
-
     for (int ie = 0; ie < nelt; ++ie) {
         if (pml.pmlTag[ie] != 0) {
             pml.pmlPtr.push_back(ie);
@@ -432,35 +331,6 @@ void BoundaryConditions::pmlCalcSigma(const Mesh& mesh, const PmlConfig& cfg, Pm
                   << ", order = " << cfg.order
                   << ", R(0) = " << cfg.reflectErr << ")" << std::endl;
     }
-
-    const auto& xm1 = mesh.getCoordX();
-    const auto& ym1 = mesh.getCoordY();
-    const auto& zm1 = mesh.getCoordZ();
-
-    // Vacuum wave impedance eta = sqrt(mu / eps) = 1.0 in normalized units
-    const double eta = 1.0;
-
-    for (int e = 0; e < pml.maxPml; ++e) {
-        int ie = pml.pmlPtr[e];
-        for (int face = 0; face < 6; ++face) {
-            int axis = face / 2;
-            double width = std::abs(pml.pmlOuter[face] - pml.pmlInner[face]);
-
-            if ((pml.pmlTag[ie] & (1 << face)) != 0 && width > 1.0e-14) {
-                double sigmaMax = -(cfg.order + 1.0) * std::log(cfg.reflectErr) / (2.0 * eta * width);
-
-                for (int i = 0; i < nxyz; ++i) {
-                    int j = ie * nxyz + i;
-                    double coord = (axis == 0) ? xm1[j] : ((axis == 1) ? ym1[j] : zm1[j]);
-                    double zero2one = (coord - pml.pmlInner[face]) / (pml.pmlOuter[face] - pml.pmlInner[face]);
-                    zero2one = std::max(0.0, std::min(1.0, zero2one));
-
-                    double sigmaVal = sigmaMax * std::pow(zero2one, cfg.order);
-                    pml.pmlSigma[axis * npts + j] = sigmaVal;
-                }
-            }
-        }
-    }
 }
 
 PmlData BoundaryConditions::initializePml(const Mesh& mesh, const PmlConfig& cfg) {
@@ -472,9 +342,9 @@ PmlData BoundaryConditions::initializePml(const Mesh& mesh, const PmlConfig& cfg
         return pml;
     }
 
-    std::vector<double> faceary;
-    pmlFillFaceArray(mesh, faceary, cfg.thickness);
-    pmlExtentAndTags(mesh, faceary, pml);
+    std::vector<int> faceLevel;
+    pmlFillFaceArray(mesh, faceLevel, cfg.thickness);
+    pmlExtentAndTags(mesh, faceLevel, pml);
     pmlCalcSigma(mesh, cfg, pml);
 
     return pml;

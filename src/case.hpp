@@ -160,15 +160,20 @@ private:
     bool bIsPreprocessed_;
     bool bIsSimulated_;
     bool bIsPostprocessed_;
+    bool bSolverInitializedInPreprocess_ = false;
+    bool hasNonZeroInitialCondition_ = false;
     SaveOptions saveOptions_;
 
     struct PhaseTimings {
+        bool usedGpuPreprocess = false;
         double preprocessSec = 0.0;
         double loadMeshSec = 0.0;
         double meshParseAndTopoSec = 0.0;
+        double gpuTopoUploadSec = 0.0;
         double volumeMetricsSec = 0.0;
         double faceSetupSec = 0.0;
         double pmlSetupSec = 0.0;
+        double gpuPmlSigmaSec = 0.0;
         double cflAndDtSec = 0.0;
         double initFieldsAndProbesSec = 0.0;
         double initSolverSec = 0.0;
@@ -179,6 +184,7 @@ private:
         double diagnosticsSec = 0.0;
         double postprocessSec = 0.0;
         double simulateTotalSec = 0.0;
+        size_t h2dTopologyBytes = 0;
     } timings_;
 
     DgSolver::MemoryAndHardwareStats lastMemHwStats_{};

@@ -82,9 +82,14 @@ if(ENABLE_HIP)
     if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.21")
         enable_language(HIP)
         add_library(nekwave_device STATIC
-            src/device/dg_kernels.cu
+            src/device/dg_sim_kernels.cu
+            src/device/dg_preproc_kernels.cu
         )
-        set_source_files_properties(src/device/dg_kernels.cu PROPERTIES LANGUAGE HIP)
+        set_source_files_properties(
+            src/device/dg_sim_kernels.cu
+            src/device/dg_preproc_kernels.cu
+            PROPERTIES LANGUAGE HIP
+        )
         target_include_directories(nekwave_device PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
             $<BUILD_INTERFACE:${DEVICE_INCLUDE_DIRS}>
@@ -97,7 +102,8 @@ if(ENABLE_HIP)
         endif()
     else()
         add_library(nekwave_device STATIC
-            src/device/dg_kernels.cu
+            src/device/dg_sim_kernels.cu
+            src/device/dg_preproc_kernels.cu
         )
         set_target_properties(nekwave_device PROPERTIES
             LINKER_LANGUAGE CXX
@@ -153,7 +159,8 @@ else()
     set(CUDA_INCLUDE_DIR "${CUDA_TOOLKIT_ROOT}/include")
 
     add_library(nekwave_device STATIC
-        src/device/dg_kernels.cu
+        src/device/dg_sim_kernels.cu
+        src/device/dg_preproc_kernels.cu
     )
     target_include_directories(nekwave_device PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
@@ -271,7 +278,7 @@ if(NEKWAVE_HDF5_LIBS)
             get_filename_component(_lib_dir "${_lib}" DIRECTORY)
             set(CMAKE_BUILD_RPATH "${CMAKE_BUILD_RPATH};${_lib_dir}")
             set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${_lib_dir}")
-            if(NOT HDF5_INCLUDE_DIRS)
+            if(NOT HDF5_INCLUDE_DIRS OR NOT EXISTS "${HDF5_INCLUDE_DIRS}/hdf5.h")
                 get_filename_component(_hdf5_prefix "${_lib_dir}" DIRECTORY)
                 if(EXISTS "${_hdf5_prefix}/include/hdf5.h")
                     set(HDF5_INCLUDE_DIRS "${_hdf5_prefix}/include")

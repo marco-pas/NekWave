@@ -110,7 +110,6 @@ struct PmlData {
 
     std::vector<int> pmlTag;      ///< Bitmask per element (size numElements)
     std::vector<int> pmlPtr;      ///< Compact list of PML element IDs (size maxPml)
-    std::vector<double> pmlSigma; ///< Conductivity [sigX, sigY, sigZ] (size 3 * totalPoints)
 
     PmlData()
         : enabled(false),
@@ -125,14 +124,12 @@ struct PmlData {
  *
  * Provides:
  *   1. Tag normalization and parsing for .rea, .re2, and JSON configurations.
- *   2. Face-point BcType classification for GPU surface Riemann flux kernels.
- *   3. 1-to-1 port of NekCEM's time-domain Maxwell UPML setup (contrib/NekCEM/src/cem_maxwell_pml.F):
+ *   2. 1-to-1 port of NekCEM's time-domain Maxwell UPML topological setup (contrib/NekCEM/src/cem_maxwell_pml.F):
  *        - pml_errchk          -> validatePmlConfig()
  *        - pml_fill_faceary    -> pmlFillFaceArray()
- *        - march_faces         -> marchFaces()
  *        - dir_local_to_global -> dirLocalToGlobal()
  *        - pml_extent_and_tags -> pmlExtentAndTags()
- *        - pml_calc_sigma      -> pmlCalcSigma()
+ *        - pml_calc_sigma      -> pmlCalcSigma() (topological list; point-wise sigma evaluated on GPU)
  */
 class BoundaryConditions {
 public:
@@ -151,14 +148,6 @@ public:
     static std::string toString(BcType bc);
 
     /**
-     * @brief Populates the flattened face-quadrature-point boundary condition array for GPU flux evaluation.
-     *
-     * @param mesh     Initialized Mesh object.
-     * @param h_bcType Output vector of size totalFacePoints containing static_cast<int>(BcType).
-     */
-    static void buildFacePointBcTypes(const Mesh& mesh, std::vector<int>& h_bcType);
-
-    /**
      * @brief Returns true if the mesh contains any boundary face tagged with BcType::PML.
      */
     static bool hasPmlFaces(const Mesh& mesh);
@@ -169,10 +158,10 @@ public:
     static bool validatePmlConfig(const PmlConfig& cfg);
 
     /**
-     * @brief Runs NekCEM's full UPML topological face-marching and polynomial sigma grading pipeline.
+     * @brief Runs NekCEM's UPML topological face-marching and slab extent pipeline.
      *
-     * Ports pml_fill_faceary, march_faces, pml_extent_and_tags, and pml_calc_sigma
-     * from contrib/NekCEM/src/cem_maxwell_pml.F.
+     * Point-wise polynomial sigma grading is evaluated directly on the GPU via
+     * gpu_compute_pml_sigma_kernel.
      *
      * @param mesh Reference to the Mesh (prior to or after partitioning).
      * @param cfg  UPML grading parameters (thickness, order, reflectErr).
@@ -187,12 +176,11 @@ public:
      * Matches dir_local_to_global in contrib/NekCEM/src/cem_maxwell_pml.F.
      */
     static int dirLocalToGlobal(const Mesh& mesh, int elt, int symDir);
+    static void pmlCalcSigma(const Mesh& mesh, const PmlConfig& cfg, PmlData& pml);
 
 private:
-    static void pmlFillFaceArray(const Mesh& mesh, std::vector<double>& faceary, int thick);
-    static void marchFaces(const Mesh& mesh, std::vector<double>& faceary);
-    static void pmlExtentAndTags(const Mesh& mesh, const std::vector<double>& faceary, PmlData& pml);
-    static void pmlCalcSigma(const Mesh& mesh, const PmlConfig& cfg, PmlData& pml);
+    static void pmlFillFaceArray(const Mesh& mesh, std::vector<int>& faceLevel, int thick);
+    static void pmlExtentAndTags(const Mesh& mesh, const std::vector<int>& faceLevel, PmlData& pml);
 };
 
 #endif // NW_SRC_BOUNDARY_CONDITIONS_HPP

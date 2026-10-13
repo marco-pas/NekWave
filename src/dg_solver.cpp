@@ -2,7 +2,8 @@
 #include "mesh.hpp"
 #include "boundary_conditions.hpp"
 #include "comm.hpp"
-#include "device/dg_kernels.hpp"
+#include "device/dg_sim_kernels.hpp"
+#include "device/dg_preproc_kernels.hpp"
 #include "device/gpu_runtime.hpp"
 
 #ifdef NEKWAVE_ENABLE_MPI
@@ -15,6 +16,7 @@
 #include <vector>
 #include <cassert>
 #include <cstdio>
+#include <chrono>
 
 // ==============================================================================
 // DgSolver::Impl - Fully GPU-Resident Discontinuous Galerkin Maxwell Engine
@@ -28,18 +30,22 @@ public:
         freeBuffers();
     }
 
-    /**
-     * @brief Allocates GPU device memory and uploads static mesh metrics and face topology.
-     *
-     * Prepares device memory residency:
-     *   1. State & auxiliary vectors: E, H, k (LSRK45 auxiliary), rhs (spatial residual)
-     *   2. 1D GLL differentiation matrix D (N x N) and 3D GLL weights w3 (N^3)
-     *   3. Geometric Jacobian J and metric coordinate derivatives (rx, sx, tx, ry, sy, ty, rz, sz, tz)
-     *   4. Boundary and interface face quadrature points, unit normals, and area metrics dA
-     *   5. Scratch face trace arrays (fEN, fHN) and surface numerical flux arrays (flux)
-     */
     bool initialize(const Mesh& mesh, double c0) {
+        double dxmin = 0.0;
+        return preprocessAndInitialize(const_cast<Mesh&>(mesh), c0, &dxmin, true);
+    }
+
+    /**
+     * @brief Performs GPU-native mesh preprocessing (volume metrics, face normals/matching,
+     *        UPML sigma grading, and CFL min node distance) and allocates all persistent
+     *        GPU solver buffers.
+     */
+    bool preprocessAndInitialize(Mesh& mesh, double c0,
+                                 double* outDxmin,
+                                 bool downloadHostCoords) {
+        using Clock = std::chrono::high_resolution_clock;
         freeBuffers();
+        gpuPreprocessTimings_ = GpuPreprocessTimings{};
 
         N_ = mesh.getN();
         nelt_ = mesh.getNumElements();
@@ -55,86 +61,51 @@ public:
         // Low-Storage Runge-Kutta 4th-Order 5-Stage Scheme (LSRK45)
         // From Carpenter & Kennedy (1994), matching NekCEM's rk_storage in cem_common.F
         // ----------------------------------------------------------------------
-        // 5-stage low-storage a-coefficients
         rk4a_ = {0.0,
                  -567301805773.0 / 1357537059087.0,
                  -2404267990393.0 / 2016746695238.0,
                  -3550918686646.0 / 2091501179385.0,
                  -1275806237668.0 / 842570457699.0};
 
-        // 5-stage low-storage b-coefficients
         rk4b_ = {1432997174477.0 / 9575080441755.0,
                  5161836677717.0 / 13612068292357.0,
                  1720146321549.0 / 2090206949498.0,
                  3134564353537.0 / 4481467310338.0,
                  2277821191437.0 / 14882151754819.0};
 
-        // 5-stage Carpenter-Kennedy (1994) stage time increments c_s (t_s = t_n + c_s * dt)
         rk4c_ = {0.0,
                  1432997174477.0 / 9575080441755.0,
                  2526269341429.0 / 6820363962896.0,
                  2006345519317.0 / 3224310063776.0,
                  2802321613138.0 / 2924317926251.0};
 
-        // ----------------------------------------------------------------------
-        // Flatten 2D Face Quadrature Geometry for Coalesced GPU Streaming
-        // ----------------------------------------------------------------------
-        // Nanson's relation transforms reference normals to physical normals:
-        //      n * dA = J * J^{-T} * n_ref * dA_ref
-        const auto& faceData = mesh.getFaceData();
-        const auto& coordX = mesh.getCoordX();
-        const auto& coordY = mesh.getCoordY();
-        const auto& coordZ = mesh.getCoordZ();
-        totalFacePoints_ = 0;
-        for (const auto& fd : faceData) {
-            totalFacePoints_ += fd.points.size();
-        }
+        gpuPreprocessTimings_.usedGpuPreprocess = true;
+        const int numFaces = static_cast<int>(mesh.getFaces().size());
+        totalFacePoints_ = numFaces * N_ * N_;
 
-        std::vector<int> h_volIdxMinus(totalFacePoints_);
-        std::vector<int> h_volIdxPlus(totalFacePoints_);
-        std::vector<int> h_bcType;
-        BoundaryConditions::buildFacePointBcTypes(mesh, h_bcType);
-        std::vector<double> h_nx(totalFacePoints_);
-        std::vector<double> h_ny(totalFacePoints_);
-        std::vector<double> h_nz(totalFacePoints_);
-        std::vector<double> h_dA(totalFacePoints_);
-        std::vector<double> h_fx(totalFacePoints_);
-        std::vector<double> h_fy(totalFacePoints_);
-        std::vector<double> h_fz(totalFacePoints_);
-
-        size_t ptIdx = 0;
-        for (const auto& fd : faceData) {
-            for (const auto& pt : fd.points) {
-                h_volIdxMinus[ptIdx] = pt.volIdxMinus;
-                h_volIdxPlus[ptIdx]  = pt.volIdxPlus;
-                h_nx[ptIdx]          = pt.nx;
-                h_ny[ptIdx]          = pt.ny;
-                h_nz[ptIdx]          = pt.nz;
-                h_dA[ptIdx]          = pt.dA;
-                h_fx[ptIdx]          = coordX[pt.volIdxMinus];
-                h_fy[ptIdx]          = coordY[pt.volIdxMinus];
-                h_fz[ptIdx]          = coordZ[pt.volIdxMinus];
-                ptIdx++;
-            }
+        PmlData localPml = mesh.getPmlData();
+        if (!localPml.enabled && BoundaryConditions::hasPmlFaces(mesh)) {
+            localPml = BoundaryConditions::initializePml(mesh, mesh.getPmlConfig());
         }
+        maxPml_ = localPml.maxPml;
+        nptsPml_ = maxPml_ * nxyz_;
 
         NW_GPU_CHECK(cudaStreamCreate(&stream_));
 
-        // ----------------------------------------------------------------------
-        // 1. Allocate State, Auxiliary, and Residual GPU Buffers
-        // ----------------------------------------------------------------------
-        // Memory layout here, totalEntries_ = 6 * npts_
-        // d_state_ allocates 6 * stateStride_ (where stateStride_ = npts_ + numHaloPoints_)
-        // Local collocation points occupy [0, npts_ - 1], followed by halo ghost slots
-        NW_GPU_CHECK(cudaMalloc(&d_state_, 6 * stateStride_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemsetAsync(d_state_, 0, 6 * stateStride_ * sizeof(double), stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_k_, totalEntries_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMalloc(&d_rhs_, totalEntries_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemsetAsync(d_k_, 0, totalEntries_ * sizeof(double), stream_));
+        // ------------------------------------------------------------------
+        // Stage A: Allocate persistent GPU buffers & upload compact topology
+        //          (Element corners: 24 doubles/elem; Faces: 5 ints/face)
+        // ------------------------------------------------------------------
+        auto tStage = Clock::now();
+        NW_PROFILER_PUSH("GPU::allocAndUploadTopology");
 
-        // ----------------------------------------------------------------------
-        // 1b. Allocate MPI Halo Exchange Buffers & Metadata (if partitioned)
-        // ----------------------------------------------------------------------
+        NW_GPU_CHECK(cudaMalloc(&d_state_, 6 * static_cast<size_t>(stateStride_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMemsetAsync(d_state_, 0, 6 * static_cast<size_t>(stateStride_) * sizeof(double), stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_k_, static_cast<size_t>(totalEntries_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_rhs_, static_cast<size_t>(totalEntries_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMemsetAsync(d_k_, 0, static_cast<size_t>(totalEntries_) * sizeof(double), stream_));
+
+        // Allocate MPI Halo Exchange Buffers & Metadata (if partitioned across ranks)
         if (numHaloPoints_ > 0) {
             exchangeBufOffsets_.resize(haloExchanges_.size());
             int curOffset = 0;
@@ -160,119 +131,266 @@ public:
                 }
             }
 
-            NW_GPU_CHECK(cudaMalloc(&d_sendVolIndices_, numHaloPoints_ * sizeof(int)));
-            NW_GPU_CHECK(cudaMemcpyAsync(d_sendVolIndices_, h_sendVolIndices.data(), numHaloPoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+            NW_GPU_CHECK(cudaMalloc(&d_sendVolIndices_, static_cast<size_t>(numHaloPoints_) * sizeof(int)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_sendVolIndices_, h_sendVolIndices.data(), static_cast<size_t>(numHaloPoints_) * sizeof(int), cudaMemcpyHostToDevice, stream_));
 
-            NW_GPU_CHECK(cudaMalloc(&d_sendBufOffsets_, numHaloPoints_ * sizeof(int)));
-            NW_GPU_CHECK(cudaMemcpyAsync(d_sendBufOffsets_, h_sendBufOffsets.data(), numHaloPoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+            NW_GPU_CHECK(cudaMalloc(&d_sendBufOffsets_, static_cast<size_t>(numHaloPoints_) * sizeof(int)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_sendBufOffsets_, h_sendBufOffsets.data(), static_cast<size_t>(numHaloPoints_) * sizeof(int), cudaMemcpyHostToDevice, stream_));
 
-            NW_GPU_CHECK(cudaMalloc(&d_recvBufOffsets_, numHaloPoints_ * sizeof(int)));
-            NW_GPU_CHECK(cudaMemcpyAsync(d_recvBufOffsets_, h_recvBufOffsets.data(), numHaloPoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+            NW_GPU_CHECK(cudaMalloc(&d_recvBufOffsets_, static_cast<size_t>(numHaloPoints_) * sizeof(int)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_recvBufOffsets_, h_recvBufOffsets.data(), static_cast<size_t>(numHaloPoints_) * sizeof(int), cudaMemcpyHostToDevice, stream_));
 
-            NW_GPU_CHECK(cudaMalloc(&d_exchangeSizes_, numHaloPoints_ * sizeof(int)));
-            NW_GPU_CHECK(cudaMemcpyAsync(d_exchangeSizes_, h_exchangeSizes.data(), numHaloPoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+            NW_GPU_CHECK(cudaMalloc(&d_exchangeSizes_, static_cast<size_t>(numHaloPoints_) * sizeof(int)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_exchangeSizes_, h_exchangeSizes.data(), static_cast<size_t>(numHaloPoints_) * sizeof(int), cudaMemcpyHostToDevice, stream_));
 
-            NW_GPU_CHECK(cudaMalloc(&d_mpiSendBuf_, 6 * numHaloPoints_ * sizeof(double)));
-            NW_GPU_CHECK(cudaMalloc(&d_mpiRecvBuf_, 6 * numHaloPoints_ * sizeof(double)));
+            NW_GPU_CHECK(cudaMalloc(&d_mpiSendBuf_, 6 * static_cast<size_t>(numHaloPoints_) * sizeof(double)));
+            NW_GPU_CHECK(cudaMalloc(&d_mpiRecvBuf_, 6 * static_cast<size_t>(numHaloPoints_) * sizeof(double)));
         }
 
-        // ----------------------------------------------------------------------
-        // 2. Allocate & Copy 1D GLL Differentiation Matrix D & Quadrature Weights
-        // ----------------------------------------------------------------------
         NW_GPU_CHECK(cudaMalloc(&d_D_, mesh.getD().size() * sizeof(double)));
         NW_GPU_CHECK(cudaMemcpyAsync(d_D_, mesh.getD().data(), mesh.getD().size() * sizeof(double), cudaMemcpyHostToDevice, stream_));
 
         NW_GPU_CHECK(cudaMalloc(&d_w3_, mesh.getW3().size() * sizeof(double)));
         NW_GPU_CHECK(cudaMemcpyAsync(d_w3_, mesh.getW3().data(), mesh.getW3().size() * sizeof(double), cudaMemcpyHostToDevice, stream_));
 
-        // ----------------------------------------------------------------------
-        // 3. Allocate & Copy Volume Coordinate Metrics and Element Jacobians
-        // ----------------------------------------------------------------------
-        // This is AoS: Ex1, Ey1, ..., Hx1, Hy1, ...
-        // AoS used from the host side for the mesh
-        NW_GPU_CHECK(cudaMalloc(&d_jac_, npts_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_jac_, mesh.getJac().data(), npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_jac_, static_cast<size_t>(npts_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_rx_, static_cast<size_t>(npts_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_sx_, static_cast<size_t>(npts_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_tx_, static_cast<size_t>(npts_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_ry_, static_cast<size_t>(npts_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_sy_, static_cast<size_t>(npts_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_ty_, static_cast<size_t>(npts_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_rz_, static_cast<size_t>(npts_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_sz_, static_cast<size_t>(npts_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_tz_, static_cast<size_t>(npts_) * sizeof(double)));
 
-        NW_GPU_CHECK(cudaMalloc(&d_rx_, npts_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_rx_, mesh.getRx().data(), npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_sx_, npts_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_sx_, mesh.getSx().data(), npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_tx_, npts_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_tx_, mesh.getTx().data(), npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_volIdxMinus_, static_cast<size_t>(totalFacePoints_) * sizeof(int)));
+        NW_GPU_CHECK(cudaMalloc(&d_volIdxPlus_, static_cast<size_t>(totalFacePoints_) * sizeof(int)));
+        NW_GPU_CHECK(cudaMalloc(&d_bcType_, static_cast<size_t>(totalFacePoints_) * sizeof(int)));
+        NW_GPU_CHECK(cudaMalloc(&d_nx_, static_cast<size_t>(totalFacePoints_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_ny_, static_cast<size_t>(totalFacePoints_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_nz_, static_cast<size_t>(totalFacePoints_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_dA_, static_cast<size_t>(totalFacePoints_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_fx_, static_cast<size_t>(totalFacePoints_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_fy_, static_cast<size_t>(totalFacePoints_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_fz_, static_cast<size_t>(totalFacePoints_) * sizeof(double)));
 
-        NW_GPU_CHECK(cudaMalloc(&d_ry_, npts_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_ry_, mesh.getRy().data(), npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_sy_, npts_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_sy_, mesh.getSy().data(), npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_ty_, npts_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_ty_, mesh.getTy().data(), npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+        // Temporary preprocessing buffers (freed before scratch allocation so peak VRAM is unchanged)
+        double* d_corners = nullptr;
+        double* d_gll_z = nullptr;
+        double* d_gll_w = nullptr;
+        double* d_coordX = nullptr;
+        double* d_coordY = nullptr;
+        double* d_coordZ = nullptr;
+        int* d_faceElem = nullptr;
+        int* d_faceId = nullptr;
+        int* d_neighborElem = nullptr;
+        int* d_neighborFace = nullptr;
+        int* d_faceBcCode = nullptr;
+        int* d_mpiCutGhostIdx = nullptr;
+        int* d_pmlTag = nullptr;
 
-        NW_GPU_CHECK(cudaMalloc(&d_rz_, npts_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_rz_, mesh.getRz().data(), npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_sz_, npts_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_sz_, mesh.getSz().data(), npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_tz_, npts_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_tz_, mesh.getTz().data(), npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+        const size_t cornersBytes = static_cast<size_t>(nelt_) * 24 * sizeof(double);
+        NW_GPU_CHECK(cudaMalloc(&d_corners, cornersBytes));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_corners, mesh.getElementCorners().data(), cornersBytes, cudaMemcpyHostToDevice, stream_));
 
-        // ----------------------------------------------------------------------
-        // 4. Allocate & Copy Face Quadrature Topologies and Metric Areas
-        // ----------------------------------------------------------------------
-        NW_GPU_CHECK(cudaMalloc(&d_volIdxMinus_, totalFacePoints_ * sizeof(int)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_volIdxMinus_, h_volIdxMinus.data(), totalFacePoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_gll_z, static_cast<size_t>(N_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_gll_z, mesh.getGllZ().data(), static_cast<size_t>(N_) * sizeof(double), cudaMemcpyHostToDevice, stream_));
 
-        NW_GPU_CHECK(cudaMalloc(&d_volIdxPlus_, totalFacePoints_ * sizeof(int)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_volIdxPlus_, h_volIdxPlus.data(), totalFacePoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_gll_w, static_cast<size_t>(N_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_gll_w, mesh.getGllW().data(), static_cast<size_t>(N_) * sizeof(double), cudaMemcpyHostToDevice, stream_));
 
-        NW_GPU_CHECK(cudaMalloc(&d_bcType_, totalFacePoints_ * sizeof(int)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_bcType_, h_bcType.data(), totalFacePoints_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMalloc(&d_coordX, static_cast<size_t>(npts_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_coordY, static_cast<size_t>(npts_) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_coordZ, static_cast<size_t>(npts_) * sizeof(double)));
 
-        NW_GPU_CHECK(cudaMalloc(&d_nx_, totalFacePoints_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_nx_, h_nx.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_ny_, totalFacePoints_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_ny_, h_ny.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_nz_, totalFacePoints_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_nz_, h_nz.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_dA_, totalFacePoints_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_dA_, h_dA.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_fx_, totalFacePoints_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_fx_, h_fx.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_fy_, totalFacePoints_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_fy_, h_fy.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-        NW_GPU_CHECK(cudaMalloc(&d_fz_, totalFacePoints_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMemcpyAsync(d_fz_, h_fz.data(), totalFacePoints_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
-
-        // ----------------------------------------------------------------------
-        // 5. Allocate Scratch Face Trace and Numerical Flux Buffers
-        // ----------------------------------------------------------------------
-        NW_GPU_CHECK(cudaMalloc(&d_fEN_, 3 * totalFacePoints_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMalloc(&d_fHN_, 3 * totalFacePoints_ * sizeof(double)));
-        NW_GPU_CHECK(cudaMalloc(&d_flux_, 6 * totalFacePoints_ * sizeof(double)));
-
-        // ----------------------------------------------------------------------
-        // 6. Allocate & Upload UPML Auxiliary Fields and Conductivity Buffers
-        // ----------------------------------------------------------------------
-        PmlData localPml = mesh.getPmlData();
-        if (!localPml.enabled && BoundaryConditions::hasPmlFaces(mesh)) {
-            localPml = BoundaryConditions::initializePml(mesh, mesh.getPmlConfig());
+        const auto& faces = mesh.getFaces();
+        std::vector<int> h_faceElem(numFaces);
+        std::vector<int> h_faceId(numFaces);
+        std::vector<int> h_neighborElem(numFaces);
+        std::vector<int> h_neighborFace(numFaces);
+        std::vector<int> h_faceBcCode(numFaces);
+        for (int f = 0; f < numFaces; ++f) {
+            h_faceElem[f] = faces[f].elementId;
+            h_faceId[f] = faces[f].faceId;
+            h_neighborElem[f] = faces[f].neighborElementId;
+            h_neighborFace[f] = faces[f].neighborFaceId;
+            h_faceBcCode[f] = static_cast<int>(BoundaryConditions::parseBcTag(faces[f].bcType, faces[f].neighborElementId));
         }
 
-        maxPml_ = localPml.maxPml;
-        nptsPml_ = maxPml_ * nxyz_;
+        const size_t faceIntsBytes = static_cast<size_t>(numFaces) * sizeof(int);
+        NW_GPU_CHECK(cudaMalloc(&d_faceElem, faceIntsBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_faceId, faceIntsBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_neighborElem, faceIntsBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_neighborFace, faceIntsBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_faceBcCode, faceIntsBytes));
+
+        NW_GPU_CHECK(cudaMemcpyAsync(d_faceElem, h_faceElem.data(), faceIntsBytes, cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_faceId, h_faceId.data(), faceIntsBytes, cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_neighborElem, h_neighborElem.data(), faceIntsBytes, cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_neighborFace, h_neighborFace.data(), faceIntsBytes, cudaMemcpyHostToDevice, stream_));
+        NW_GPU_CHECK(cudaMemcpyAsync(d_faceBcCode, h_faceBcCode.data(), faceIntsBytes, cudaMemcpyHostToDevice, stream_));
+
+        if (!mesh.getMpiCutGhostIndices().empty()) {
+            const size_t cutBytes = mesh.getMpiCutGhostIndices().size() * sizeof(int);
+            NW_GPU_CHECK(cudaMalloc(&d_mpiCutGhostIdx, cutBytes));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_mpiCutGhostIdx, mesh.getMpiCutGhostIndices().data(), cutBytes, cudaMemcpyHostToDevice, stream_));
+        }
+
+        size_t pmlUploadBytes = 0;
         if (maxPml_ > 0) {
-            NW_GPU_CHECK(cudaMalloc(&d_pmlPtr_, maxPml_ * sizeof(int)));
-            NW_GPU_CHECK(cudaMemcpyAsync(d_pmlPtr_, localPml.pmlPtr.data(), maxPml_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+            std::vector<int> h_pmlTagCompact(maxPml_);
+            for (int e = 0; e < maxPml_; ++e) {
+                int ie = localPml.pmlPtr[e];
+                h_pmlTagCompact[e] = (ie >= 0 && ie < static_cast<int>(localPml.pmlTag.size())) ? localPml.pmlTag[ie] : 0;
+            }
+            NW_GPU_CHECK(cudaMalloc(&d_pmlPtr_, static_cast<size_t>(maxPml_) * sizeof(int)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_pmlPtr_, localPml.pmlPtr.data(), static_cast<size_t>(maxPml_) * sizeof(int), cudaMemcpyHostToDevice, stream_));
 
-            NW_GPU_CHECK(cudaMalloc(&d_pmlSigma_, 3 * npts_ * sizeof(double)));
-            NW_GPU_CHECK(cudaMemcpyAsync(d_pmlSigma_, localPml.pmlSigma.data(), 3 * npts_ * sizeof(double), cudaMemcpyHostToDevice, stream_));
+            NW_GPU_CHECK(cudaMalloc(&d_pmlTag, static_cast<size_t>(maxPml_) * sizeof(int)));
+            NW_GPU_CHECK(cudaMemcpyAsync(d_pmlTag, h_pmlTagCompact.data(), static_cast<size_t>(maxPml_) * sizeof(int), cudaMemcpyHostToDevice, stream_));
+            pmlUploadBytes = 2 * static_cast<size_t>(maxPml_) * sizeof(int);
 
-            NW_GPU_CHECK(cudaMalloc(&d_pmlAux_, 6 * nptsPml_ * sizeof(double)));
-            NW_GPU_CHECK(cudaMemsetAsync(d_pmlAux_, 0, 6 * nptsPml_ * sizeof(double), stream_));
+            NW_GPU_CHECK(cudaMalloc(&d_pmlSigma_, 3 * static_cast<size_t>(npts_) * sizeof(double)));
+            NW_GPU_CHECK(cudaMemsetAsync(d_pmlSigma_, 0, 3 * static_cast<size_t>(npts_) * sizeof(double), stream_));
+        }
 
-            NW_GPU_CHECK(cudaMalloc(&d_kPmlAux_, 6 * nptsPml_ * sizeof(double)));
-            NW_GPU_CHECK(cudaMemsetAsync(d_kPmlAux_, 0, 6 * nptsPml_ * sizeof(double), stream_));
+        NW_GPU_CHECK(cudaStreamSynchronize(stream_));
+        NW_PROFILER_POP();
+        gpuPreprocessTimings_.topoUploadSec = std::chrono::duration<double>(Clock::now() - tStage).count();
+        gpuPreprocessTimings_.h2dTopologyBytes = cornersBytes + 5 * faceIntsBytes + pmlUploadBytes +
+                                                 (mesh.getD().size() + mesh.getW3().size() + 2 * static_cast<size_t>(N_)) * sizeof(double);
 
-            NW_GPU_CHECK(cudaMalloc(&d_resPmlAux_, 6 * nptsPml_ * sizeof(double)));
-            NW_GPU_CHECK(cudaMemsetAsync(d_resPmlAux_, 0, 6 * nptsPml_ * sizeof(double), stream_));
+        // ------------------------------------------------------------------
+        // Stage B: GPU Kernel - Compute 3D GLL Coordinates, Jacobian, Metrics
+        // ------------------------------------------------------------------
+        tStage = Clock::now();
+        NW_PROFILER_PUSH("GPU::computeVolumeMetrics");
+        nekwave::device::launch_compute_volume_metrics(
+            d_corners, d_gll_z,
+            d_coordX, d_coordY, d_coordZ,
+            d_jac_,
+            d_rx_, d_sx_, d_tx_,
+            d_ry_, d_sy_, d_ty_,
+            d_rz_, d_sz_, d_tz_,
+            N_, nelt_, npts_, stream_
+        );
+        NW_GPU_CHECK(cudaStreamSynchronize(stream_));
+        NW_PROFILER_POP();
+        gpuPreprocessTimings_.volumeMetricsKernelSec = std::chrono::duration<double>(Clock::now() - tStage).count();
+
+        cudaFree(d_corners);
+        d_corners = nullptr;
+
+        // ------------------------------------------------------------------
+        // Stage C: GPU Kernel - Face Normals, Area dA, and D4 Neighbor Match
+        // ------------------------------------------------------------------
+        tStage = Clock::now();
+        NW_PROFILER_PUSH("GPU::setupFaceData");
+        nekwave::device::launch_setup_face_data(
+            d_faceElem, d_faceId, d_neighborElem, d_neighborFace, d_faceBcCode,
+            d_gll_w,
+            d_coordX, d_coordY, d_coordZ,
+            d_jac_,
+            d_rx_, d_sx_, d_tx_,
+            d_ry_, d_sy_, d_ty_,
+            d_rz_, d_sz_, d_tz_,
+            d_volIdxMinus_, d_volIdxPlus_, d_bcType_,
+            d_nx_, d_ny_, d_nz_, d_dA_,
+            d_fx_, d_fy_, d_fz_,
+            N_, numFaces, totalFacePoints_, stream_,
+            d_mpiCutGhostIdx
+        );
+        NW_GPU_CHECK(cudaStreamSynchronize(stream_));
+        NW_PROFILER_POP();
+        gpuPreprocessTimings_.faceSetupKernelSec = std::chrono::duration<double>(Clock::now() - tStage).count();
+
+        if (d_mpiCutGhostIdx) { cudaFree(d_mpiCutGhostIdx); d_mpiCutGhostIdx = nullptr; }
+        cudaFree(d_faceElem); d_faceElem = nullptr;
+        cudaFree(d_faceId); d_faceId = nullptr;
+        cudaFree(d_neighborElem); d_neighborElem = nullptr;
+        cudaFree(d_neighborFace); d_neighborFace = nullptr;
+        cudaFree(d_faceBcCode); d_faceBcCode = nullptr;
+        cudaFree(d_gll_w); d_gll_w = nullptr;
+
+        // ------------------------------------------------------------------
+        // Stage D: GPU Kernel - UPML Damping Conductivity Profiles (pmlSigma)
+        // ------------------------------------------------------------------
+        if (maxPml_ > 0) {
+            tStage = Clock::now();
+            NW_PROFILER_PUSH("GPU::setupPmlSigma");
+            nekwave::device::launch_compute_pml_sigma(
+                d_pmlPtr_, d_pmlTag,
+                d_coordX, d_coordY, d_coordZ,
+                localPml.pmlInner.data(), localPml.pmlOuter.data(),
+                static_cast<double>(mesh.getPmlConfig().order),
+                mesh.getPmlConfig().reflectErr,
+                d_pmlSigma_,
+                maxPml_, nxyz_, npts_, stream_
+            );
+            NW_GPU_CHECK(cudaStreamSynchronize(stream_));
+            NW_PROFILER_POP();
+            gpuPreprocessTimings_.pmlSigmaKernelSec = std::chrono::duration<double>(Clock::now() - tStage).count();
+
+            cudaFree(d_pmlTag);
+            d_pmlTag = nullptr;
+        }
+
+        // ------------------------------------------------------------------
+        // Stage E: GPU Kernel - Minimum GLL Node Spacing (dxmin) for CFL
+        // ------------------------------------------------------------------
+        tStage = Clock::now();
+        NW_PROFILER_PUSH("GPU::computeMinNodeDistance");
+        const double dxiMin = (N_ > 1) ? (mesh.getGllZ()[1] - mesh.getGllZ()[0]) : 2.0;
+        const double dxminVal = nekwave::device::launch_compute_min_node_distance(
+            d_coordX, d_coordY, d_coordZ,
+            d_rx_, d_sx_, d_tx_,
+            d_ry_, d_sy_, d_ty_,
+            d_rz_, d_sz_, d_tz_,
+            dxiMin, N_, nelt_, npts_, stream_
+        );
+        mesh.setMinNodeDistance(dxminVal);
+        if (outDxmin != nullptr) {
+            *outDxmin = dxminVal;
+        }
+        NW_PROFILER_POP();
+        gpuPreprocessTimings_.minDistKernelSec = std::chrono::duration<double>(Clock::now() - tStage).count();
+
+        // ------------------------------------------------------------------
+        // Stage F: Optional Host Coordinate/Jacobian Download (only if needed)
+        // ------------------------------------------------------------------
+        if (downloadHostCoords && !mesh.hasHostMetrics()) {
+            tStage = Clock::now();
+            NW_PROFILER_PUSH("GPU::downloadHostCoords");
+            std::vector<double> cx(npts_), cy(npts_), cz(npts_), jac(npts_);
+            NW_GPU_CHECK(cudaMemcpyAsync(cx.data(), d_coordX, static_cast<size_t>(npts_) * sizeof(double), cudaMemcpyDeviceToHost, stream_));
+            NW_GPU_CHECK(cudaMemcpyAsync(cy.data(), d_coordY, static_cast<size_t>(npts_) * sizeof(double), cudaMemcpyDeviceToHost, stream_));
+            NW_GPU_CHECK(cudaMemcpyAsync(cz.data(), d_coordZ, static_cast<size_t>(npts_) * sizeof(double), cudaMemcpyDeviceToHost, stream_));
+            NW_GPU_CHECK(cudaMemcpyAsync(jac.data(), d_jac_, static_cast<size_t>(npts_) * sizeof(double), cudaMemcpyDeviceToHost, stream_));
+            NW_GPU_CHECK(cudaStreamSynchronize(stream_));
+            mesh.setHostCoordsAndJac(std::move(cx), std::move(cy), std::move(cz), std::move(jac));
+            NW_PROFILER_POP();
+            gpuPreprocessTimings_.hostCoordsDownloadSec = std::chrono::duration<double>(Clock::now() - tStage).count();
+        }
+
+        cudaFree(d_coordX); d_coordX = nullptr;
+        cudaFree(d_coordY); d_coordY = nullptr;
+        cudaFree(d_coordZ); d_coordZ = nullptr;
+        cudaFree(d_gll_z);  d_gll_z = nullptr;
+
+        // ------------------------------------------------------------------
+        // Allocate UPML Auxiliary State & LSRK45 Register Buffers
+        // Note: Surface scratch buffers (d_fEN_, d_fHN_, d_flux_) and UPML
+        // residual buffer (d_resPmlAux_) are eliminated because those
+        // intermediate quantities are kept in GPU registers by the fused
+        // multi-operation kernels.
+        // ------------------------------------------------------------------
+        if (maxPml_ > 0) {
+            NW_GPU_CHECK(cudaMalloc(&d_pmlAux_, 6 * static_cast<size_t>(nptsPml_) * sizeof(double)));
+            NW_GPU_CHECK(cudaMemsetAsync(d_pmlAux_, 0, 6 * static_cast<size_t>(nptsPml_) * sizeof(double), stream_));
+
+            NW_GPU_CHECK(cudaMalloc(&d_kPmlAux_, 6 * static_cast<size_t>(nptsPml_) * sizeof(double)));
+            NW_GPU_CHECK(cudaMemsetAsync(d_kPmlAux_, 0, 6 * static_cast<size_t>(nptsPml_) * sizeof(double), stream_));
         }
 
         NW_GPU_CHECK(cudaStreamSynchronize(stream_));
@@ -320,26 +438,30 @@ public:
     }
 
     /**
-     * @brief Advances the complete 3D Maxwell system by dt using 5-stage LSRK45.
+     * @brief Advances the complete 3D Maxwell system by dt using 5-stage LSRK45
+     *        with fused multi-operation GPU kernels.
      *
      * Semi-discrete Maxwell curl equations:
      *      dE/dt = +(1/eps) * curl(H) - (1/eps) * M^{-1} [ F^*_E ]
      *      dH/dt = -(1/mu)  * curl(E) - (1/mu)  * M^{-1} [ F^*_H ]
      *
-     * In each stage:
-     *   1) Non-blocking MPI_Irecv / MPI_Isend halo exchange for cut faces (overlapped with volume curl)
-     *   2) Volume curl evaluated directly in shared-memory on chip (+curl(H), -curl(E))
-     *   3) MPI_Waitall + unpack received ghost traces into d_state_
-     *   4) Interior fields restricted to element face quadrature nodes (fEN, fHN)
-     *   5) Numerical surface Riemann fluxes computed (Central vs Upwind + PEC/PMC/PML/Periodic)
-     *   6) Numerical surface fluxes lifted into volume residuals (atomic additions)
-     *   6b) If UPML active: evaluate ADE auxiliary equations (pml_step) for DN, BN, EN, HN
-     *   7) Scaled by exact diagonal inverse mass matrix: 1 / (J * w_i * w_j * w_k)
-     *   8) LSRK45 state & auxiliary vector update:
-     *          k = a_s * k + dt * rhs
-     *          state = state + b_s * k
+     * In each LSRK45 stage, 4 fused multi-operation GPU kernels are launched:
+     *   1) Fused 2-Operation Volume Curl (`gpu_volume_curl_kernel`):
+     *        - Operation 1: Volume Curl of H for Electric residual (+curl(H) -> res_E)
+     *        - Operation 2: Volume Curl of E for Magnetic residual (-curl(E) -> res_H)
+     *        (Overlapped with non-blocking MPI_Irecv / MPI_Isend halo exchange when active)
+     *   2) Fused 3-Operation Surface Flux Interface (`gpu_surface_flux_kernel`):
+     *        - Operation 1: Face Trace Restriction (gather interior E^-, H^- in registers)
+     *        - Operation 2: Upwind/Central Riemann Numerical Flux & Boundary Conditions (F^*_E, F^*_H)
+     *        - Operation 3: Surface Flux Lift / Scatter into Volume Residual (rhs += dA * F^*)
+     *   3) Fused 2-Operation UPML Step (`gpu_pml_step_kernel`, when maxPml_ > 0):
+     *        - Operation 1: UPML Auxiliary Differential Equation (ADE) Coupling (res_DN, res_BN, rhs_E, rhs_H)
+     *        - Operation 2: Auxiliary Inverse Mass Scaling & LSRK45 Stage Update for (DN, BN)
+     *   4) Fused 2-Operation Inverse Mass + LSRK45 Stage Update (`gpu_inv_mass_lsrk45_update_kernel`):
+     *        - Operation 1: Diagonal Inverse Mass Matrix Scaling (r_scaled = rhs / (J * w_ijk))
+     *        - Operation 2: LSRK45 Stage Update (k = a_s * k + dt * r_scaled, state = state + b_s * k)
      *
-     * Zero host-device transfers occur during this method.
+     * Zero host-device transfers and zero intermediate scratch buffers occur during this method.
      */
     void step(double dt, double time) {
         assert(bInitialized_);
@@ -405,31 +527,21 @@ public:
             }
 #endif
 
-            NW_PROFILER_PUSH("Launch_VolumeCurl");
+            NW_PROFILER_PUSH("Launch_VolumeCurl_Fused2Op");
             // ------------------------------------------------------------------
-            // Step 1: Volume curl of H for Electric field residual: +curl(H)
-            // Evaluates dE/dt = +(1/eps) * curl(H) in reference curvilinear coordinates
+            // Kernel 1 (Fused 2-Operation Volume Curl):
+            //   - Operation 1: Volume Curl of H for Electric residual (+curl(H) -> resEx..resEz)
+            //   - Operation 2: Volume Curl of E for Magnetic residual (-curl(E) -> resHx..resHz)
+            // Loads curvilinear metric factors (rx..tz, jac) once per stage.
             // ------------------------------------------------------------------
             nekwave::device::launch_volume_curl(
-                Hx, Hy, Hz, resEx, resEy, resEz,
+                Ex, Ey, Ez, Hx, Hy, Hz,
+                resEx, resEy, resEz, resHx, resHy, resHz,
                 d_D_, d_w3_, d_jac_,
                 d_rx_, d_sx_, d_tx_,
                 d_ry_, d_sy_, d_ty_,
                 d_rz_, d_sz_, d_tz_,
-                1.0, N_, nelt_, stream_
-            );
-
-            // ------------------------------------------------------------------
-            // Step 2: Volume curl of E for Magnetic field residual: -curl(E)
-            // Evaluates dH/dt = -(1/mu) * curl(E) with negative sign
-            // ------------------------------------------------------------------
-            nekwave::device::launch_volume_curl(
-                Ex, Ey, Ez, resHx, resHy, resHz,
-                d_D_, d_w3_, d_jac_,
-                d_rx_, d_sx_, d_tx_,
-                d_ry_, d_sy_, d_ty_,
-                d_rz_, d_sz_, d_tz_,
-                -1.0, N_, nelt_, stream_
+                N_, nelt_, stream_
             );
             NW_PROFILER_POP();
 
@@ -450,82 +562,48 @@ public:
             }
 #endif
 
-            NW_PROFILER_PUSH("Launch_SurfaceFluxes");
+            NW_PROFILER_PUSH("Launch_SurfaceFlux_Fused3Op");
             // ------------------------------------------------------------------
-            // Step 3: Restrict volume solution fields to face traces (fEN, fHN)
-            // Corresponds to cem_maxwell_restrict_to_face in NekCEM
+            // Kernel 2 (Fused 3-Operation Surface Interface Kernel):
+            //   - Operation 1: Face Trace Restriction (gather interior E^-, H^- in registers)
+            //   - Operation 2: Upwind/Central Riemann Numerical Flux & BCs (F^*_E, F^*_H in registers)
+            //   - Operation 3: Surface Flux Lift / Scatter into Volume Residual (rhs += dA * F^*)
             // ------------------------------------------------------------------
-            nekwave::device::launch_restrict_faces(
-                d_state_, d_fEN_, d_fHN_, d_volIdxMinus_,
-                totalFacePoints_, stateStride_, stream_
-            );
-
-            // ------------------------------------------------------------------
-            // Step 4: Compute numerical surface fluxes (Central or Upwind + PEC/PMC/PML/Periodic)
-            // Evaluates jumps [[E]] = E^+ - E^-, [[H]] = H^+ - H^-
-            // Upwind/Central numerical flux matching NekCEM lines 991-996:
-            //   F^*_H = -0.5 * (n x [[E]]) - 0.5 * C0 * (n x (n x [[H]]))
-            //   F^*_E = +0.5 * (n x [[H]]) - 0.5 * C0 * (n x (n x [[E]]))
-            // ------------------------------------------------------------------
-            nekwave::device::launch_compute_flux(
-                d_state_, d_fEN_, d_fHN_, d_volIdxPlus_, d_bcType_,
-                d_nx_, d_ny_, d_nz_, d_flux_, c0_, totalFacePoints_, stateStride_, stream_,
+            nekwave::device::launch_surface_flux(
+                d_state_, d_volIdxMinus_, d_volIdxPlus_, d_bcType_,
+                d_nx_, d_ny_, d_nz_, d_dA_, d_rhs_,
+                c0_, N_, totalFacePoints_, npts_, stateStride_, stream_,
                 d_fx_, d_fy_, d_fz_, incWave_, stageTime
-            );
-
-            // ------------------------------------------------------------------
-            // Step 5: Lift numerical surface fluxes into volume residuals
-            // Integrates surface term via face quadrature metric area dA:
-            //   res += dA * F^*
-            // Corresponds to cem_maxwell_add_flux_to_res in NekCEM
-            // ------------------------------------------------------------------
-            nekwave::device::launch_add_flux(
-                d_flux_, d_volIdxMinus_, d_dA_, d_rhs_,
-                totalFacePoints_, npts_, stream_
-            );
-
-            // ------------------------------------------------------------------
-            // Step 5b: Evaluate UPML Auxiliary Differential Equations (pml_step)
-            // Couples unscaled spatial residuals with auxiliary fields DN and BN
-            // Corresponds to pml_step in contrib/NekCEM/src/cem_maxwell_pml.F
-            // ------------------------------------------------------------------
-            if (maxPml_ > 0) {
-                nekwave::device::launch_pml_step(
-                    d_state_, d_rhs_, d_pmlAux_, d_resPmlAux_,
-                    d_pmlPtr_, d_pmlSigma_, d_jac_, d_w3_,
-                    maxPml_, nxyz_, npts_, stateStride_, stream_
-                );
-            }
-
-            // ------------------------------------------------------------------
-            // Step 6: Multiply residual by diagonal inverse mass matrix M^{-1}
-            // Exact diagonal mass matrix scaling (GLL quadrature mass lumping):
-            //   res_E /= (eps * J * w_i * w_j * w_k)
-            //   res_H /= (mu  * J * w_i * w_j * w_k)
-            // Corresponds to cem_maxwell_invqmass in NekCEM
-            // ------------------------------------------------------------------
-            nekwave::device::launch_inv_mass(
-                d_rhs_, d_jac_, d_w3_, nelt_, nxyz_, npts_, stream_
             );
             NW_PROFILER_POP();
 
-            NW_PROFILER_PUSH("Launch_UpdateLSRK45");
             // ------------------------------------------------------------------
-            // Step 7: Update LSRK45 state & auxiliary vector 'k'
-            // Carpenter & Kennedy (1994) low-storage state update:
-            //   k = a_s * k + dt * rhs
-            //   state = state + b_s * k
+            // Kernel 3 (Fused 2-Operation UPML Step):
+            //   - Operation 1: UPML Auxiliary Differential Equation (ADE) Coupling
+            //   - Operation 2: Auxiliary Inverse Mass Scaling & LSRK45 Stage Update for (DN, BN)
             // ------------------------------------------------------------------
-            nekwave::device::launch_lsrk45_update(
-                d_state_, d_k_, d_rhs_, rk4a_[stage], rk4b_[stage], dt, npts_, stateStride_, stream_
-            );
-
             if (maxPml_ > 0) {
-                nekwave::device::launch_lsrk45_update(
-                    d_pmlAux_, d_kPmlAux_, d_resPmlAux_,
-                    rk4a_[stage], rk4b_[stage], dt, nptsPml_, nptsPml_, stream_
+                NW_PROFILER_PUSH("Launch_PmlStep_Fused2Op");
+                nekwave::device::launch_pml_step(
+                    d_state_, d_rhs_, d_pmlAux_, d_kPmlAux_,
+                    d_pmlPtr_, d_pmlSigma_, d_jac_, d_w3_,
+                    rk4a_[stage], rk4b_[stage], dt,
+                    maxPml_, nxyz_, npts_, stateStride_, stream_
                 );
+                NW_PROFILER_POP();
             }
+
+            NW_PROFILER_PUSH("Launch_InvMass_LSRK45_Fused2Op");
+            // ------------------------------------------------------------------
+            // Kernel 4 (Fused 2-Operation Inverse Mass + LSRK45 Stage Update):
+            //   - Operation 1: Diagonal Inverse Mass Matrix Scaling (r_scaled = rhs / (J * w_ijk))
+            //   - Operation 2: LSRK45 Stage Update (k = a_s * k + dt * r_scaled, state += b_s * k)
+            // ------------------------------------------------------------------
+            nekwave::device::launch_inv_mass_lsrk45_update(
+                d_state_, d_k_, d_rhs_, d_jac_, d_w3_,
+                rk4a_[stage], rk4b_[stage], dt,
+                nelt_, nxyz_, npts_, stateStride_, stream_
+            );
             NW_PROFILER_POP();
 
             NW_PROFILER_POP(); // LSRK45_Stage
@@ -573,15 +651,10 @@ public:
         if (d_fy_) { cudaFree(d_fy_); d_fy_ = nullptr; }
         if (d_fz_) { cudaFree(d_fz_); d_fz_ = nullptr; }
 
-        cudaFree(d_fEN_); d_fEN_ = nullptr;
-        cudaFree(d_fHN_); d_fHN_ = nullptr;
-        cudaFree(d_flux_); d_flux_ = nullptr;
-
         if (d_pmlPtr_) { cudaFree(d_pmlPtr_); d_pmlPtr_ = nullptr; }
         if (d_pmlSigma_) { cudaFree(d_pmlSigma_); d_pmlSigma_ = nullptr; }
         if (d_pmlAux_) { cudaFree(d_pmlAux_); d_pmlAux_ = nullptr; }
         if (d_kPmlAux_) { cudaFree(d_kPmlAux_); d_kPmlAux_ = nullptr; }
-        if (d_resPmlAux_) { cudaFree(d_resPmlAux_); d_resPmlAux_ = nullptr; }
 
         if (d_sendVolIndices_) { cudaFree(d_sendVolIndices_); d_sendVolIndices_ = nullptr; }
         if (d_sendBufOffsets_) { cudaFree(d_sendBufOffsets_); d_sendBufOffsets_ = nullptr; }
@@ -619,10 +692,10 @@ public:
         stats.metricBuffersBytes = (static_cast<size_t>(N_ * N_) + static_cast<size_t>(nxyz_) + 10 * static_cast<size_t>(npts_)) * sizeof(double);
         stats.faceTopologyBytes = 3 * static_cast<size_t>(totalFacePoints_) * sizeof(int) +
                                   7 * static_cast<size_t>(totalFacePoints_) * sizeof(double);
-        stats.faceScratchBytes = 12 * static_cast<size_t>(totalFacePoints_) * sizeof(double);
+        stats.faceScratchBytes = 0;
         if (maxPml_ > 0) {
             stats.pmlBuffersBytes = static_cast<size_t>(maxPml_) * sizeof(int) +
-                                    (3 * static_cast<size_t>(npts_) + 18 * static_cast<size_t>(nptsPml_)) * sizeof(double);
+                                    (3 * static_cast<size_t>(npts_) + 12 * static_cast<size_t>(nptsPml_)) * sizeof(double);
         }
         if (numHaloPoints_ > 0) {
             stats.mpiHaloBuffersBytes = 4 * static_cast<size_t>(numHaloPoints_) * sizeof(int) +
@@ -677,9 +750,14 @@ public:
         return stats;
     }
 
+    GpuPreprocessTimings getGpuPreprocessTimings() const {
+        return gpuPreprocessTimings_;
+    }
+
 private:
     bool bInitialized_;
     cudaStream_t stream_;
+    GpuPreprocessTimings gpuPreprocessTimings_;
 
     int N_ = 0;
     int nelt_ = 0;
@@ -725,16 +803,11 @@ private:
     double* d_fy_ = nullptr;
     double* d_fz_ = nullptr;
 
-    double* d_fEN_ = nullptr;
-    double* d_fHN_ = nullptr;
-    double* d_flux_ = nullptr;
-
     // UPML device buffers (only allocated when maxPml_ > 0)
     int* d_pmlPtr_ = nullptr;
     double* d_pmlSigma_ = nullptr;
     double* d_pmlAux_ = nullptr;
     double* d_kPmlAux_ = nullptr;
-    double* d_resPmlAux_ = nullptr;
 
     // MPI Halo exchange device buffers
     int* d_sendVolIndices_ = nullptr;
@@ -755,6 +828,16 @@ DgSolver::~DgSolver() = default;
 
 bool DgSolver::initialize(const Mesh& mesh, double c0) {
     return impl_->initialize(mesh, c0);
+}
+
+bool DgSolver::preprocessAndInitialize(Mesh& mesh, double c0,
+                                       double* outDxmin,
+                                       bool downloadHostCoords) {
+    return impl_->preprocessAndInitialize(mesh, c0, outDxmin, downloadHostCoords);
+}
+
+DgSolver::GpuPreprocessTimings DgSolver::getGpuPreprocessTimings() const {
+    return impl_->getGpuPreprocessTimings();
 }
 
 void DgSolver::setIncidentWave(const IncidentPlaneWaveConfig& incWave) {
