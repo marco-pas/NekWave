@@ -1,5 +1,5 @@
 {
-  "_comment": "NekWave Example: 3D PEC Sphere Scattering (RCS) with UPML Absorbing Boundaries",
+  "_comment": "NekWave Example: 3D PEC Sphere Scattering (RCS) with UPML Absorbing Boundaries (HPC Profiling Case)",
 
   "mesh": {
     "type": "nekcem",
@@ -7,19 +7,19 @@
   },
 
   "numerics": {
-    "poly_order": 6,
+    "poly_order": 7,
     "cfl": "auto",
     "dt": "auto",
     "c0": 1.0,
     "scatteredFieldMode": true,
-    "pml_thickness": 3,
+    "pml_thickness": 9,
     "pml_order": 3.0,
     "pml_reflect_err": 1.0e-6
   },
 
   "time": {
-    "final_time": 0.1,
-    "max_steps": 500000
+    "final_time": 300000,
+    "max_steps": 50
   },
 
   "output": {
@@ -38,3 +38,4 @@
 
   "probes": []
 }
+

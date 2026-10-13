@@ -7,7 +7,7 @@
   },
 
   "numerics": {
-    "poly_order": 7,
+    "poly_order": 6,
     "cfl": "auto",
     "dt": "auto",
     "c0": 1.0,

@@ -55,6 +55,9 @@ build_nekwave_lumi.sh
 .vscode/
 
 # Meshes
-meshing/*rea
-meshing/*msh
-meshing/*re2
+*.rea
+*.msh
+*.re2
+
+# Profiling on LUMI
+tools/HPC_analysis

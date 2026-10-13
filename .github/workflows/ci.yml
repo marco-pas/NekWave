@@ -31,4 +31,3 @@ jobs:
         run: |
           if [ -f ./config.sh ]; then source ./config.sh; fi
           ctest --test-dir build --output-on-failure
-
