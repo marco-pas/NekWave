@@ -47,4 +47,23 @@ set_target_properties(convergence_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples/numerical_analysis/convergence_test"
 )
 
+# ------------------------------------------------------------------------------
+# Example 6: 3D PEC Sphere Scattering (RCS) with UPML Absorbing Boundaries
+# ------------------------------------------------------------------------------
+add_executable(sphereRCS sphereRCS/sphereRCS.cpp)
+target_link_libraries(sphereRCS PRIVATE nekwave_core)
+set_target_properties(sphereRCS PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples/sphereRCS"
+)
+
+# ------------------------------------------------------------------------------
+# Example 7: 3D PEC Sphere Scattering (RCS) for Profiling
+# ------------------------------------------------------------------------------
+add_executable(sphereRCS_profiling sphereRCS_profiling/sphereRCS.cpp)
+target_link_libraries(sphereRCS_profiling PRIVATE nekwave_core)
+set_target_properties(sphereRCS_profiling PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples/sphereRCS_profiling"
+    OUTPUT_NAME "sphereRCS"
+)
+
 

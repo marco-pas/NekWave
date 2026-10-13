@@ -10,6 +10,7 @@
 #include <vector>
 #include <string>
 #include <array>
+#include "boundary_conditions.hpp"
 
 // @@ FaceInfo struct to hold boundary and neighbor connectivity
 struct FaceInfo {
@@ -76,7 +77,8 @@ public:
                        double xmin = -1.0, double xmax = 1.0,
                        double ymin = -1.0, double ymax = 1.0,
                        double zmin = -1.0, double zmax = 1.0,
-                       bool periodicX = false, bool periodicY = false, bool periodicZ = false);
+                       bool periodicX = false, bool periodicY = false, bool periodicZ = false,
+                       const std::string& outerBc = "PEC");
 
     // @@ config an element with an affine bounding box transformation
     // Computes constant Jacobian J and metric factors J^{-T}
@@ -123,30 +125,20 @@ public:
     // @@ face connectivity and boundary condition records
     const std::vector<FaceInfo>& getFaces() const { return m_faces; }
 
-    // @@ precomputed face quadrature and connectivity data
-    // Face data list for interface flux evaluation
-    const std::vector<ElementFaceData>& getFaceData() const { return m_faceData; }
+    // @@ precomputed face quadrature and connectivity data (evaluated on GPU on demand)
+    const std::vector<ElementFaceData>& getFaceData() const;
 
     // @@ computing the volume index for a node (p, q) on a given element face
     // Maps face (p, q) collocation node to 3D volume node index
     int getFaceNodeVolIndex(int elemId, int faceId, int p, int q) const;
 
-    // @@ geometric metric factors (entries of J^{-T} or cofactor matrix)
-    const std::vector<double>& getRx() const { return m_rx; }
-    const std::vector<double>& getSx() const { return m_sx; }
-    const std::vector<double>& getTx() const { return m_tx; }
-    const std::vector<double>& getRy() const { return m_ry; }
-    const std::vector<double>& getSy() const { return m_sy; }
-    const std::vector<double>& getTy() const { return m_ty; }
-    const std::vector<double>& getRz() const { return m_rz; }
-    const std::vector<double>& getSz() const { return m_sz; }
-    const std::vector<double>& getTz() const { return m_tz; }
-    const std::vector<double>& getJac() const { return m_jac; }
+    // @@ Jacobian determinant at all collocation nodes (evaluated on GPU)
+    const std::vector<double>& getJac() const;
 
-    // @@ physical coordinates of all collocation nodes
-    const std::vector<double>& getCoordX() const { return m_coord_x; }
-    const std::vector<double>& getCoordY() const { return m_coord_y; }
-    const std::vector<double>& getCoordZ() const { return m_coord_z; }
+    // @@ physical coordinates of all collocation nodes (evaluated on GPU)
+    const std::vector<double>& getCoordX() const;
+    const std::vector<double>& getCoordY() const;
+    const std::vector<double>& getCoordZ() const;
 
     // @@ element corners in physical space
     const std::vector<std::array<std::array<double, 3>, 8>>& getElementCorners() const { return m_elementCorners; }
@@ -156,6 +148,32 @@ public:
     bool isPartitioned() const { return m_bIsPartitioned; }
     int getNumHaloPoints() const { return m_numHaloPoints; }
     const std::vector<MpiHaloExchangeInfo>& getMpiHalos() const { return m_mpiHalos; }
+    const std::vector<int>& getMpiCutGhostIndices() const { return m_mpiCutGhostIndices; }
+
+    // @@ UPML (Perfectly Matched Layer) configuration and precomputed data
+    void setPmlConfig(const PmlConfig& cfg) { m_pmlConfig = cfg; }
+    const PmlConfig& getPmlConfig() const { return m_pmlConfig; }
+    const PmlData& getPmlData() const { return m_pmlData; }
+    void setupPml();
+
+    // @@ Sub-phase timings recorded during mesh loading & topological setup
+    struct PreprocessSubTimings {
+        double fileReadAndConnectivitySec = 0.0;
+        double gllSetupSec = 0.0;
+        double pmlInitSec = 0.0;
+    };
+    const PreprocessSubTimings& getSubTimings() const { return m_subTimings; }
+
+    // @@ GPU-Native Preprocessing Support
+    bool hasHostMetrics() const { return !m_coord_x.empty() && !m_jac.empty(); }
+    bool hasHostFaceData() const { return !m_faceData.empty(); }
+    void getCornerBoundingBox(double& minX, double& maxX,
+                              double& minY, double& maxY,
+                              double& minZ, double& maxZ) const;
+    void setHostCoordsAndJac(std::vector<double>&& cx, std::vector<double>&& cy,
+                             std::vector<double>&& cz, std::vector<double>&& jac) const;
+    void setMinNodeDistance(double dxmin) const { m_cachedMinNodeDist = dxmin; }
+    size_t getAllocatedHostBytes() const;
 
 private:
     // @@ store polynomial degree parameters
@@ -175,22 +193,12 @@ private:
     // @@ store 3D element quadrature weights w3
     std::vector<double> m_w3;
 
-    // @@ store physical node coordinates
-    std::vector<double> m_coord_x;
-    std::vector<double> m_coord_y;
-    std::vector<double> m_coord_z;
-
-    // @@ store geometric metric factor arrays of length m_totalPoints
-    std::vector<double> m_rx;
-    std::vector<double> m_sx;
-    std::vector<double> m_tx;
-    std::vector<double> m_ry;
-    std::vector<double> m_sy;
-    std::vector<double> m_ty;
-    std::vector<double> m_rz;
-    std::vector<double> m_sz;
-    std::vector<double> m_tz;
-    std::vector<double> m_jac;
+    // @@ cached host physical node coordinates and Jacobian determinant (populated from GPU when needed)
+    mutable std::vector<double> m_coord_x;
+    mutable std::vector<double> m_coord_y;
+    mutable std::vector<double> m_coord_z;
+    mutable std::vector<double> m_jac;
+    mutable double m_cachedMinNodeDist = -1.0;
 
     // @@ store the 8 corner coordinates for each element
     std::vector<std::array<std::array<double, 3>, 8>> m_elementCorners;
@@ -198,23 +206,28 @@ private:
     // @@ store face connectivity and boundary conditions
     std::vector<FaceInfo> m_faces;
 
-    // @@ store the precomputed geometric and connectivity data for each face
-    std::vector<ElementFaceData> m_faceData;
+    // @@ cached host geometric and connectivity data for each face (populated from GPU when needed)
+    mutable std::vector<ElementFaceData> m_faceData;
 
     // @@ helper to setup 1D GLL points, weights, and derivative matrix D
     void setupGLL();
 
-    // @@ helper to recompute physical metrics from element corners
-    void computeMetricsFromCorners();
+    // @@ helper to invalidate cached host geometry arrays when topology changes
+    void invalidateGeometryCache();
 
-    // @@ helper to compute face normals, area metrics, and neighbor node matching
-    // NANSON RELATIONS & PIOLA: Precomputes n * dA = J * J^{-T} * n_ref * dA_ref and trace indices
-    void setupFaceData();
+    // @@ helper to run GPU preprocessing kernels to populate host caches on demand
+    void preprocessOnGpu(bool needCoordsAndJac, bool needFaceData) const;
 
     // @@ MPI domain decomposition state
     bool m_bIsPartitioned;
     int m_numHaloPoints;
     std::vector<MpiHaloExchangeInfo> m_mpiHalos;
+    std::vector<int> m_mpiCutGhostIndices;
+
+    // @@ UPML state
+    PmlConfig m_pmlConfig;
+    PmlData m_pmlData;
+    PreprocessSubTimings m_subTimings;
 };
 
 #endif // NW_SRC_MESH_HPP

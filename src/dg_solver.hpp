@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 #include <cstddef>
+#include "boundary_conditions.hpp"
 
 /**
  * @brief State vector type alias representing 6 electromagnetic field components:
@@ -58,6 +59,34 @@ public:
     bool initialize(const Mesh& mesh, double c0);
 
     /**
+     * @brief Performs GPU-native mesh preprocessing (volume GLL coordinates/metrics,
+     *        face normals/matching, UPML damping profiles, and CFL min node distance)
+     *        and initializes all GPU solver buffers without allocating or transferring
+     *        multi-GB expanded volume/face arrays on the host.
+     */
+    bool preprocessAndInitialize(Mesh& mesh, double c0,
+                                 double* outDxmin = nullptr,
+                                 bool downloadHostCoords = false);
+
+    struct GpuPreprocessTimings {
+        bool usedGpuPreprocess = false;
+        double topoUploadSec = 0.0;
+        double volumeMetricsKernelSec = 0.0;
+        double faceSetupKernelSec = 0.0;
+        double pmlSigmaKernelSec = 0.0;
+        double minDistKernelSec = 0.0;
+        double hostCoordsDownloadSec = 0.0;
+        size_t h2dTopologyBytes = 0;
+    };
+
+    GpuPreprocessTimings getGpuPreprocessTimings() const;
+
+    /**
+     * @brief Configures the analytical incident plane wave for Scattered-Field PEC boundary excitation.
+     */
+    void setIncidentWave(const IncidentPlaneWaveConfig& incWave);
+
+    /**
      * @brief Copies initial condition state vector from host RAM to GPU VRAM.
      *
      * @param hostState Pointer to contiguous host state buffer [Ex, Ey, Ez, Hx, Hy, Hz].
@@ -95,6 +124,40 @@ public:
      * @brief Releases all allocated GPU device buffers and streams.
      */
     void finalize();
+
+    /**
+     * @brief Device memory footprint and hardware telemetry for HPC profiling and Roofline analysis.
+     */
+    struct MemoryAndHardwareStats {
+        std::string deviceName = "Unknown GPU";
+        std::string archName = "";
+        int computeUnits = 0;
+        int clockRateKHz = 0;
+        int memoryClockRateKHz = 0;
+        int memoryBusWidthBits = 0;
+        size_t totalGlobalMemBytes = 0;
+        size_t sharedMemPerBlockBytes = 0;
+
+        size_t stateBuffersBytes = 0;        // d_state_, d_k_, d_rhs_
+        size_t metricBuffersBytes = 0;       // d_D_, d_w3_, d_jac_, d_rx_..d_tz_
+        size_t faceTopologyBytes = 0;        // d_volIdxMinus_, d_volIdxPlus_, d_bcType_, d_nx_..d_fz_
+        size_t faceScratchBytes = 0;         // d_fEN_, d_fHN_, d_flux_
+        size_t pmlBuffersBytes = 0;          // d_pmlPtr_, d_pmlSigma_, d_pmlAux_, d_kPmlAux_, d_resPmlAux_
+        size_t mpiHaloBuffersBytes = 0;      // d_sendVolIndices_..d_mpiRecvBuf_
+        size_t totalNekWaveVramBytes = 0;    // Exact sum of NekWave device allocations
+        size_t driverUsedVramBytes = 0;      // Reported by hipMemGetInfo / cudaMemGetInfo
+        size_t driverFreeVramBytes = 0;
+
+        int orderN = 0;
+        int numElements = 0;
+        int npts = 0;
+        int totalFacePoints = 0;
+        int maxPmlElements = 0;
+        int nptsPml = 0;
+        int numHaloPoints = 0;
+    };
+
+    MemoryAndHardwareStats getMemoryAndHardwareStats() const;
 
 private:
     class Impl;

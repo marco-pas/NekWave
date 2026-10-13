@@ -1,5 +1,7 @@
 # NekWave
 
+[![NekWave GPU CI](https://github.com/marco-pas/NekWave/actions/workflows/ci.yml/badge.svg)](https://github.com/marco-pas/NekWave/actions/workflows/ci.yml)
+
 NekWave is a high-fidelity time-domain Maxwell equation solver designed for direct numerical simulations on modern accelerated high-performance computing architectures.
 
 The solver employs the discontinuous Galerkin spectral element method (DG-SEM) with tensor-product Gauss-Lobatto-Legendre (GLL) quadratures and high-order sum factorization to achieve spectral spatial accuracy alongside explicit low-storage Runge-Kutta time integration.

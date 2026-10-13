@@ -5,6 +5,7 @@
 #include "dg_solver.hpp"
 #include "config.hpp"
 #include "probe.hpp"
+#include "rcs.hpp"
 
 #include <memory>
 #include <string>
@@ -74,6 +75,13 @@ public:
     const SaveOptions& saveOptions() const { return saveOptions_; }
     SaveOptions& saveOptions() { return saveOptions_; }
 
+    // Near-to-Far-Field (NTFF) / Radar Cross Section (RCS) monitor configuration
+    void setRcsConfig(const RcsConfig& cfg) { rcsMonitor_.setConfig(cfg); }
+    const RcsConfig& rcsConfig() const { return rcsMonitor_.config(); }
+    RcsConfig& rcsConfig() { return rcsMonitor_.config(); }
+    const RcsMonitor& rcsMonitor() const { return rcsMonitor_; }
+    RcsMonitor& rcsMonitor() { return rcsMonitor_; }
+
     // 3-Phase Simulation Lifecycle
     void preprocess();
     void preprocess(const Config& cfg);
@@ -88,6 +96,7 @@ public:
     double getMaxE() const;
     double getMaxH() const;
     void saveFields(const std::string& filename, double time) const;
+    void reconstructTotalField(double time, StateVector& outTotalState) const;
 
     // Component accessors
     const Mesh& mesh() const { return *mesh_; }
@@ -110,7 +119,8 @@ public:
     double finalTime() const { return config_.finalTime; }
     int outputFreq() const { return config_.outputFreq; }
     int saveFreq() const { return config_.saveFreq; }
-    bool exportContinuousVtk() const { return config_.exportContinuousVtk; }
+    bool exportContinuous() const { return config_.exportContinuous; }
+    bool exportContinuousVtk() const { return config_.exportContinuous; }
 
     /**
      * @brief Computes exact DG spectral spatial derivatives (divergence and curl) on GLL nodes.
@@ -131,6 +141,7 @@ private:
     std::unique_ptr<DgSolver> dgSolver_;
     std::unique_ptr<Hdf5Writer> hdf5Writer_;
     ProbeManager probes_;
+    RcsMonitor rcsMonitor_;
     StateVector state_;
 
     double dt_;
@@ -149,7 +160,34 @@ private:
     bool bIsPreprocessed_;
     bool bIsSimulated_;
     bool bIsPostprocessed_;
+    bool bSolverInitializedInPreprocess_ = false;
+    bool hasNonZeroInitialCondition_ = false;
     SaveOptions saveOptions_;
+
+    struct PhaseTimings {
+        bool usedGpuPreprocess = false;
+        double preprocessSec = 0.0;
+        double loadMeshSec = 0.0;
+        double meshParseAndTopoSec = 0.0;
+        double gpuTopoUploadSec = 0.0;
+        double volumeMetricsSec = 0.0;
+        double faceSetupSec = 0.0;
+        double pmlSetupSec = 0.0;
+        double gpuPmlSigmaSec = 0.0;
+        double cflAndDtSec = 0.0;
+        double initFieldsAndProbesSec = 0.0;
+        double initSolverSec = 0.0;
+        double solverStepSec = 0.0;
+        double downloadStateSec = 0.0;
+        double probesAndRcsSec = 0.0;
+        double hdf5IoSec = 0.0;
+        double diagnosticsSec = 0.0;
+        double postprocessSec = 0.0;
+        double simulateTotalSec = 0.0;
+        size_t h2dTopologyBytes = 0;
+    } timings_;
+
+    DgSolver::MemoryAndHardwareStats lastMemHwStats_{};
 };
 
 #endif // NW_SRC_CASE_HPP

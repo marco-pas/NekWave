@@ -82,9 +82,14 @@ if(ENABLE_HIP)
     if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.21")
         enable_language(HIP)
         add_library(nekwave_device STATIC
-            src/device/dg_kernels.cu
+            src/device/dg_sim_kernels.cu
+            src/device/dg_preproc_kernels.cu
         )
-        set_source_files_properties(src/device/dg_kernels.cu PROPERTIES LANGUAGE HIP)
+        set_source_files_properties(
+            src/device/dg_sim_kernels.cu
+            src/device/dg_preproc_kernels.cu
+            PROPERTIES LANGUAGE HIP
+        )
         target_include_directories(nekwave_device PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
             $<BUILD_INTERFACE:${DEVICE_INCLUDE_DIRS}>
@@ -97,7 +102,8 @@ if(ENABLE_HIP)
         endif()
     else()
         add_library(nekwave_device STATIC
-            src/device/dg_kernels.cu
+            src/device/dg_sim_kernels.cu
+            src/device/dg_preproc_kernels.cu
         )
         set_target_properties(nekwave_device PROPERTIES
             LINKER_LANGUAGE CXX
@@ -108,6 +114,16 @@ if(ENABLE_HIP)
             $<BUILD_INTERFACE:${DEVICE_INCLUDE_DIRS}>
         )
         target_compile_definitions(nekwave_device PUBLIC USE_HIP=1 NEKWAVE_ENABLE_HIP=1)
+    endif()
+
+    find_library(ROCTX_LIB
+        NAMES roctx64
+        PATHS "${ROCM_PATH}/lib" /opt/rocm/lib
+    )
+    if(ROCTX_LIB)
+        message(STATUS "[NekWave] Found ROCm ROCTX trace library: ${ROCTX_LIB}")
+        target_compile_definitions(nekwave_device PUBLIC NEKWAVE_HAVE_ROCTX=1)
+        target_link_libraries(nekwave_device PUBLIC "${ROCTX_LIB}")
     endif()
 
     set(CUDA_INCLUDE_DIR "")
@@ -143,7 +159,8 @@ else()
     set(CUDA_INCLUDE_DIR "${CUDA_TOOLKIT_ROOT}/include")
 
     add_library(nekwave_device STATIC
-        src/device/dg_kernels.cu
+        src/device/dg_sim_kernels.cu
+        src/device/dg_preproc_kernels.cu
     )
     target_include_directories(nekwave_device PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
@@ -244,7 +261,14 @@ if(HDF5_FOUND AND NOT NEKWAVE_HDF5_LIBS)
     endif()
     if(HDF5_C_LIB)
         set(NEKWAVE_HDF5_LIBS "${HDF5_C_LIB}")
-        message(STATUS "[NekWave] Explicitly linked HDF5 library: ${HDF5_C_LIB}")
+        if(NOT HDF5_INCLUDE_DIRS)
+            get_filename_component(_hdf5_lib_dir "${HDF5_C_LIB}" DIRECTORY)
+            get_filename_component(_hdf5_prefix "${_hdf5_lib_dir}" DIRECTORY)
+            if(EXISTS "${_hdf5_prefix}/include/hdf5.h")
+                set(HDF5_INCLUDE_DIRS "${_hdf5_prefix}/include")
+            endif()
+        endif()
+        message(STATUS "[NekWave] Explicitly linked HDF5 library: ${HDF5_C_LIB} (include: ${HDF5_INCLUDE_DIRS})")
     endif()
 endif()
 
@@ -254,6 +278,12 @@ if(NEKWAVE_HDF5_LIBS)
             get_filename_component(_lib_dir "${_lib}" DIRECTORY)
             set(CMAKE_BUILD_RPATH "${CMAKE_BUILD_RPATH};${_lib_dir}")
             set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${_lib_dir}")
+            if(NOT HDF5_INCLUDE_DIRS OR NOT EXISTS "${HDF5_INCLUDE_DIRS}/hdf5.h")
+                get_filename_component(_hdf5_prefix "${_lib_dir}" DIRECTORY)
+                if(EXISTS "${_hdf5_prefix}/include/hdf5.h")
+                    set(HDF5_INCLUDE_DIRS "${_hdf5_prefix}/include")
+                endif()
+            endif()
         endif()
     endforeach()
 endif()
@@ -263,9 +293,11 @@ endif()
 # ------------------------------------------------------------------------------
 set(NEKWAVE_CORE_SRCS
     src/comm.cpp
+    src/boundary_conditions.cpp
     src/mesh.cpp
     src/dg_solver.cpp
     src/probe.cpp
+    src/rcs.cpp
     src/case.cpp
     src/hdf5_writer.cpp
 )
@@ -295,7 +327,7 @@ if(HDF5_FOUND)
 endif()
 
 if(MPI_FOUND AND ENABLE_MPI)
-    target_include_directories(nekwave_core PUBLIC ${MPI_CXX_INCLUDE_PATH})
+    target_include_directories(nekwave_core PUBLIC ${MPI_CXX_INCLUDE_PATH} ${MPI_CXX_COMPILER_INCLUDE_DIRS})
     target_compile_definitions(nekwave_core PUBLIC NEKWAVE_ENABLE_MPI=1)
     target_link_libraries(nekwave_core PUBLIC ${NEKWAVE_MPI_LIBS})
     get_filename_component(MPI_LIB_DIR "${MPI_CXX_LIBRARIES}" DIRECTORY)

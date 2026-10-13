@@ -49,6 +49,15 @@ __pycache__/
 .venv
 *.slurm
 env_lumi.sh
+build_nekwave_lumi.sh
 *.err
 *.out
 .vscode/
+
+# Meshes
+*.rea
+*.msh
+*.re2
+
+# Profiling on LUMI
+tools/HPC_analysis

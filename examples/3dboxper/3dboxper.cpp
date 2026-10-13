@@ -47,8 +47,8 @@ int main(int argc, char* argv[]) {
     saveOptions.saveCurlH = false;
     saveOptions.saveDivE = true;
     saveOptions.saveDivH = true;
-    saveOptions.saveMagnitudeE = true;
-    saveOptions.saveMagnitudeH = true;
+    saveOptions.saveMagnitudeE = false;
+    saveOptions.saveMagnitudeH = false;
     saveOptions.saveMagnitudeCurlE = false;
     saveOptions.saveMagnitudeCurlH = false;
     saveOptions.saveEnergyDensity = true;

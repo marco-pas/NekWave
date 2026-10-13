@@ -7,7 +7,7 @@
   },
 
   "numerics": {
-    "order": 7,
+    "poly_order": 7,
     "cfl": "auto",
     "dt": "auto",
     "c0": 0.0
@@ -24,6 +24,9 @@
     "output_dir": "output_3dboxper",
     "export_fields": true,
     "export_format": "hdf5",
-    "export_continuous_vtk": true
+    "export_continuous": true,
+    "export_precision": "float32",
+    "hdf5_compression": 2,
+    "hdf5_shuffle": true
   }
 }

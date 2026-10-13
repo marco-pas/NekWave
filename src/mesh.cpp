@@ -4,15 +4,17 @@
 // this is also where the operator gets built as these olny depend on the mesh topology
 
 #include "mesh.hpp"
-#ifndef USE_HIP
-#include <nvtx3/nvToolsExt.h>
-#endif
+#include "device/gpu_runtime.hpp"
+#include "device/dg_preproc_kernels.hpp"
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <sstream>
 #include <iostream>
 #include <algorithm>
 #include <map>
+#include <unordered_map>
+#include <cstdint>
 #include <tuple>
 
 // @@ Helper to evaluate the Legendre polynomial of degree n at x
@@ -57,11 +59,24 @@ void Mesh::setN(int N) {
     m_N = N;
     m_numPointsPerElement = m_N * m_N * m_N;
     m_totalPoints = m_numElements * m_numPointsPerElement;
+    invalidateGeometryCache();
     setupGLL();
+}
+
+void Mesh::invalidateGeometryCache() {
+    m_coord_x.clear();
+    m_coord_y.clear();
+    m_coord_z.clear();
+    m_jac.clear();
+    m_faceData.clear();
+    m_cachedMinNodeDist = -1.0;
 }
 
 // @@ GLL collocation points, weights, and derivative matrix setup
 void Mesh::setupGLL() {
+    using Clock = std::chrono::high_resolution_clock;
+    auto tStart = Clock::now();
+    NW_PROFILER_PUSH("Mesh::setupGLL");
     int N = m_N;
     int p = N - 1; // polynomial degree
 
@@ -142,11 +157,11 @@ void Mesh::setupGLL() {
             }
         }
     }
+    NW_PROFILER_POP();
+    m_subTimings.gllSetupSec += std::chrono::duration<double>(Clock::now() - tStart).count();
 }
 
 // @@ configuring an element with an affine bounding box transformation
-// AFFINE transformation here (!)
-// J_aff = diag(dx/2, dy/2, dz/2), det(J_aff) = (dx * dy * dz) / 8, rx = 2/dx, sy = 2/dy, tz = 2/dz
 void Mesh::setAffineBox(int elementIdx, double xmin, double xmax,
                         double ymin, double ymax, double zmin, double zmax) {
     if (elementIdx < 0 || elementIdx >= m_numElements) return;
@@ -164,8 +179,6 @@ void Mesh::setAffineBox(int elementIdx, double xmin, double xmax,
     m_elementCorners[elementIdx][6] = {{xmax, ymax, zmax}};
     m_elementCorners[elementIdx][7] = {{xmin, ymax, zmax}};
 
-    computeMetricsFromCorners();
-
     if (m_faces.empty()) {
         for (int e = 0; e < m_numElements; ++e) {
             for (int f = 0; f < 6; ++f) {
@@ -179,151 +192,47 @@ void Mesh::setAffineBox(int elementIdx, double xmin, double xmax,
             }
         }
     }
-    setupFaceData();
+    invalidateGeometryCache();
 }
 
-// @@ computing general trilinear hex metrics and physical coordinates from element corners
-// General Trilinear Coordinate Transformation
-// x(r,s,t) = sum_{a=0}^7 N_a(r,s,t) * v_a
-void Mesh::computeMetricsFromCorners() {
-    m_coord_x.assign(m_totalPoints, 0.0);
-    m_coord_y.assign(m_totalPoints, 0.0);
-    m_coord_z.assign(m_totalPoints, 0.0);
-
-    m_rx.assign(m_totalPoints, 0.0);
-    m_sx.assign(m_totalPoints, 0.0);
-    m_tx.assign(m_totalPoints, 0.0);
-    m_ry.assign(m_totalPoints, 0.0);
-    m_sy.assign(m_totalPoints, 0.0);
-    m_ty.assign(m_totalPoints, 0.0);
-    m_rz.assign(m_totalPoints, 0.0);
-    m_sz.assign(m_totalPoints, 0.0);
-    m_tz.assign(m_totalPoints, 0.0);
-    m_jac.assign(m_totalPoints, 1.0);
-
-    int N = m_N;
-
-    for (int e = 0; e < m_numElements; ++e) {
-        const auto& corners = m_elementCorners[e];
-        int elemOffset = e * m_numPointsPerElement;
-
-        for (int k = 0; k < N; ++k) {
-            double t = m_gll_z[k];
-            for (int j = 0; j < N; ++j) {
-                double s = m_gll_z[j];
-                for (int i = 0; i < N; ++i) {
-                    double r = m_gll_z[i];
-                    int ptIdx = elemOffset + i + N * (j + N * k);
-
-                    // Trilinear shape functions N_a(r, s, t)
-                    double N_fn[8];
-                    N_fn[0] = 0.125 * (1.0 - r) * (1.0 - s) * (1.0 - t);
-                    N_fn[1] = 0.125 * (1.0 + r) * (1.0 - s) * (1.0 - t);
-                    N_fn[2] = 0.125 * (1.0 + r) * (1.0 + s) * (1.0 - t);
-                    N_fn[3] = 0.125 * (1.0 - r) * (1.0 + s) * (1.0 - t);
-                    N_fn[4] = 0.125 * (1.0 - r) * (1.0 - s) * (1.0 + t);
-                    N_fn[5] = 0.125 * (1.0 + r) * (1.0 - s) * (1.0 + t);
-                    N_fn[6] = 0.125 * (1.0 + r) * (1.0 + s) * (1.0 + t);
-                    N_fn[7] = 0.125 * (1.0 - r) * (1.0 + s) * (1.0 + t);
-
-                    // Derivatives of shape functions w.r.t r, s, t
-                    double dN_dr[8], dN_ds[8], dN_dt[8];
-                    dN_dr[0] = -0.125 * (1.0 - s) * (1.0 - t);
-                    dN_dr[1] =  0.125 * (1.0 - s) * (1.0 - t);
-                    dN_dr[2] =  0.125 * (1.0 + s) * (1.0 - t);
-                    dN_dr[3] = -0.125 * (1.0 + s) * (1.0 - t);
-                    dN_dr[4] = -0.125 * (1.0 - s) * (1.0 + t);
-                    dN_dr[5] =  0.125 * (1.0 - s) * (1.0 + t);
-                    dN_dr[6] =  0.125 * (1.0 + s) * (1.0 + t);
-                    dN_dr[7] = -0.125 * (1.0 + s) * (1.0 + t);
-
-                    dN_ds[0] = -0.125 * (1.0 - r) * (1.0 - t);
-                    dN_ds[1] = -0.125 * (1.0 + r) * (1.0 - t);
-                    dN_ds[2] =  0.125 * (1.0 + r) * (1.0 - t);
-                    dN_ds[3] =  0.125 * (1.0 - r) * (1.0 - t);
-                    dN_ds[4] = -0.125 * (1.0 - r) * (1.0 + t);
-                    dN_ds[5] = -0.125 * (1.0 + r) * (1.0 + t);
-                    dN_ds[6] =  0.125 * (1.0 + r) * (1.0 + t);
-                    dN_ds[7] =  0.125 * (1.0 - r) * (1.0 + t);
-
-                    dN_dt[0] = -0.125 * (1.0 - r) * (1.0 - s);
-                    dN_dt[1] = -0.125 * (1.0 + r) * (1.0 - s);
-                    dN_dt[2] = -0.125 * (1.0 + r) * (1.0 + s);
-                    dN_dt[3] = -0.125 * (1.0 - r) * (1.0 + s);
-                    dN_dt[4] =  0.125 * (1.0 - r) * (1.0 - s);
-                    dN_dt[5] =  0.125 * (1.0 + r) * (1.0 - s);
-                    dN_dt[6] =  0.125 * (1.0 + r) * (1.0 + s);
-                    dN_dt[7] =  0.125 * (1.0 - r) * (1.0 + s);
-
-                    // Compute physical position and Jacobian entries
-                    double x = 0.0, y = 0.0, z = 0.0;
-                    double xr = 0.0, yr = 0.0, zr = 0.0;
-                    double xs = 0.0, ys = 0.0, zs = 0.0;
-                    double xt = 0.0, yt = 0.0, zt = 0.0;
-
-                    for (int a = 0; a < 8; ++a) {
-                        double vx = corners[a][0];
-                        double vy = corners[a][1];
-                        double vz = corners[a][2];
-
-                        x += N_fn[a] * vx;
-                        y += N_fn[a] * vy;
-                        z += N_fn[a] * vz;
-
-                        xr += dN_dr[a] * vx;
-                        yr += dN_dr[a] * vy;
-                        zr += dN_dr[a] * vz;
-
-                        xs += dN_ds[a] * vx;
-                        ys += dN_ds[a] * vy;
-                        zs += dN_ds[a] * vz;
-
-                        xt += dN_dt[a] * vx;
-                        yt += dN_dt[a] * vy;
-                        zt += dN_dt[a] * vz;
-                    }
-
-                    m_coord_x[ptIdx] = x;
-                    m_coord_y[ptIdx] = y;
-                    m_coord_z[ptIdx] = z;
-
-                    // Jacobian determinant J = det(J_aff)
-                    double detJ = xr * (ys * zt - yt * zs)
-                                - xs * (yr * zt - yt * zr)
-                                + xt * (yr * zs - ys * zr);
-
-                    m_jac[ptIdx] = detJ;
-
-                    // Inverse transpose metric tensor J^{-T}
-                    double invJ = 1.0 / detJ;
-                    m_rx[ptIdx] = invJ * (ys * zt - yt * zs);
-                    m_sx[ptIdx] = invJ * (yt * zr - yr * zt);
-                    m_tx[ptIdx] = invJ * (yr * zs - ys * zr);
-
-                    m_ry[ptIdx] = invJ * (xt * zs - xs * zt);
-                    m_sy[ptIdx] = invJ * (xr * zt - xt * zr);
-                    m_ty[ptIdx] = invJ * (xs * zr - xr * zs);
-
-                    m_rz[ptIdx] = invJ * (xs * yt - xt * ys);
-                    m_sz[ptIdx] = invJ * (xt * yr - xr * yt);
-                    m_tz[ptIdx] = invJ * (xr * ys - xs * yr);
-                }
-            }
+// @@ Helper to resolve relative mesh file paths across working directories and NEKWAVE_SOURCE_DIR
+static std::string resolveMeshFilePath(const std::string& filename, std::ios_base::openmode mode = std::ios_base::in) {
+    if (filename.empty()) return "";
+    std::vector<std::string> candidates = {
+        filename,
+        "../" + filename,
+        "../../" + filename,
+        "../../../" + filename
+#ifdef NEKWAVE_SOURCE_DIR
+        , std::string(NEKWAVE_SOURCE_DIR) + "/" + filename
+#endif
+    };
+    for (const auto& cand : candidates) {
+        std::ifstream testFile(cand, mode);
+        if (testFile.is_open()) {
+            testFile.close();
+            return cand;
         }
     }
+    return "";
 }
 
 // @@ .rea file parser taken 1-to-1 from NekCEM / Nek5000
 bool Mesh::loadFromRea(const std::string& filename) {
-    std::ifstream file(filename);
+    using Clock = std::chrono::high_resolution_clock;
+    m_subTimings = PreprocessSubTimings{};
+    auto tParseStart = Clock::now();
+    NW_PROFILER_PUSH("Mesh::parseReaFile");
+    std::string resolvedPath = resolveMeshFilePath(filename, std::ios_base::in);
+    if (resolvedPath.empty()) {
+        std::cerr << "[ERROR] Could not open .rea mesh file: '" << filename << "'" << std::endl;
+        NW_PROFILER_POP();
+        return false;
+    }
+    std::ifstream file(resolvedPath);
     if (!file.is_open()) {
-        // Fallback: check ../<filename> if executed from build/ subdirectory
-        std::ifstream fileFallback("../" + filename);
-        if (fileFallback.is_open()) {
-            fileFallback.close();
-            return loadFromRea("../" + filename);
-        }
-        std::cerr << "Error: Could not open .rea file: " << filename << std::endl;
+        std::cerr << "[ERROR] Could not open .rea mesh file: '" << resolvedPath << "'" << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -331,8 +240,15 @@ bool Mesh::loadFromRea(const std::string& filename) {
     bool foundMesh = false;
     int nel = 0, ndim = 3;
 
-    // @@ scanning the file for the **MESH DATA** section
+    // @@ scanning the file for the **MESH DATA** section (and optional PMLTHICK param 77)
     while (std::getline(file, line)) {
+        if (line.find("PMLTHICK") != std::string::npos) {
+            std::stringstream pss(line);
+            double pmlThickVal = 0.0;
+            if (pss >> pmlThickVal && pmlThickVal >= 1.0) {
+                m_pmlConfig.thickness = static_cast<int>(std::round(pmlThickVal));
+            }
+        }
         if (line.find("**MESH DATA**") != std::string::npos) {
             foundMesh = true;
             break;
@@ -340,7 +256,8 @@ bool Mesh::loadFromRea(const std::string& filename) {
     }
 
     if (!foundMesh) {
-        std::cerr << "Error: Could not find **MESH DATA** section in " << filename << std::endl;
+        std::cerr << "Error: Could not find **MESH DATA** section in " << resolvedPath << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -351,8 +268,9 @@ bool Mesh::loadFromRea(const std::string& filename) {
     }
 
     if (nel < 0) {
+        NW_PROFILER_POP();
         std::cout << "[MESH] Negative NEL = " << nel << " indicates binary .re2 mesh. Redirecting to loadFromRe2..." << std::endl;
-        std::string re2name = filename;
+        std::string re2name = resolvedPath;
         size_t dotPos = re2name.rfind('.');
         if (dotPos != std::string::npos) {
             re2name = re2name.substr(0, dotPos) + ".re2";
@@ -363,7 +281,8 @@ bool Mesh::loadFromRea(const std::string& filename) {
     }
 
     if (nel == 0) {
-        std::cerr << "Error: Invalid number of elements (NEL = " << nel << ") in " << filename << std::endl;
+        std::cerr << "Error: Invalid number of elements (NEL = " << nel << ") in " << resolvedPath << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -428,32 +347,41 @@ bool Mesh::loadFromRea(const std::string& filename) {
             FaceInfo info;
             info.elementId = elemId - 1; // Convert 1-based to 0-based
             info.faceId = faceId - 1;    // Convert 1-based to 0-based
-            info.bcType = bcType;
             info.neighborElementId = (nbrElem > 0.0) ? static_cast<int>(nbrElem) - 1 : -1;
             info.neighborFaceId = (nbrFace > 0.0) ? static_cast<int>(nbrFace) - 1 : -1;
+            info.bcType = BoundaryConditions::toString(
+                BoundaryConditions::parseBcTag(bcType, info.neighborElementId)
+            );
 
             m_faces.push_back(info);
         }
     }
+    NW_PROFILER_POP();
+    m_subTimings.fileReadAndConnectivitySec += std::chrono::duration<double>(Clock::now() - tParseStart).count();
 
-    // @@ setting up GLL basis and evaluating metrics
     setupGLL();
-    computeMetricsFromCorners();
-    setupFaceData();
+    invalidateGeometryCache();
+    setupPml();
 
     return true;
 }
 
 // @@ load mesh directly from a NekCEM binary .re2 file
 bool Mesh::loadFromRe2(const std::string& filename, int nel) {
-    std::ifstream file(filename, std::ios::binary);
+    using Clock = std::chrono::high_resolution_clock;
+    m_subTimings = PreprocessSubTimings{};
+    auto tParseStart = Clock::now();
+    NW_PROFILER_PUSH("Mesh::parseRe2AndPairFaces");
+    std::string resolvedPath = resolveMeshFilePath(filename, std::ios::binary);
+    if (resolvedPath.empty()) {
+        std::cerr << "[ERROR] Could not open .re2 mesh file: '" << filename << "'" << std::endl;
+        NW_PROFILER_POP();
+        return false;
+    }
+    std::ifstream file(resolvedPath, std::ios::binary);
     if (!file.is_open()) {
-        std::ifstream fileFallback("../" + filename, std::ios::binary);
-        if (fileFallback.is_open()) {
-            fileFallback.close();
-            return loadFromRe2("../" + filename, nel);
-        }
-        std::cerr << "Error: Could not open .re2 file: " << filename << std::endl;
+        std::cerr << "[ERROR] Could not open .re2 mesh file: '" << resolvedPath << "'" << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -462,6 +390,7 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
     file.read(header, 80);
     if (!file) {
         std::cerr << "Error: Failed to read header from " << filename << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -470,6 +399,7 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
     file.read(reinterpret_cast<char*>(&tag), sizeof(float));
     if (!file) {
         std::cerr << "Error: Failed to read tag from " << filename << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -485,6 +415,7 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
 
     if (nel <= 0) {
         std::cerr << "Error: Invalid number of elements (NEL = " << nel << ") in " << filename << std::endl;
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -492,19 +423,26 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
     m_totalPoints = m_numElements * m_numPointsPerElement;
     m_elementCorners.resize(m_numElements);
 
-    // Read elements: group (double) + 8 x (double) + 8 y (double) + 8 z (double)
-    for (int e = 0; e < nel; ++e) {
-        double group = 0.0;
-        double x[8], y[8], z[8];
-        file.read(reinterpret_cast<char*>(&group), sizeof(double));
-        file.read(reinterpret_cast<char*>(x), 8 * sizeof(double));
-        file.read(reinterpret_cast<char*>(y), 8 * sizeof(double));
-        file.read(reinterpret_cast<char*>(z), 8 * sizeof(double));
+    // Bulk-read all elements: each element is 25 doubles (group + 8 x + 8 y + 8 z)
+    std::vector<double> elemBuf(static_cast<size_t>(nel) * 25);
+    file.read(reinterpret_cast<char*>(elemBuf.data()), static_cast<std::streamsize>(elemBuf.size() * sizeof(double)));
+    if (!file) {
+        std::cerr << "[ERROR] Failed to read element coordinate block from " << resolvedPath << std::endl;
+        NW_PROFILER_POP();
+        return false;
+    }
 
+    for (int e = 0; e < nel; ++e) {
+        const double* rec = &elemBuf[static_cast<size_t>(e) * 25];
+        const double* x = rec + 1;
+        const double* y = rec + 9;
+        const double* z = rec + 17;
         for (int a = 0; a < 8; ++a) {
             m_elementCorners[e][a] = {x[a], y[a], z[a]};
         }
     }
+    elemBuf.clear();
+    elemBuf.shrink_to_fit();
 
     // Read curved faces count
     double ncurvD = 0.0;
@@ -515,55 +453,39 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
     file.read(reinterpret_cast<char*>(&nbcD), sizeof(double));
     int nbc = static_cast<int>(nbcD);
 
-    // Map: (elemId, faceId) -> FaceInfo
-    std::map<std::pair<int, int>, FaceInfo> bcMap;
+    m_faces.clear();
+    m_faces.resize(static_cast<size_t>(nel) * 6);
+    std::vector<uint8_t> hasBc(static_cast<size_t>(nel) * 6, 0);
+
     for (int i = 0; i < nbc; ++i) {
-        double elemD = 0.0, faceD = 0.0, nbrElemD = 0.0, nbrFaceD = 0.0;
-        double p1 = 0.0, p2 = 0.0, p3 = 0.0;
+        double bcDoubles[7] = {0.0};
         char tagStr[9] = {0};
 
-        file.read(reinterpret_cast<char*>(&elemD), sizeof(double));
-        file.read(reinterpret_cast<char*>(&faceD), sizeof(double));
-        file.read(reinterpret_cast<char*>(&nbrElemD), sizeof(double));
-        file.read(reinterpret_cast<char*>(&nbrFaceD), sizeof(double));
-        file.read(reinterpret_cast<char*>(&p1), sizeof(double));
-        file.read(reinterpret_cast<char*>(&p2), sizeof(double));
-        file.read(reinterpret_cast<char*>(&p3), sizeof(double));
+        file.read(reinterpret_cast<char*>(bcDoubles), 7 * sizeof(double));
         file.read(tagStr, 8);
 
-        int e = static_cast<int>(elemD) - 1;
-        int f = static_cast<int>(faceD) - 1;
-        int nbrE = (nbrElemD > 0.0) ? (static_cast<int>(nbrElemD) - 1) : -1;
-        int nbrF = (nbrFaceD > 0.0) ? (static_cast<int>(nbrFaceD) - 1) : -1;
+        int e = static_cast<int>(bcDoubles[0]) - 1;
+        int f = static_cast<int>(bcDoubles[1]) - 1;
+        int nbrE = (bcDoubles[2] > 0.0) ? (static_cast<int>(bcDoubles[2]) - 1) : -1;
+        int nbrF = (bcDoubles[3] > 0.0) ? (static_cast<int>(bcDoubles[3]) - 1) : -1;
+
+        if (e < 0 || e >= nel || f < 0 || f >= 6) continue;
 
         std::string rawTag(tagStr);
-        std::string bcType = "PEC";
-        if (rawTag.find('P') != std::string::npos) {
-            bcType = "PERIODIC";
-        } else if (rawTag.find('E') != std::string::npos) {
-            bcType = "E";
-        } else if (rawTag.find('W') != std::string::npos || rawTag.find("PEC") != std::string::npos) {
-            bcType = "PEC";
-        } else if (nbrE >= 0) {
-            bcType = "PERIODIC";
+        BcType parsedBc = BoundaryConditions::parseBcTag(rawTag, nbrE);
+        if (parsedBc == BcType::INTERIOR && nbrE >= 0 && rawTag.find('E') == std::string::npos) {
+            parsedBc = BcType::PERIODIC;
         }
 
-        FaceInfo info;
-        info.elementId = e;
-        info.faceId = f;
-        info.bcType = bcType;
-        info.neighborElementId = nbrE;
-        info.neighborFaceId = nbrF;
-        bcMap[{e, f}] = info;
+        size_t idx = static_cast<size_t>(e) * 6 + static_cast<size_t>(f);
+        m_faces[idx].elementId = e;
+        m_faces[idx].faceId = f;
+        m_faces[idx].bcType = BoundaryConditions::toString(parsedBc);
+        m_faces[idx].neighborElementId = nbrE;
+        m_faces[idx].neighborFaceId = nbrF;
+        hasBc[idx] = 1;
     }
 
-    // Hex face corner definitions matching NekWave / NekCEM:
-    // Face 0 (s=-1): 0, 1, 5, 4
-    // Face 1 (r=+1): 1, 2, 6, 5
-    // Face 2 (s=+1): 2, 3, 7, 6
-    // Face 3 (r=-1): 3, 0, 4, 7
-    // Face 4 (t=-1): 0, 3, 2, 1
-    // Face 5 (t=+1): 4, 5, 6, 7
     const int faceCorners[6][4] = {
         {0, 1, 5, 4},
         {1, 2, 6, 5},
@@ -573,65 +495,66 @@ bool Mesh::loadFromRe2(const std::string& filename, int nel) {
         {4, 5, 6, 7}
     };
 
-    // Index face centroids for interior conforming faces
-    std::map<std::tuple<long long, long long, long long>, std::pair<int, int>> interiorCenters;
-    auto makeKey = [](double cx, double cy, double cz) {
-        long long ix = static_cast<long long>(std::round(cx * 100000.0));
-        long long iy = static_cast<long long>(std::round(cy * 100000.0));
-        long long iz = static_cast<long long>(std::round(cz * 100000.0));
-        return std::make_tuple(ix, iy, iz);
+    // O(1) spatial hash table for pairing interior conforming faces by centroid
+    std::unordered_map<uint64_t, int> interiorCenters;
+    interiorCenters.reserve(static_cast<size_t>(nel) * 3);
+    auto makeHashKey = [](double cx, double cy, double cz) -> uint64_t {
+        uint64_t ux = static_cast<uint64_t>(static_cast<int64_t>(std::llround(cx * 1000000.0)));
+        uint64_t uy = static_cast<uint64_t>(static_cast<int64_t>(std::llround(cy * 1000000.0)));
+        uint64_t uz = static_cast<uint64_t>(static_cast<int64_t>(std::llround(cz * 1000000.0)));
+        uint64_t h = ux * 0x9E3779B97F4A7C15ULL;
+        h ^= uy * 0xBF58476D1CE4E5B9ULL + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+        h ^= uz * 0x94D049BB133111EBULL + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+        return h;
     };
-
-    m_faces.clear();
-    m_faces.resize(nel * 6);
 
     for (int e = 0; e < nel; ++e) {
         for (int f = 0; f < 6; ++f) {
             int idx = e * 6 + f;
-            auto it = bcMap.find({e, f});
-            if (it != bcMap.end()) {
-                m_faces[idx] = it->second;
+            if (hasBc[idx]) continue;
+
+            double cx = 0.0, cy = 0.0, cz = 0.0;
+            for (int v = 0; v < 4; ++v) {
+                int cIdx = faceCorners[f][v];
+                cx += m_elementCorners[e][cIdx][0] * 0.25;
+                cy += m_elementCorners[e][cIdx][1] * 0.25;
+                cz += m_elementCorners[e][cIdx][2] * 0.25;
+            }
+            uint64_t key = makeHashKey(cx, cy, cz);
+            auto cIt = interiorCenters.find(key);
+            if (cIt != interiorCenters.end()) {
+                int otherIdx = cIt->second;
+                int otherE = otherIdx / 6;
+                int otherF = otherIdx % 6;
+
+                m_faces[idx].elementId = e;
+                m_faces[idx].faceId = f;
+                m_faces[idx].bcType = "E";
+                m_faces[idx].neighborElementId = otherE;
+                m_faces[idx].neighborFaceId = otherF;
+
+                m_faces[otherIdx].elementId = otherE;
+                m_faces[otherIdx].faceId = otherF;
+                m_faces[otherIdx].bcType = "E";
+                m_faces[otherIdx].neighborElementId = e;
+                m_faces[otherIdx].neighborFaceId = f;
+                interiorCenters.erase(cIt);
             } else {
-                // Interior face: match neighbor via centroid
-                double cx = 0.0, cy = 0.0, cz = 0.0;
-                for (int v = 0; v < 4; ++v) {
-                    int cIdx = faceCorners[f][v];
-                    cx += m_elementCorners[e][cIdx][0] * 0.25;
-                    cy += m_elementCorners[e][cIdx][1] * 0.25;
-                    cz += m_elementCorners[e][cIdx][2] * 0.25;
-                }
-                auto key = makeKey(cx, cy, cz);
-                auto cIt = interiorCenters.find(key);
-                if (cIt != interiorCenters.end()) {
-                    int otherE = cIt->second.first;
-                    int otherF = cIt->second.second;
-                    int otherIdx = otherE * 6 + otherF;
-
-                    FaceInfo infoThis;
-                    infoThis.elementId = e;
-                    infoThis.faceId = f;
-                    infoThis.bcType = "E";
-                    infoThis.neighborElementId = otherE;
-                    infoThis.neighborFaceId = otherF;
-                    m_faces[idx] = infoThis;
-
-                    FaceInfo infoOther;
-                    infoOther.elementId = otherE;
-                    infoOther.faceId = otherF;
-                    infoOther.bcType = "E";
-                    infoOther.neighborElementId = e;
-                    infoOther.neighborFaceId = f;
-                    m_faces[otherIdx] = infoOther;
-                } else {
-                    interiorCenters[key] = {e, f};
-                }
+                m_faces[idx].elementId = e;
+                m_faces[idx].faceId = f;
+                m_faces[idx].bcType = "PEC";
+                m_faces[idx].neighborElementId = -1;
+                m_faces[idx].neighborFaceId = -1;
+                interiorCenters.emplace(key, idx);
             }
         }
     }
+    NW_PROFILER_POP();
+    m_subTimings.fileReadAndConnectivitySec += std::chrono::duration<double>(Clock::now() - tParseStart).count();
 
     setupGLL();
-    computeMetricsFromCorners();
-    setupFaceData();
+    invalidateGeometryCache();
+    setupPml();
     return true;
 }
 
@@ -674,8 +597,8 @@ void Mesh::rescale(double xmin, double xmax, double ymin, double ymax, double zm
         }
     }
 
-    computeMetricsFromCorners();
-    setupFaceData();
+    invalidateGeometryCache();
+    setupPml();
 }
 
 // @@ generate structured Cartesian box mesh with nelx * nely * nelz hexahedral elements
@@ -684,15 +607,22 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                          double xmin, double xmax,
                          double ymin, double ymax,
                          double zmin, double zmax,
-                         bool periodicX, bool periodicY, bool periodicZ) {
+                         bool periodicX, bool periodicY, bool periodicZ,
+                         const std::string& outerBc) {
     if (nelx < 1 || nely < 1 || nelz < 1) return false;
 
-#ifndef USE_HIP
-    nvtxRangePushA("Mesh::createBoxMesh");
-#endif
+    using Clock = std::chrono::high_resolution_clock;
+    m_subTimings = PreprocessSubTimings{};
+    NW_PROFILER_PUSH("Mesh::createBoxMesh");
     m_numElements = nelx * nely * nelz;
     m_totalPoints = m_numElements * m_numPointsPerElement;
     setupGLL();
+
+    auto tBoxStart = Clock::now();
+    std::string extBc = BoundaryConditions::toString(BoundaryConditions::parseBcTag(outerBc, -1));
+    if (extBc == "E" || extBc == "PERIODIC" || extBc == "MPI") {
+        extBc = "PEC";
+    }
 
     double dx = (xmax - xmin) / nelx;
     double dy = (ymax - ymin) / nely;
@@ -739,7 +669,7 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f0.neighborElementId = elemIdx(ex, nely - 1, ez);
                     f0.neighborFaceId = 2;
                 } else {
-                    f0.bcType = "PEC";
+                    f0.bcType = extBc;
                     f0.neighborElementId = -1; f0.neighborFaceId = -1;
                 }
                 m_faces.push_back(f0);
@@ -756,7 +686,7 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f1.neighborElementId = elemIdx(0, ey, ez);
                     f1.neighborFaceId = 3;
                 } else {
-                    f1.bcType = "PEC";
+                    f1.bcType = extBc;
                     f1.neighborElementId = -1; f1.neighborFaceId = -1;
                 }
                 m_faces.push_back(f1);
@@ -773,7 +703,7 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f2.neighborElementId = elemIdx(ex, 0, ez);
                     f2.neighborFaceId = 0;
                 } else {
-                    f2.bcType = "PEC";
+                    f2.bcType = extBc;
                     f2.neighborElementId = -1; f2.neighborFaceId = -1;
                 }
                 m_faces.push_back(f2);
@@ -790,7 +720,7 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f3.neighborElementId = elemIdx(nelx - 1, ey, ez);
                     f3.neighborFaceId = 1;
                 } else {
-                    f3.bcType = "PEC";
+                    f3.bcType = extBc;
                     f3.neighborElementId = -1; f3.neighborFaceId = -1;
                 }
                 m_faces.push_back(f3);
@@ -807,7 +737,7 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f4.neighborElementId = elemIdx(ex, ey, nelz - 1);
                     f4.neighborFaceId = 5;
                 } else {
-                    f4.bcType = "PEC";
+                    f4.bcType = extBc;
                     f4.neighborElementId = -1; f4.neighborFaceId = -1;
                 }
                 m_faces.push_back(f4);
@@ -824,26 +754,23 @@ bool Mesh::createBoxMesh(int nelx, int nely, int nelz,
                     f5.neighborElementId = elemIdx(ex, ey, 0);
                     f5.neighborFaceId = 4;
                 } else {
-                    f5.bcType = "PEC";
+                    f5.bcType = extBc;
                     f5.neighborElementId = -1; f5.neighborFaceId = -1;
                 }
                 m_faces.push_back(f5);
             }
         }
     }
+    m_subTimings.fileReadAndConnectivitySec += std::chrono::duration<double>(Clock::now() - tBoxStart).count();
 
-    // Evaluate metric factor tensors and face trace connections
-    computeMetricsFromCorners();
-    setupFaceData();
+    invalidateGeometryCache();
+    setupPml();
 
-#ifndef USE_HIP
-    nvtxRangePop();
-#endif
+    NW_PROFILER_POP();
     return true;
 }
 
 // @@ the default mesh initialization routine
-// %% METHOD STEP 1D: Global Mesh Initialization (GLL Setup + Default Metric Factors)
 void Mesh::initialize() {
     setupGLL();
 
@@ -860,8 +787,6 @@ void Mesh::initialize() {
         m_elementCorners[e][7] = {{-1.0,  1.0,  1.0}};
     }
 
-    computeMetricsFromCorners();
-
     if (m_faces.empty()) {
         for (int e = 0; e < m_numElements; ++e) {
             for (int f = 0; f < 6; ++f) {
@@ -875,66 +800,327 @@ void Mesh::initialize() {
             }
         }
     }
-    setupFaceData();
+    invalidateGeometryCache();
 }
 
-// @@ compute minimum node distance dxmin matching NekCEM's get_dxmin
-// Finds smallest spacing between adjacent GLL nodes across all hex elements --> CFL
-double Mesh::computeMinNodeDistance() const {
-    double minD2 = 1.0e20;
-    int N = m_N;
-
+void Mesh::getCornerBoundingBox(double& xmin, double& xmax,
+                                double& ymin, double& ymax,
+                                double& zmin, double& zmax) const {
+    xmin = 1.0e30; xmax = -1.0e30;
+    ymin = 1.0e30; ymax = -1.0e30;
+    zmin = 1.0e30; zmax = -1.0e30;
     for (int e = 0; e < m_numElements; ++e) {
-        int offset = e * m_numPointsPerElement;
+        for (int a = 0; a < 8; ++a) {
+            xmin = std::min(xmin, m_elementCorners[e][a][0]);
+            xmax = std::max(xmax, m_elementCorners[e][a][0]);
+            ymin = std::min(ymin, m_elementCorners[e][a][1]);
+            ymax = std::max(ymax, m_elementCorners[e][a][1]);
+            zmin = std::min(zmin, m_elementCorners[e][a][2]);
+            zmax = std::max(zmax, m_elementCorners[e][a][2]);
+        }
+    }
+}
 
-        for (int k = 0; k < N; ++k) {
-            for (int j = 0; j < N; ++j) {
-                for (int i = 0; i < N; ++i) {
-                    int idx = offset + i + N * (j + N * k);
-                    double x0 = m_coord_x[idx];
-                    double y0 = m_coord_y[idx];
-                    double z0 = m_coord_z[idx];
+void Mesh::setHostCoordsAndJac(std::vector<double>&& cx,
+                               std::vector<double>&& cy,
+                               std::vector<double>&& cz,
+                               std::vector<double>&& jac) const {
+    m_coord_x = std::move(cx);
+    m_coord_y = std::move(cy);
+    m_coord_z = std::move(cz);
+    m_jac     = std::move(jac);
+}
 
-                    // Check distance along r (i + 1)
-                    if (i + 1 < N) {
-                        int idx_r = offset + (i + 1) + N * (j + N * k);
-                        double dx = m_coord_x[idx_r] - x0;
-                        double dy = m_coord_y[idx_r] - y0;
-                        double dz = m_coord_z[idx_r] - z0;
-                        minD2 = std::min(minD2, dx * dx + dy * dy + dz * dz);
-                    }
+size_t Mesh::getAllocatedHostBytes() const {
+    return m_elementCorners.size() * 24ULL * sizeof(double) +
+           m_faces.size() * sizeof(FaceInfo) +
+           (m_coord_x.size() + m_coord_y.size() + m_coord_z.size() + m_jac.size()) * sizeof(double) +
+           m_faceData.size() * 64ULL;
+}
 
-                    // Check distance along s (j + 1)
-                    if (j + 1 < N) {
-                        int idx_s = offset + i + N * ((j + 1) + N * k);
-                        double dx = m_coord_x[idx_s] - x0;
-                        double dy = m_coord_y[idx_s] - y0;
-                        double dz = m_coord_z[idx_s] - z0;
-                        minD2 = std::min(minD2, dx * dx + dy * dy + dz * dz);
-                    }
+void Mesh::preprocessOnGpu(bool needCoordsAndJac, bool needFaceData) const {
+    if (m_numElements <= 0 || m_totalPoints <= 0 || m_elementCorners.empty()) return;
 
-                    // Check distance along t (k + 1)
-                    if (k + 1 < N) {
-                        int idx_t = offset + i + N * (j + N * (k + 1));
-                        double dx = m_coord_x[idx_t] - x0;
-                        double dy = m_coord_y[idx_t] - y0;
-                        double dz = m_coord_z[idx_t] - z0;
-                        minD2 = std::min(minD2, dx * dx + dy * dy + dz * dz);
-                    }
-                }
-            }
+    NW_PROFILER_PUSH("Mesh::preprocessOnGpu");
+    const int N = m_N;
+    const int nelt = m_numElements;
+    const int npts = m_totalPoints;
+    const size_t volDoublesBytes = static_cast<size_t>(npts) * sizeof(double);
+
+    std::vector<double> h_corners(static_cast<size_t>(nelt) * 24);
+    for (int e = 0; e < nelt; ++e) {
+        for (int a = 0; a < 8; ++a) {
+            h_corners[static_cast<size_t>(e) * 24 + a * 3 + 0] = m_elementCorners[e][a][0];
+            h_corners[static_cast<size_t>(e) * 24 + a * 3 + 1] = m_elementCorners[e][a][1];
+            h_corners[static_cast<size_t>(e) * 24 + a * 3 + 2] = m_elementCorners[e][a][2];
         }
     }
 
-    return std::sqrt(minD2);
+    double* d_corners = nullptr;
+    double* d_gll_z   = nullptr;
+    double* d_coordX  = nullptr;
+    double* d_coordY  = nullptr;
+    double* d_coordZ  = nullptr;
+    double* d_jac     = nullptr;
+    double* d_rx      = nullptr;
+    double* d_sx      = nullptr;
+    double* d_tx      = nullptr;
+    double* d_ry      = nullptr;
+    double* d_sy      = nullptr;
+    double* d_ty      = nullptr;
+    double* d_rz      = nullptr;
+    double* d_sz      = nullptr;
+    double* d_tz      = nullptr;
+
+    NW_GPU_CHECK(cudaMalloc(&d_corners, h_corners.size() * sizeof(double)));
+    NW_GPU_CHECK(cudaMalloc(&d_gll_z, static_cast<size_t>(N) * sizeof(double)));
+    NW_GPU_CHECK(cudaMalloc(&d_coordX, volDoublesBytes));
+    NW_GPU_CHECK(cudaMalloc(&d_coordY, volDoublesBytes));
+    NW_GPU_CHECK(cudaMalloc(&d_coordZ, volDoublesBytes));
+    NW_GPU_CHECK(cudaMalloc(&d_jac,    volDoublesBytes));
+    NW_GPU_CHECK(cudaMalloc(&d_rx,     volDoublesBytes));
+    NW_GPU_CHECK(cudaMalloc(&d_sx,     volDoublesBytes));
+    NW_GPU_CHECK(cudaMalloc(&d_tx,     volDoublesBytes));
+    NW_GPU_CHECK(cudaMalloc(&d_ry,     volDoublesBytes));
+    NW_GPU_CHECK(cudaMalloc(&d_sy,     volDoublesBytes));
+    NW_GPU_CHECK(cudaMalloc(&d_ty,     volDoublesBytes));
+    NW_GPU_CHECK(cudaMalloc(&d_rz,     volDoublesBytes));
+    NW_GPU_CHECK(cudaMalloc(&d_sz,     volDoublesBytes));
+    NW_GPU_CHECK(cudaMalloc(&d_tz,     volDoublesBytes));
+
+    NW_GPU_CHECK(cudaMemcpy(d_corners, h_corners.data(), h_corners.size() * sizeof(double), cudaMemcpyHostToDevice));
+    NW_GPU_CHECK(cudaMemcpy(d_gll_z, m_gll_z.data(), static_cast<size_t>(N) * sizeof(double), cudaMemcpyHostToDevice));
+
+    nekwave::device::launch_compute_volume_metrics(
+        d_corners, d_gll_z,
+        d_coordX, d_coordY, d_coordZ,
+        d_jac,
+        d_rx, d_sx, d_tx,
+        d_ry, d_sy, d_ty,
+        d_rz, d_sz, d_tz,
+        N, nelt, npts
+    );
+
+    if (m_cachedMinNodeDist <= 0.0) {
+        double dxiMin = (N > 1) ? (m_gll_z[1] - m_gll_z[0]) : 2.0;
+        m_cachedMinNodeDist = nekwave::device::launch_compute_min_node_distance(
+            d_coordX, d_coordY, d_coordZ,
+            d_rx, d_sx, d_tx,
+            d_ry, d_sy, d_ty,
+            d_rz, d_sz, d_tz,
+            dxiMin, N, nelt, npts
+        );
+    }
+
+    if (needCoordsAndJac && m_coord_x.empty()) {
+        m_coord_x.resize(npts);
+        m_coord_y.resize(npts);
+        m_coord_z.resize(npts);
+        m_jac.resize(npts);
+        NW_GPU_CHECK(cudaMemcpy(m_coord_x.data(), d_coordX, volDoublesBytes, cudaMemcpyDeviceToHost));
+        NW_GPU_CHECK(cudaMemcpy(m_coord_y.data(), d_coordY, volDoublesBytes, cudaMemcpyDeviceToHost));
+        NW_GPU_CHECK(cudaMemcpy(m_coord_z.data(), d_coordZ, volDoublesBytes, cudaMemcpyDeviceToHost));
+        NW_GPU_CHECK(cudaMemcpy(m_jac.data(),     d_jac,    volDoublesBytes, cudaMemcpyDeviceToHost));
+    }
+
+    if (needFaceData && m_faceData.empty() && !m_faces.empty()) {
+        const int numFaces = static_cast<int>(m_faces.size());
+        const int N2 = N * N;
+        const int totalFacePoints = numFaces * N2;
+        const size_t faceIntsBytes    = static_cast<size_t>(totalFacePoints) * sizeof(int);
+        const size_t faceDoublesBytes = static_cast<size_t>(totalFacePoints) * sizeof(double);
+
+        std::vector<int> h_faceElem(numFaces);
+        std::vector<int> h_faceId(numFaces);
+        std::vector<int> h_neighborElem(numFaces);
+        std::vector<int> h_neighborFace(numFaces);
+        std::vector<int> h_faceBcCode(numFaces);
+        for (int f = 0; f < numFaces; ++f) {
+            h_faceElem[f]     = m_faces[f].elementId;
+            h_faceId[f]       = m_faces[f].faceId;
+            h_neighborElem[f] = m_faces[f].neighborElementId;
+            h_neighborFace[f] = m_faces[f].neighborFaceId;
+            h_faceBcCode[f]   = static_cast<int>(
+                BoundaryConditions::parseBcTag(m_faces[f].bcType, m_faces[f].neighborElementId)
+            );
+        }
+
+        int* d_faceElem        = nullptr;
+        int* d_faceId          = nullptr;
+        int* d_neighborElem    = nullptr;
+        int* d_neighborFace    = nullptr;
+        int* d_faceBcCode      = nullptr;
+        int* d_mpiCutGhostIdx  = nullptr;
+        double* d_gll_w        = nullptr;
+        int* d_volIdxMinus     = nullptr;
+        int* d_volIdxPlus      = nullptr;
+        int* d_bcType          = nullptr;
+        double* d_nx           = nullptr;
+        double* d_ny           = nullptr;
+        double* d_nz           = nullptr;
+        double* d_dA           = nullptr;
+        double* d_fx           = nullptr;
+        double* d_fy           = nullptr;
+        double* d_fz           = nullptr;
+
+        const size_t topoIntsBytes = static_cast<size_t>(numFaces) * sizeof(int);
+        NW_GPU_CHECK(cudaMalloc(&d_faceElem,     topoIntsBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_faceId,       topoIntsBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_neighborElem, topoIntsBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_neighborFace, topoIntsBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_faceBcCode,   topoIntsBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_gll_w,        static_cast<size_t>(N) * sizeof(double)));
+        NW_GPU_CHECK(cudaMalloc(&d_volIdxMinus,  faceIntsBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_volIdxPlus,   faceIntsBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_bcType,       faceIntsBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_nx,           faceDoublesBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_ny,           faceDoublesBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_nz,           faceDoublesBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_dA,           faceDoublesBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_fx,           faceDoublesBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_fy,           faceDoublesBytes));
+        NW_GPU_CHECK(cudaMalloc(&d_fz,           faceDoublesBytes));
+
+        if (!m_mpiCutGhostIndices.empty()) {
+            NW_GPU_CHECK(cudaMalloc(&d_mpiCutGhostIdx, faceIntsBytes));
+            NW_GPU_CHECK(cudaMemcpy(d_mpiCutGhostIdx, m_mpiCutGhostIndices.data(), faceIntsBytes, cudaMemcpyHostToDevice));
+        }
+
+        NW_GPU_CHECK(cudaMemcpy(d_faceElem,     h_faceElem.data(),     topoIntsBytes, cudaMemcpyHostToDevice));
+        NW_GPU_CHECK(cudaMemcpy(d_faceId,       h_faceId.data(),       topoIntsBytes, cudaMemcpyHostToDevice));
+        NW_GPU_CHECK(cudaMemcpy(d_neighborElem, h_neighborElem.data(), topoIntsBytes, cudaMemcpyHostToDevice));
+        NW_GPU_CHECK(cudaMemcpy(d_neighborFace, h_neighborFace.data(), topoIntsBytes, cudaMemcpyHostToDevice));
+        NW_GPU_CHECK(cudaMemcpy(d_faceBcCode,   h_faceBcCode.data(),   topoIntsBytes, cudaMemcpyHostToDevice));
+        NW_GPU_CHECK(cudaMemcpy(d_gll_w,        m_gll_w.data(),        static_cast<size_t>(N) * sizeof(double), cudaMemcpyHostToDevice));
+
+        nekwave::device::launch_setup_face_data(
+            d_faceElem, d_faceId, d_neighborElem, d_neighborFace, d_faceBcCode,
+            d_gll_w,
+            d_coordX, d_coordY, d_coordZ,
+            d_jac,
+            d_rx, d_sx, d_tx,
+            d_ry, d_sy, d_ty,
+            d_rz, d_sz, d_tz,
+            d_volIdxMinus, d_volIdxPlus, d_bcType,
+            d_nx, d_ny, d_nz, d_dA,
+            d_fx, d_fy, d_fz,
+            N, numFaces, totalFacePoints,
+            nullptr, d_mpiCutGhostIdx
+        );
+
+        std::vector<int> h_volIdxMinus(totalFacePoints);
+        std::vector<int> h_volIdxPlus(totalFacePoints);
+        std::vector<double> h_nx(totalFacePoints);
+        std::vector<double> h_ny(totalFacePoints);
+        std::vector<double> h_nz(totalFacePoints);
+        std::vector<double> h_dA(totalFacePoints);
+
+        NW_GPU_CHECK(cudaMemcpy(h_volIdxMinus.data(), d_volIdxMinus, faceIntsBytes,    cudaMemcpyDeviceToHost));
+        NW_GPU_CHECK(cudaMemcpy(h_volIdxPlus.data(),  d_volIdxPlus,  faceIntsBytes,    cudaMemcpyDeviceToHost));
+        NW_GPU_CHECK(cudaMemcpy(h_nx.data(),          d_nx,          faceDoublesBytes, cudaMemcpyDeviceToHost));
+        NW_GPU_CHECK(cudaMemcpy(h_ny.data(),          d_ny,          faceDoublesBytes, cudaMemcpyDeviceToHost));
+        NW_GPU_CHECK(cudaMemcpy(h_nz.data(),          d_nz,          faceDoublesBytes, cudaMemcpyDeviceToHost));
+        NW_GPU_CHECK(cudaMemcpy(h_dA.data(),          d_dA,          faceDoublesBytes, cudaMemcpyDeviceToHost));
+
+        m_faceData.resize(numFaces);
+        for (int f = 0; f < numFaces; ++f) {
+            ElementFaceData& efd = m_faceData[f];
+            efd.elementId = m_faces[f].elementId;
+            efd.faceId    = m_faces[f].faceId;
+            efd.bcType    = m_faces[f].bcType;
+            efd.points.resize(N2);
+            for (int p = 0; p < N2; ++p) {
+                int idx = f * N2 + p;
+                efd.points[p].volIdxMinus = h_volIdxMinus[idx];
+                efd.points[p].volIdxPlus  = h_volIdxPlus[idx];
+                efd.points[p].nx          = h_nx[idx];
+                efd.points[p].ny          = h_ny[idx];
+                efd.points[p].nz          = h_nz[idx];
+                efd.points[p].dA          = h_dA[idx];
+            }
+        }
+
+        if (d_mpiCutGhostIdx) NW_GPU_CHECK(cudaFree(d_mpiCutGhostIdx));
+        NW_GPU_CHECK(cudaFree(d_faceElem));
+        NW_GPU_CHECK(cudaFree(d_faceId));
+        NW_GPU_CHECK(cudaFree(d_neighborElem));
+        NW_GPU_CHECK(cudaFree(d_neighborFace));
+        NW_GPU_CHECK(cudaFree(d_faceBcCode));
+        NW_GPU_CHECK(cudaFree(d_gll_w));
+        NW_GPU_CHECK(cudaFree(d_volIdxMinus));
+        NW_GPU_CHECK(cudaFree(d_volIdxPlus));
+        NW_GPU_CHECK(cudaFree(d_bcType));
+        NW_GPU_CHECK(cudaFree(d_nx));
+        NW_GPU_CHECK(cudaFree(d_ny));
+        NW_GPU_CHECK(cudaFree(d_nz));
+        NW_GPU_CHECK(cudaFree(d_dA));
+        NW_GPU_CHECK(cudaFree(d_fx));
+        NW_GPU_CHECK(cudaFree(d_fy));
+        NW_GPU_CHECK(cudaFree(d_fz));
+    }
+
+    NW_GPU_CHECK(cudaFree(d_corners));
+    NW_GPU_CHECK(cudaFree(d_gll_z));
+    NW_GPU_CHECK(cudaFree(d_coordX));
+    NW_GPU_CHECK(cudaFree(d_coordY));
+    NW_GPU_CHECK(cudaFree(d_coordZ));
+    NW_GPU_CHECK(cudaFree(d_jac));
+    NW_GPU_CHECK(cudaFree(d_rx));
+    NW_GPU_CHECK(cudaFree(d_sx));
+    NW_GPU_CHECK(cudaFree(d_tx));
+    NW_GPU_CHECK(cudaFree(d_ry));
+    NW_GPU_CHECK(cudaFree(d_sy));
+    NW_GPU_CHECK(cudaFree(d_ty));
+    NW_GPU_CHECK(cudaFree(d_rz));
+    NW_GPU_CHECK(cudaFree(d_sz));
+    NW_GPU_CHECK(cudaFree(d_tz));
+    NW_PROFILER_POP();
+}
+
+const std::vector<double>& Mesh::getJac() const {
+    if (m_jac.empty() && !m_elementCorners.empty()) {
+        preprocessOnGpu(true, false);
+    }
+    return m_jac;
+}
+
+const std::vector<double>& Mesh::getCoordX() const {
+    if (m_coord_x.empty() && !m_elementCorners.empty()) {
+        preprocessOnGpu(true, false);
+    }
+    return m_coord_x;
+}
+
+const std::vector<double>& Mesh::getCoordY() const {
+    if (m_coord_y.empty() && !m_elementCorners.empty()) {
+        preprocessOnGpu(true, false);
+    }
+    return m_coord_y;
+}
+
+const std::vector<double>& Mesh::getCoordZ() const {
+    if (m_coord_z.empty() && !m_elementCorners.empty()) {
+        preprocessOnGpu(true, false);
+    }
+    return m_coord_z;
+}
+
+const std::vector<ElementFaceData>& Mesh::getFaceData() const {
+    if (m_faceData.empty() && !m_faces.empty()) {
+        preprocessOnGpu(false, true);
+    }
+    return m_faceData;
+}
+
+// @@ compute minimum node distance dxmin on the GPU matching NekCEM's get_dxmin
+double Mesh::computeMinNodeDistance() const {
+    if (m_cachedMinNodeDist <= 0.0 && !m_elementCorners.empty()) {
+        preprocessOnGpu(false, false);
+    }
+    return (m_cachedMinNodeDist > 0.0) ? m_cachedMinNodeDist : 1.0;
 }
 
 // @@ automatic stable CFL Courant number based on polynomial order and 3D stability bound
-// In 3D DG-SEM with LSRK45, the spatial operator eigenvalue bound is:
-// lambda_max <= sqrt(d) * c / dxmin.
-// For Carpenter-Kennedy LSRK45, the stability limit on the imaginary axis is alpha_RK45 ~ 1.75 to 2.82.
-// With safety factor S (default 0.35 - 0.4 for DG with boundary penalty terms):
-//      CFL_auto = S * (alpha_RK45 / sqrt(3)) ~ 0.20 - 0.25
 double Mesh::computeAutomaticCFL(double safetyFactor) const {
     const double alpha_RK = 1.75;           // Conservative stability limit with numerical penalty fluxes
     const double sqrt_dim = std::sqrt(3.0);  // 3D spatial dimension
@@ -980,103 +1166,14 @@ int Mesh::getFaceNodeVolIndex(int elemId, int faceId, int p, int q) const {
     return elemId * m_numPointsPerElement + i + N * (j + N * k);
 }
 
-// @@ computing outward physical normal vectors, face quadrature weights, and neighbor node connectivity
-// PIOLA transform & NANSON formula: n * dA = J * J^{-T} * n_ref * dA_ref
-void Mesh::setupFaceData() {
-#ifndef USE_HIP
-    nvtxRangePushA("Mesh::setupFaceData");
-#endif
-    m_faceData.clear();
-    m_faceData.reserve(m_faces.size());
-
-    int N = m_N;
-    for (const auto& face : m_faces) {
-        ElementFaceData efd;
-        efd.elementId = face.elementId;
-        efd.faceId = face.faceId;
-        efd.bcType = face.bcType;
-        efd.points.reserve(N * N);
-
-        int eA = face.elementId;
-        int fA = face.faceId;
-
-        for (int qA = 0; qA < N; ++qA) {
-            for (int pA = 0; pA < N; ++pA) {
-                FacePointData pt;
-                pt.volIdxMinus = getFaceNodeVolIndex(eA, fA, pA, qA);
-                int vM = pt.volIdxMinus;
-                double J = m_jac[vM];
-                double w2 = m_gll_w[pA] * m_gll_w[qA];
-
-                // Outward normal in reference coordinates n_ref transformed via cofactor matrix J * J^{-T}
-                double Nx = 0.0, Ny = 0.0, Nz = 0.0;
-                switch (fA) {
-                    case 0: // s = -1: n_ref = (0, -1, 0)
-                        Nx = -J * m_sx[vM]; Ny = -J * m_sy[vM]; Nz = -J * m_sz[vM];
-                        break;
-                    case 1: // r = +1: n_ref = (1, 0, 0)
-                        Nx = +J * m_rx[vM]; Ny = +J * m_ry[vM]; Nz = +J * m_rz[vM];
-                        break;
-                    case 2: // s = +1: n_ref = (0, 1, 0)
-                        Nx = +J * m_sx[vM]; Ny = +J * m_sy[vM]; Nz = +J * m_sz[vM];
-                        break;
-                    case 3: // r = -1: n_ref = (-1, 0, 0)
-                        Nx = -J * m_rx[vM]; Ny = -J * m_ry[vM]; Nz = -J * m_rz[vM];
-                        break;
-                    case 4: // t = -1: n_ref = (0, 0, -1)
-                        Nx = -J * m_tx[vM]; Ny = -J * m_ty[vM]; Nz = -J * m_tz[vM];
-                        break;
-                    case 5: // t = +1: n_ref = (0, 0, 1)
-                        Nx = +J * m_tx[vM]; Ny = +J * m_ty[vM]; Nz = +J * m_tz[vM];
-                        break;
-                }
-
-                double L = std::sqrt(Nx * Nx + Ny * Ny + Nz * Nz);
-                pt.nx = (L > 1e-14) ? (Nx / L) : 0.0;
-                pt.ny = (L > 1e-14) ? (Ny / L) : 0.0;
-                pt.nz = (L > 1e-14) ? (Nz / L) : 0.0;
-                pt.dA = L * w2;
-
-                // Determine exterior neighbor node index
-                if (face.bcType == "PEC" || face.neighborElementId < 0) {
-                    pt.volIdxPlus = -1;
-                } else if (face.bcType == "PERIODIC") {
-                    // Periodic boundary: aligned opposite Cartesian faces map directly by (pA, qA)
-                    int eB = face.neighborElementId;
-                    int fB = face.neighborFaceId;
-                    pt.volIdxPlus = getFaceNodeVolIndex(eB, fB, pA, qA);
-                } else {
-                    int eB = face.neighborElementId;
-                    int fB = face.neighborFaceId;
-                    double xA = m_coord_x[vM];
-                    double yA = m_coord_y[vM];
-                    double zA = m_coord_z[vM];
-
-                    int matchedVolB = -1;
-                    for (int qB = 0; qB < N; ++qB) {
-                        for (int pB = 0; pB < N; ++pB) {
-                            int vB = getFaceNodeVolIndex(eB, fB, pB, qB);
-                            double dx = xA - m_coord_x[vB];
-                            double dy = yA - m_coord_y[vB];
-                            double dz = zA - m_coord_z[vB];
-                            if (dx * dx + dy * dy + dz * dz < 1e-10) {
-                                matchedVolB = vB;
-                                break;
-                            }
-                        }
-                        if (matchedVolB >= 0) break;
-                    }
-                    pt.volIdxPlus = matchedVolB;
-                }
-
-                efd.points.push_back(pt);
-            }
-        }
-        m_faceData.push_back(efd);
-    }
-#ifndef USE_HIP
-    nvtxRangePop();
-#endif
+// @@ initialize UPML topology and conductivity profiles if PML boundary faces exist
+void Mesh::setupPml() {
+    using Clock = std::chrono::high_resolution_clock;
+    auto tStart = Clock::now();
+    NW_PROFILER_PUSH("Mesh::setupPml");
+    m_pmlData = BoundaryConditions::initializePml(*this, m_pmlConfig);
+    NW_PROFILER_POP();
+    m_subTimings.pmlInitSec += std::chrono::duration<double>(Clock::now() - tStart).count();
 }
 
 // @@ multi-GPU MPI domain decomposition (Recursive Coordinate Bisection)
@@ -1085,19 +1182,19 @@ bool Mesh::partition(int rank, int numRanks) {
         m_bIsPartitioned = false;
         m_numHaloPoints = 0;
         m_mpiHalos.clear();
+        m_mpiCutGhostIndices.clear();
         return true;
     }
 
-#ifndef USE_HIP
-    nvtxRangePushA("Mesh::partition");
-#endif
+    // Populate global face matching on the GPU so cut-face node pairings are known
+    const auto& globalFaceData = getFaceData();
+
+    NW_PROFILER_PUSH("Mesh::partition");
     int totalElems = m_numElements;
     if (totalElems < numRanks) {
         std::cerr << "[MPI ERROR] Total elements (" << totalElems 
                   << ") is less than number of ranks (" << numRanks << ")!" << std::endl;
-#ifndef USE_HIP
-        nvtxRangePop();
-#endif
+        NW_PROFILER_POP();
         return false;
     }
 
@@ -1165,42 +1262,10 @@ bool Mesh::partition(int rank, int numRanks) {
     int nxyz = m_numPointsPerElement;
     int localTotalPoints = localNumElems * nxyz;
 
-    // 3. Extract local element metrics and coordinates
-    std::vector<double> new_coord_x(localTotalPoints);
-    std::vector<double> new_coord_y(localTotalPoints);
-    std::vector<double> new_coord_z(localTotalPoints);
-    std::vector<double> new_rx(localTotalPoints);
-    std::vector<double> new_sx(localTotalPoints);
-    std::vector<double> new_tx(localTotalPoints);
-    std::vector<double> new_ry(localTotalPoints);
-    std::vector<double> new_sy(localTotalPoints);
-    std::vector<double> new_ty(localTotalPoints);
-    std::vector<double> new_rz(localTotalPoints);
-    std::vector<double> new_sz(localTotalPoints);
-    std::vector<double> new_tz(localTotalPoints);
-    std::vector<double> new_jac(localTotalPoints);
+    // 3. Extract local element corners
     std::vector<std::array<std::array<double, 3>, 8>> new_corners(localNumElems);
-
     for (int locE = 0; locE < localNumElems; ++locE) {
-        int globE = localElemIds[locE];
-        new_corners[locE] = m_elementCorners[globE];
-        int globOffset = globE * nxyz;
-        int locOffset = locE * nxyz;
-        for (int p = 0; p < nxyz; ++p) {
-            new_coord_x[locOffset + p] = m_coord_x[globOffset + p];
-            new_coord_y[locOffset + p] = m_coord_y[globOffset + p];
-            new_coord_z[locOffset + p] = m_coord_z[globOffset + p];
-            new_rx[locOffset + p] = m_rx[globOffset + p];
-            new_sx[locOffset + p] = m_sx[globOffset + p];
-            new_tx[locOffset + p] = m_tx[globOffset + p];
-            new_ry[locOffset + p] = m_ry[globOffset + p];
-            new_sy[locOffset + p] = m_sy[globOffset + p];
-            new_ty[locOffset + p] = m_ty[globOffset + p];
-            new_rz[locOffset + p] = m_rz[globOffset + p];
-            new_sz[locOffset + p] = m_sz[globOffset + p];
-            new_tz[locOffset + p] = m_tz[globOffset + p];
-            new_jac[locOffset + p] = m_jac[globOffset + p];
-        }
+        new_corners[locE] = m_elementCorners[localElemIds[locE]];
     }
 
     // 4. Identify cut faces and build halo exchange structures
@@ -1210,7 +1275,6 @@ bool Mesh::partition(int rank, int numRanks) {
         int nbrGlobE;
         int nbrFaceId;
         int nbrRank;
-        std::tuple<long long, long long, long long> centroidKey;
         size_t faceDataIdx;
     };
 
@@ -1224,39 +1288,25 @@ bool Mesh::partition(int rank, int numRanks) {
             int ownerA = elemOwner[globE];
             int ownerB = elemOwner[nbrGlobE];
 
-            if (ownerA == rank || ownerB == rank) {
-                int otherRank = (ownerA == rank) ? ownerB : ownerA;
-
-                double fcx = 0.0, fcy = 0.0, fcz = 0.0;
-                const auto& pts = m_faceData[fIdx].points;
-                for (const auto& pt : pts) {
-                    fcx += m_coord_x[pt.volIdxMinus];
-                    fcy += m_coord_y[pt.volIdxMinus];
-                    fcz += m_coord_z[pt.volIdxMinus];
-                }
-                if (!pts.empty()) {
-                    fcx /= pts.size(); fcy /= pts.size(); fcz /= pts.size();
-                }
-                auto key = std::make_tuple(
-                    static_cast<long long>(std::round(fcx * 100000.0)),
-                    static_cast<long long>(std::round(fcy * 100000.0)),
-                    static_cast<long long>(std::round(fcz * 100000.0))
-                );
-
-                if (ownerA == rank) {
-                    rankCutFaces[otherRank].push_back({globE, f.faceId, nbrGlobE, f.neighborFaceId, otherRank, key, fIdx});
-                }
+            if (ownerA == rank) {
+                int otherRank = ownerB;
+                rankCutFaces[otherRank].push_back({globE, f.faceId, nbrGlobE, f.neighborFaceId, otherRank, fIdx});
             }
         }
     }
 
-    // Sort cut faces for each neighbor rank canonically
+    // Sort cut faces for each neighbor rank canonically using exact integer element & face IDs
     for (auto& kv : rankCutFaces) {
         std::sort(kv.second.begin(), kv.second.end(), [](const CutFaceRef& a, const CutFaceRef& b) {
-            if (a.centroidKey != b.centroidKey) return a.centroidKey < b.centroidKey;
-            if (std::min(a.globE, a.nbrGlobE) != std::min(b.globE, b.nbrGlobE))
-                return std::min(a.globE, a.nbrGlobE) < std::min(b.globE, b.nbrGlobE);
-            return std::max(a.globE, a.nbrGlobE) < std::max(b.globE, b.nbrGlobE);
+            int minEA = std::min(a.globE, a.nbrGlobE);
+            int minEB = std::min(b.globE, b.nbrGlobE);
+            if (minEA != minEB) return minEA < minEB;
+            int maxEA = std::max(a.globE, a.nbrGlobE);
+            int maxEB = std::max(b.globE, b.nbrGlobE);
+            if (maxEA != maxEB) return maxEA < maxEB;
+            int canonFA = (a.globE < a.nbrGlobE) ? a.faceId : a.nbrFaceId;
+            int canonFB = (b.globE < b.nbrGlobE) ? b.faceId : b.nbrFaceId;
+            return canonFA < canonFB;
         });
     }
 
@@ -1274,30 +1324,25 @@ bool Mesh::partition(int rank, int numRanks) {
         halo.ghostOffset = currentGhostOffset;
 
         for (const auto& cut : cutList) {
-            const auto& origPts = m_faceData[cut.faceDataIdx].points;
+            const auto& origPts = globalFaceData[cut.faceDataIdx].points;
             int locE = globalToLocalElem[cut.globE];
 
             struct PtSort {
                 size_t ptIdx;
                 int locVolMinus;
-                std::tuple<long long, long long, long long> ptKey;
+                int canonicalVolKey;
             };
             std::vector<PtSort> sortedPts(origPts.size());
             for (size_t p = 0; p < origPts.size(); ++p) {
                 int globVM = origPts[p].volIdxMinus;
-                double px = m_coord_x[globVM];
-                double py = m_coord_y[globVM];
-                double pz = m_coord_z[globVM];
-                auto pkey = std::make_tuple(
-                    static_cast<long long>(std::round(px * 1000000.0)),
-                    static_cast<long long>(std::round(py * 1000000.0)),
-                    static_cast<long long>(std::round(pz * 1000000.0))
-                );
+                int globVP = origPts[p].volIdxPlus;
+                int canonKey = (cut.globE < cut.nbrGlobE) ? globVM : globVP;
                 int locVM = locE * nxyz + (globVM % nxyz);
-                sortedPts[p] = {p, locVM, pkey};
+                sortedPts[p] = {p, locVM, canonKey};
             }
             std::sort(sortedPts.begin(), sortedPts.end(), [](const PtSort& a, const PtSort& b) {
-                return a.ptKey < b.ptKey;
+                if (a.canonicalVolKey != b.canonicalVolKey) return a.canonicalVolKey < b.canonicalVolKey;
+                return a.ptIdx < b.ptIdx;
             });
 
             for (size_t sp = 0; sp < sortedPts.size(); ++sp) {
@@ -1312,9 +1357,10 @@ bool Mesh::partition(int rank, int numRanks) {
     }
     m_numHaloPoints = currentGhostOffset;
 
-    // 6. Build partitioned m_faceData and m_faces for this rank
+    // 6. Build partitioned m_faces and m_mpiCutGhostIndices for this rank
     std::vector<FaceInfo> new_faces;
-    std::vector<ElementFaceData> new_faceData;
+    m_mpiCutGhostIndices.clear();
+    const int N2 = m_N * m_N;
 
     for (size_t fIdx = 0; fIdx < m_faces.size(); ++fIdx) {
         const auto& f = m_faces[fIdx];
@@ -1327,69 +1373,49 @@ bool Mesh::partition(int rank, int numRanks) {
         FaceInfo newF = f;
         newF.elementId = locE;
 
-        ElementFaceData newEfd;
-        newEfd.elementId = locE;
-        newEfd.faceId = f.faceId;
-
-        const auto& origEfd = m_faceData[fIdx];
-        newEfd.points.reserve(origEfd.points.size());
-
         if (globNbr < 0) {
             newF.neighborElementId = -1;
             newF.neighborFaceId = -1;
-            newEfd.bcType = f.bcType;
-            for (const auto& pt : origEfd.points) {
-                FacePointData npt = pt;
-                npt.volIdxMinus = locE * nxyz + (pt.volIdxMinus % nxyz);
-                npt.volIdxPlus = -1;
-                newEfd.points.push_back(npt);
-            }
+            for (int p = 0; p < N2; ++p) m_mpiCutGhostIndices.push_back(-1);
         } else if (elemOwner[globNbr] == rank) {
-            int locNbr = globalToLocalElem[globNbr];
-            newF.neighborElementId = locNbr;
-            newEfd.bcType = f.bcType;
-            for (const auto& pt : origEfd.points) {
-                FacePointData npt = pt;
-                npt.volIdxMinus = locE * nxyz + (pt.volIdxMinus % nxyz);
-                npt.volIdxPlus = locNbr * nxyz + (pt.volIdxPlus % nxyz);
-                newEfd.points.push_back(npt);
-            }
+            newF.neighborElementId = globalToLocalElem[globNbr];
+            for (int p = 0; p < N2; ++p) m_mpiCutGhostIndices.push_back(-1);
         } else {
             // MPI Cut Face
             newF.neighborElementId = -1;
             newF.bcType = "MPI";
-            newEfd.bcType = "MPI";
-            for (size_t p = 0; p < origEfd.points.size(); ++p) {
-                FacePointData npt = origEfd.points[p];
-                npt.volIdxMinus = locE * nxyz + (origEfd.points[p].volIdxMinus % nxyz);
-                npt.volIdxPlus = facePtToGhost[{fIdx, p}];
-                newEfd.points.push_back(npt);
+            for (int p = 0; p < N2; ++p) {
+                m_mpiCutGhostIndices.push_back(facePtToGhost[{fIdx, static_cast<size_t>(p)}]);
             }
         }
 
         new_faces.push_back(newF);
-        new_faceData.push_back(newEfd);
     }
 
-    // 7. Commit partitioned mesh state
+    // 6b. Partition UPML topological data if enabled
+    if (m_pmlData.enabled) {
+        std::vector<int> new_pmlTag(localNumElems, 0);
+        std::vector<int> new_pmlPtr;
+
+        for (int locE = 0; locE < localNumElems; ++locE) {
+            int globE = localElemIds[locE];
+            int tag = (globE < static_cast<int>(m_pmlData.pmlTag.size())) ? m_pmlData.pmlTag[globE] : 0;
+            new_pmlTag[locE] = tag;
+            if (tag != 0) {
+                new_pmlPtr.push_back(locE);
+            }
+        }
+        m_pmlData.pmlTag = std::move(new_pmlTag);
+        m_pmlData.pmlPtr = std::move(new_pmlPtr);
+        m_pmlData.maxPml = static_cast<int>(m_pmlData.pmlPtr.size());
+    }
+
+    // 7. Commit partitioned mesh state (metrics/coords will be evaluated on GPU for the local partition)
     m_numElements = localNumElems;
     m_totalPoints = localTotalPoints;
-    m_coord_x = std::move(new_coord_x);
-    m_coord_y = std::move(new_coord_y);
-    m_coord_z = std::move(new_coord_z);
-    m_rx = std::move(new_rx);
-    m_sx = std::move(new_sx);
-    m_tx = std::move(new_tx);
-    m_ry = std::move(new_ry);
-    m_sy = std::move(new_sy);
-    m_ty = std::move(new_ty);
-    m_rz = std::move(new_rz);
-    m_sz = std::move(new_sz);
-    m_tz = std::move(new_tz);
-    m_jac = std::move(new_jac);
     m_elementCorners = std::move(new_corners);
     m_faces = std::move(new_faces);
-    m_faceData = std::move(new_faceData);
+    invalidateGeometryCache();
 
     m_bIsPartitioned = true;
 
@@ -1399,8 +1425,6 @@ bool Mesh::partition(int rank, int numRanks) {
               << m_numHaloPoints << " halo ghost nodes across "
               << m_mpiHalos.size() << " neighbor rank(s)." << std::endl;
 
-#ifndef USE_HIP
-    nvtxRangePop();
-#endif
+    NW_PROFILER_POP();
     return true;
 }

@@ -39,6 +39,7 @@ if(BUILD_TESTING)
     add_test(NAME MaxwellStabilityTests COMMAND nekwave-test MaxwellStabilityTest)
     add_test(NAME CaseInputLoadingTests COMMAND nekwave-test CaseInputLoadingTest)
     add_test(NAME JsonConfigLoadingTests COMMAND nekwave-test JsonConfigLoadingTest)
+    add_test(NAME BoundaryConditionsAndPmlTests COMMAND nekwave-test BoundaryConditionsAndPmlTest)
     add_test(NAME NekWaveUnitTests COMMAND nekwave-test)
 
     set_tests_properties(
@@ -47,6 +48,7 @@ if(BUILD_TESTING)
         MaxwellStabilityTests
         CaseInputLoadingTests
         JsonConfigLoadingTests
+        BoundaryConditionsAndPmlTests
         NekWaveUnitTests
         PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"

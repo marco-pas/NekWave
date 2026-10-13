@@ -165,7 +165,26 @@ int main(int argc, char* argv[]) {
                         std::cerr << "  FAILED: Field dataset missing in HDF5: " << dsetPath << std::endl;
                         failures++;
                     } else {
-                        std::cout << "  [VERIFIED] Found dataset: " << dsetPath << std::endl;
+                        hid_t dsetId = H5Dopen2(fileId, dsetPath.c_str(), H5P_DEFAULT);
+                        if (dsetId >= 0) {
+                            hid_t dtypeId = H5Dget_type(dsetId);
+                            size_t typeSize = H5Tget_size(dtypeId);
+                            H5Tclose(dtypeId);
+                            if (typeSize != 4) {
+                                std::cerr << "  FAILED: Expected float32 (4 bytes) for " << dsetPath
+                                          << ", got " << typeSize << " bytes." << std::endl;
+                                failures++;
+                            }
+                            hid_t dcplId = H5Dget_create_plist(dsetId);
+                            int nfilters = H5Pget_nfilters(dcplId);
+                            H5Pclose(dcplId);
+                            if (nfilters < 1) {
+                                std::cerr << "  FAILED: Expected DEFLATE/SHUFFLE compression filters on " << dsetPath << std::endl;
+                                failures++;
+                            }
+                            H5Dclose(dsetId);
+                        }
+                        std::cout << "  [VERIFIED] Found compressed float32 dataset: " << dsetPath << std::endl;
                     }
                 }
             }
